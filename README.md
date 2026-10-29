@@ -15,7 +15,8 @@ Your own voice chat inside Telegram: voice, video, screen share, live chat, sync
 
 ### 1. Bot + Mini App in @BotFather
 1. You already have the bot token.
-2. `/setprivacy` → your bot → **Disable** (optional, commands work either way).
+2. `/setprivacy` → your bot → **Disable**. Commands work either way, but the **Invite** list can only show
+   members the bot has seen chatting in the group (Telegram doesn't let bots read the member list).
 3. `/newapp` → pick your bot → title, description, a 640×360 photo →
    **Web App URL** = your Railway app URL (step 3) → **short name** e.g. `vc`.
    Put that short name in `APP_SHORT_NAME`.
@@ -67,16 +68,23 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 
 ## Features
 - **Voice room:** speaking rings, per-person volume, mute for me, admin mute for everyone, hand raise,
-  speaker/listener, video, screen share (desktop), noise suppression, join/leave sounds, appear as the group
-- **Chat:** replies, reactions, delete
+  speaker/listener, camera (asks front or back, can switch), full-screen video, screen share (desktop),
+  noise isolation (RNNoise, runs on the phone), speaker/Bluetooth/mic picker, voice and music volume sliders,
+  join/leave sounds, appear as the group
+- **Invite:** invite members from inside the voice chat. The bot sends them a private Join button, or mentions
+  them in the group if they never started the bot. If the group hides its members, only admins are listed;
+  anonymous admins are never shown.
+- **Chat:** like Telegram's voice chat: messages pop up over the room for a few seconds, floating reactions,
+  and a history button with everything sent since you joined. Replies, message reactions, delete
 - **Music:** YouTube search, links and playlists, synced for everyone, queue, repeat, shuffle, autoplay (only when on),
   vote skip, audio-only/video switch, audio and video quality (Auto adapts to the connection), lyrics,
   Liked Songs and playlists, history
-- **Sound:** 8D, Spatial 3D (headphones), Bass Boost, Concert Hall, Vocal, Slowed + Reverb, Nightcore, Treble,
-  plus EQ, reverb and speed sliders. These are per listener.
+- **Sound:** Bass Boost, 8D, Concert Hall, Vocal, Slowed + Reverb, Nightcore, plus EQ, reverb and speed.
+  Everyone hears the same effect in sync; only admins or the person who added the song can change it.
 - **Soundboard:** sounds everyone hears (admins can switch it off)
 - **Admin:** title/description, lock, new participants can speak, only admins add songs, mute everyone,
-  invite link copy/reset, recording (the bot sends you the file), scheduled reminders
+  invite link copy/reset, recording (named, renamable while recording; the bot sends the file only to the
+  admin who recorded it, in private), scheduled reminders
 - **Logs:** who joined, when they left, how long they stayed, mic on and off time. Search by name, @username or ID.
   Filter by today/7/30 days/custom, ranking by time/joins/mic, and full visit history per person
 - **Safety:** members can report. People who join in a flood, rejoin over and over, or get reported are flagged

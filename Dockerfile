@@ -11,7 +11,7 @@ RUN pip install -r requirements.txt
 
 COPY . .
 # Bundle the LiveKit browser SDK so users don't depend on a CDN at runtime
-RUN mkdir -p web/vendor && curl -fsSL https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs -o web/vendor/livekit-client.esm.mjs || true
+RUN mkdir -p web/vendor && curl -fsSL https://cdn.jsdelivr.net/npm/livekit-client@2.23.0/dist/livekit-client.esm.mjs -o web/vendor/livekit-client.esm.mjs || true
 
 # Railway sets PORT. Mount a volume at /data to keep logs, playlists and the audio cache.
 ENV DATA_DIR=/data

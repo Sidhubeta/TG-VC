@@ -58,17 +58,100 @@ _admins_cache: dict[int, tuple[float, list[int]]] = {}
 _alert_last: dict[tuple[int, str], float] = {}
 
 
-async def group_admins(chat_id: int) -> list[int]:
+def _full_name(u: dict) -> str:
+    return " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x).strip() or "User"
+
+
+async def admin_list(chat_id: int) -> list[dict]:
+    """Group admins (no bots): [{uid, name, username, anonymous}]. Cached for 10 minutes."""
     hit = _admins_cache.get(chat_id)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
     try:
         res = await call("getChatAdministrators", chat_id=chat_id)
-        ids = [a["user"]["id"] for a in res if not a["user"].get("is_bot")]
+        out = [{"uid": a["user"]["id"], "name": _full_name(a["user"]), "username": a["user"].get("username") or "",
+                "anonymous": bool(a.get("is_anonymous"))} for a in res if not a["user"].get("is_bot")]
     except Exception:
-        ids = hit[1] if hit else []
-    _admins_cache[chat_id] = (time.time(), ids)
-    return ids
+        out = hit[1] if hit else []
+    _admins_cache[chat_id] = (time.time(), out)
+    return out
+
+
+async def group_admins(chat_id: int) -> list[int]:
+    return [a["uid"] for a in await admin_list(chat_id)]
+
+
+_info_cache: dict[int, tuple[float, dict]] = {}
+
+
+async def hidden_members(chat_id: int) -> bool:
+    """True when the group hides its member list (then invites only show admins)."""
+    hit = _info_cache.get(chat_id)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1].get("has_hidden_members", False)
+    try:
+        info = await call("getChat", chat_id=chat_id)
+    except Exception:
+        info = hit[1] if hit else {}
+    _info_cache[chat_id] = (time.time(), info)
+    return bool(info.get("has_hidden_members"))
+
+
+# ---- people seen in the group (the Bot API can't list members, so we remember who we've seen) ----
+_SERVICE_IDS = {777000, 1087968824, 136817688}  # Telegram service account, anonymous admin bot, channel bot
+_seen: dict[tuple[int, int], float] = {}
+
+
+async def remember_member(chat_id: int, user: dict | None):
+    if not user or user.get("is_bot") or user.get("id") in _SERVICE_IDS:
+        return
+    key = (chat_id, user["id"])
+    if time.time() - _seen.get(key, 0) < 300:
+        return
+    _seen[key] = time.time()
+    await db.x("INSERT OR REPLACE INTO members(chat_id,uid,name,username,seen) VALUES(?,?,?,?,?)",
+               (chat_id, user["id"], _full_name(user)[:64], user.get("username") or "", time.time()))
+
+
+async def forget_member(chat_id: int, uid: int):
+    _seen.pop((chat_id, uid), None)
+    await db.x("DELETE FROM members WHERE chat_id=? AND uid=?", (chat_id, uid))
+
+
+async def invite(chat_id: int, uid: int, name: str, by_name: str) -> str | None:
+    """DM the person a Join button; if they never started the bot, mention them in the group instead."""
+    url = await group_link(chat_id)
+    title = await chat_title(chat_id)
+    try:
+        await call("sendMessage", chat_id=uid, parse_mode="HTML",
+                   text=f"🎧 <b>{_esc(by_name)}</b> invited you to the voice chat in <b>{_esc(title)}</b>",
+                   reply_markup=join_button(url))
+        return "dm"
+    except Exception:
+        pass
+    g = await db.get_group(chat_id)
+    params = {"chat_id": chat_id, "parse_mode": "HTML", "reply_markup": join_button(url),
+              "text": f'🎧 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you to the voice chat'}
+    if g.get("pin_thread"):
+        params["message_thread_id"] = g["pin_thread"]
+    try:
+        m = await call("sendMessage", **params)
+    except Exception as e:
+        log.info("invite failed: %s", e)
+        return None
+
+    async def cleanup():  # don't leave invite messages lying around in the group
+        await asyncio.sleep(600)
+        try:
+            await call("deleteMessage", chat_id=chat_id, message_id=m["message_id"])
+        except Exception:
+            pass
+    _cleanup_tasks.add(t := asyncio.create_task(cleanup()))
+    t.add_done_callback(_cleanup_tasks.discard)
+    return "group"
+
+
+_cleanup_tasks: set[asyncio.Task] = set()
 
 
 async def alert_admins(chat_id: int, kind: str, text: str, every: int = 120):
@@ -140,22 +223,36 @@ async def send_join_message(chat_id: int, text: str):
     await call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=join_button(url))
 
 
-async def send_recording(uid: int, chat_id: int, data: bytes, filename: str, caption: str):
-    files = {"audio": (filename, data)}
-    for target in (uid, chat_id):
-        try:
-            r = await client().post(f"{API}/sendDocument", data={"chat_id": str(target), "caption": caption},
-                                    files={"document": files["audio"]}, timeout=300)
-            if r.json().get("ok"):
-                return target
-        except Exception as e:
-            log.warning("recording send failed to %s: %s", target, e)
-    return None
+async def send_recording(uid: int, data: bytes, filename: str, caption: str) -> bool:
+    """Recordings only ever go to the private chat of the person who recorded, never to the group."""
+    try:
+        r = await client().post(f"{API}/sendDocument", data={"chat_id": str(uid), "caption": caption},
+                                files={"document": (filename, data)}, timeout=300)
+        return bool(r.json().get("ok"))
+    except Exception as e:
+        log.warning("recording send failed to %s: %s", uid, e)
+        return False
 
 
 # ---- update handling ----------------------------------------------------------------------
 async def _handle(upd: dict):
     msg = upd.get("message")
+    if cm := upd.get("chat_member"):  # someone joined / left the group (needs the bot to be admin)
+        if cm["chat"]["type"] in ("group", "supergroup"):
+            new = cm.get("new_chat_member") or {}
+            if new.get("status") in ("left", "kicked"):
+                await forget_member(cm["chat"]["id"], new["user"]["id"])
+            else:
+                await remember_member(cm["chat"]["id"], new.get("user"))
+        return
+    if msg and msg.get("chat", {}).get("type") in ("group", "supergroup"):
+        gid = msg["chat"]["id"]
+        if not msg.get("sender_chat"):
+            await remember_member(gid, msg.get("from"))
+        for u in msg.get("new_chat_members") or []:
+            await remember_member(gid, u)
+        if left := msg.get("left_chat_member"):
+            await forget_member(gid, left["id"])
     if mcm := upd.get("my_chat_member"):
         chat = mcm["chat"]
         if chat["type"] in ("group", "supergroup"):
@@ -234,7 +331,7 @@ async def run_polling():
     offset = 0
     while True:
         try:
-            ups = await call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "my_chat_member"])
+            ups = await call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "my_chat_member", "chat_member"])
             for u in ups:
                 offset = u["update_id"] + 1
                 try:

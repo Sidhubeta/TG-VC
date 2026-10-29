@@ -70,6 +70,12 @@
     <symbol id="i-library" viewBox="0 0 24 24"><path d="M4 4v16M8.5 4v16M13 4.5l5.5 15M3.5 20.5h17"/></symbol>
     <symbol id="i-pip" viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><rect x="12" y="11.5" width="7" height="5.5" rx="1.2" fill="currentColor" stroke="none"/></symbol>
     <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 3v2m0 0a6 6 0 0 1 6 6v3l2 3H4l2-3v-3a6 6 0 0 1 6-6Zm-2 15a2 2 0 0 0 4 0"/></symbol>
+    <symbol id="i-flip" viewBox="0 0 24 24"><path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h1.8l1.4-2h4.6l1.4 2h1.8A2.5 2.5 0 0 1 20 8.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5v-9Z"/><path d="M15.5 11.5a3.6 3.6 0 0 0-6.6-1.2M8.5 14.5a3.6 3.6 0 0 0 6.6 1.2M8.6 8.6v1.9h1.9M15.4 17.4v-1.9h-1.9"/></symbol>
+    <symbol id="i-speaker" viewBox="0 0 24 24"><rect x="5" y="2.5" width="14" height="19" rx="3"/><circle cx="12" cy="14.5" r="3.5"/><circle cx="12" cy="7" r="1" fill="currentColor"/></symbol>
+    <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M8 14a4.6 4.6 0 0 0 8 0"/><circle cx="9" cy="9.5" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9.5" r="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-user-plus" viewBox="0 0 24 24"><circle cx="9.5" cy="8" r="4"/><path d="M2.5 20.5a7 7 0 0 1 14 0M19 8v6M16 11h6"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M3 12h2M7 8v8M11 4v16M15 7v10M19 10v4M21 12h0"/></symbol>
+    <symbol id="i-bt" viewBox="0 0 24 24"><path d="m7 7 10 10-5 4V3l5 4L7 17"/></symbol>
   </defs>
 </svg>
 
@@ -94,11 +100,20 @@
     <div class="list-h"><span id="lh-count">Participants</span></div>
     <div class="plist" id="grid"></div>
   </div>
+  <div id="chat-pop" aria-live="polite"></div>
+  <div id="fly-layer" aria-hidden="true"></div>
+  <div class="chatbar">
+    <button class="cb-btn" id="b-history" aria-label="Chat history"><svg class="ico"><use href="#i-chat"/></svg><span class="badge" id="chat-badge" hidden></span></button>
+    <input id="cb-input" type="text" maxlength="1000" placeholder="Message" enterkeyhint="send" autocomplete="off" aria-label="Message">
+    <button class="cb-btn" id="b-react" aria-label="Reactions"><svg class="ico"><use href="#i-smile"/></svg></button>
+    <button class="cb-btn send" id="b-send" aria-label="Send" hidden><svg class="ico"><use href="#i-send"/></svg></button>
+    <div id="react-bar" hidden></div>
+  </div>
   <nav class="dock">
     <button class="dk" id="b-cam"><span class="c"><svg class="ico"><use href="#i-video-off"/></svg></span><span>Video</span></button>
     <button class="dk" id="b-more"><span class="c"><svg class="ico"><use href="#i-more"/></svg></span><span>More</span></button>
     <div class="mic-wrap"><button class="mic wait" id="b-mic" aria-label="Microphone"><span class="halo"></span><span class="blob"></span><svg class="ico"><use href="#i-mic-off"/></svg></button><div class="mic-lbl" id="mic-lbl">Connecting</div></div>
-    <button class="dk" id="b-chat"><span class="c"><svg class="ico"><use href="#i-chat"/></svg></span><span>Chat</span><span class="badge" id="chat-badge" hidden></span></button>
+    <button class="dk" id="b-speaker"><span class="c"><svg class="ico"><use href="#i-speaker"/></svg></span><span>Audio</span></button>
     <button class="dk red" id="b-leave"><span class="c"><svg class="ico"><use href="#i-leave"/></svg></span><span>Leave</span></button>
   </nav>
 </main>

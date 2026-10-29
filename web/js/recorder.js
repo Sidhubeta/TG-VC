@@ -1,10 +1,10 @@
 // Admin recording: mixes everyone's voice + the music on the admin's device, then the bot sends the file.
-import { api, off, on, send, toast } from './core.js';
+import { api, h, off, on, send, sheet, toast } from './core.js';
 import { musicTap } from './player.js';
 import { getCtx } from './sounds.js';
 import { audioTracks } from './voice.js';
 
-let rec = null;
+let rec = null, recName = '';
 export const recorder = {
   async start() {
     if (rec) return toast('Already recording');
@@ -34,20 +34,30 @@ export const recorder = {
       const fd = new FormData();
       fd.append('file', blob, 'recording.' + ext);
       fd.append('ext', ext);
+      fd.append('name', recName);
       try {
-        const r = await api('/api/recording', { body: fd });
-        toast(r.to === 'dm' ? 'Recording sent to you by the bot' : 'Recording posted in the group', 4000);
-      } catch (e) { toast(e.message, 5000); }
+        await api('/api/recording', { body: fd });
+        toast('Recording sent to your private chat with the bot', 4000);
+      } catch (e) { toast(e.message, 5000); offerDownload(blob, ext); }
     };
     mr.start(5000);
     rec = { mr };
     send({ t: 'rec.start' });
     toast('Recording started');
   },
-  stop() {
+  stop(name = '') {
+    recName = String(name || '').trim().slice(0, 60);
     if (!rec) return send({ t: 'rec.stop' });
     try { rec.mr.stop(); } catch {}
     rec = null;
     send({ t: 'rec.stop' });
   },
 };
+
+// if the upload fails, don't lose the recording: let the admin save it on the phone instead
+function offerDownload(blob, ext) {
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { class: 'btn block', href: url, download: (recName || 'recording') + '.' + ext }, 'Save recording to this device');
+  sheet({ title: 'Recording not sent', body: h('div', null, h('p', { class: 'muted', style: { margin: '0 0 14px' } }, 'The recording couldn’t be sent. You can save it here instead.'), a),
+    onClose: () => setTimeout(() => URL.revokeObjectURL(url), 60000) });
+}

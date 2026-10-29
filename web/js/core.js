@@ -4,7 +4,7 @@ export const tg = window.Telegram?.WebApp || null;
 export const S = {
   session: '', uid: 0, chat: 0, admin: false, group: '',
   parts: new Map(), room: { settings: {}, rec: {}, count: 0 },
-  music: null, chat: [], offset: 0, liked: new Set(), unread: 0,
+  music: null, msgs: [], offset: 0, liked: new Set(), unread: 0, // chat = group id, msgs = chat messages
 };
 
 // ---------- tiny event bus ----------
@@ -260,4 +260,41 @@ export function copyText(text) {
   // writeText returns a promise that rejects (it doesn't throw) when the clipboard is blocked
   if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => toast('Copied'), () => copyFallback(text));
   else copyFallback(text);
+}
+
+// ---------- full-screen viewer for videos ----------
+// Telegram's in-app browser often ignores element.requestFullscreen(), so the video is moved into a
+// full-window overlay (and real fullscreen is requested on top when the browser allows it).
+export function fullView(el, { label = '', onClose = null } = {}) {
+  const home = el.parentNode, next = el.nextSibling;
+  let closed = false;
+  const ov = h('div', { class: 'fullview', role: 'dialog', 'aria-label': 'Full screen video' },
+    h('div', { class: 'fv-bar' }, label ? h('span', { class: 'fv-lbl' }, label) : h('span'),
+      h('button', { class: 'fv-close', 'aria-label': 'Exit full screen', onclick: (e) => { e.stopPropagation(); close(); } }, icon('close'))));
+  ov.prepend(el);
+  document.body.append(ov);
+  ov.addEventListener('click', () => ov.classList.toggle('ui-off'));
+  const unBack = pushBack(close);
+  const onFs = () => { if (!document.fullscreenElement && !document.webkitFullscreenElement) close(); };
+  try {
+    const req = ov.requestFullscreen || ov.webkitRequestFullscreen;
+    const p = req?.call(ov);
+    if (p?.then) p.then(() => {
+      document.addEventListener('fullscreenchange', onFs);
+      if (el.videoWidth > el.videoHeight) screen.orientation?.lock?.('landscape').catch(() => {});
+    }, () => {});
+  } catch {}
+  el.play?.().catch(() => {});
+  function close() {
+    if (closed) return; closed = true;
+    unBack();
+    document.removeEventListener('fullscreenchange', onFs);
+    try { screen.orientation?.unlock?.(); } catch {}
+    try { if (document.fullscreenElement) document.exitFullscreen(); } catch {}
+    if (onClose) onClose(el);
+    else if (home?.isConnected) home.insertBefore(el, next?.parentNode === home ? next : null);
+    ov.remove();
+    el.play?.().catch(() => {});
+  }
+  return { close };
 }

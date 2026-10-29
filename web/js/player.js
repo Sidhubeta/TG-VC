@@ -1,11 +1,12 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
-import { $, S, actionRow, api, avatarEl, confirmBox, dragToClose, emit, fmtTime, h, haptic, icon, media, on, pushBack, send, serverNow, sheet, store, toast } from './core.js';
+import { $, S, actionRow, api, avatarEl, confirmBox, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, toast } from './core.js';
 import { getCtx } from './sounds.js';
 
 // ======================= engine =======================
 const audio = new Audio();
 audio.preload = 'auto';
 audio.crossOrigin = 'anonymous';
+audio.preservesPitch = audio.mozPreservesPitch = audio.webkitPreservesPitch = false; // Slowed / Nightcore change pitch too
 const video = h('video', { class: 'vid', playsinline: true, muted: true, preload: 'auto' });
 video.muted = true;
 const isApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document || /iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -18,14 +19,17 @@ const P = {
   vol: store.get('vol', 1),
   localPaused: false, loadedQid: null, blocked: false, heights: [], autoH: 480, stalls: [],
 };
-let FX = store.get('fx', { preset: 'normal', bass: 0, mid: 0, treble: 0, reverb: 0, rate: 1, mode: 'none' });
+// Effects are shared: the server holds them and everyone hears the same thing, in sync.
+const FX_NONE = { preset: 'normal', bass: 0, mid: 0, treble: 0, reverb: 0, rate: 1, mode: 'none' };
+const fx = () => S.music?.fx || FX_NONE;
+const rate = () => S.music?.rate || 1;
 let G = null; // WebAudio graph
 
 const cur = () => S.music?.current || null;
 const playing = () => S.music?.status === 'playing';
 export function expectedPos() {
   const m = S.music; if (!m?.current) return 0;
-  const p = m.status === 'playing' ? m.pos + (serverNow() - m.upd) : m.pos;
+  const p = m.status === 'playing' ? m.pos + (serverNow() - m.upd) * (m.rate || 1) : m.pos;
   const d = m.current.duration || Infinity;
   return Math.max(0, Math.min(p, d));
 }
@@ -48,10 +52,9 @@ function load(t) {
   if (!t) { audio.removeAttribute('src'); audio.load(); unloadVideo(); return; }
   audio.src = audioSrc(t);
   audio.load();
-  if (videoWanted()) loadVideo(t);
+  if (P.mode === 'video') loadVideo(t);
   else unloadVideo();
 }
-function videoWanted() { return P.mode === 'video' && NP.open; }
 function loadVideo(t) {
   t = t || cur(); if (!t) return;
   const src = media(`/api/stream/${t.id}/video?q=${videoHeight()}`);
@@ -84,41 +87,49 @@ video.addEventListener('waiting', () => {
     const t = cur(); if (t) { delete video.dataset.src; loadVideo(t); }
   }
 });
-video.addEventListener('loadedmetadata', () => { video.currentTime = audio.currentTime || expectedPos(); if (!audio.paused) video.play().catch(() => {}); });
+video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused) video.play().catch(() => {}); });
+
+let lastVideoSeek = 0;
+function seekVideo() {
+  // aim a little ahead: after a seek the video needs a moment to buffer before it moves again
+  try { video.currentTime = Math.min(audio.currentTime + 0.3, video.duration || Infinity); lastVideoSeek = Date.now(); } catch {}
+}
 
 function sync(force = false) {
   const t = cur();
   if (!t) { if (!audio.paused) audio.pause(); return; }
   if (t.qid !== P.loadedQid) load(t);
   const want = playing() && !P.localPaused;
-  const exp = expectedPos();
-  const synced = FX.rate === 1;
-  if (audio.readyState >= 1) {
-    const drift = audio.currentTime - exp;
-    if (synced && (force || Math.abs(drift) > 1.5 || (!want && Math.abs(drift) > 0.4))) {
-      try { audio.currentTime = exp; } catch {}
-    } else if (synced && want && Math.abs(drift) > 0.25) {
-      audio.playbackRate = drift > 0 ? 0.96 : 1.04;
-    } else audio.playbackRate = FX.rate;
+  const r = rate();
+  if (audio.playbackRate !== r) audio.playbackRate = r;
+  if (audio.readyState >= 1 && !P.localPaused) {
+    const drift = audio.currentTime - expectedPos();
+    // Jump only when clearly out of sync. Tiny corrections (and speeding up / slowing down to catch up,
+    // which the old code did every 0.7s) are what made songs glitch and wobble.
+    if ((force && Math.abs(drift) > 0.35) || Math.abs(drift) > 1.2 || (!want && Math.abs(drift) > 0.5)) {
+      try { audio.currentTime = expectedPos(); } catch {}
+    }
   }
-  if (want && audio.paused) {
-    audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
-  } else if (!want && !audio.paused) audio.pause();
-  // video follows audio
+  if (want && audio.paused) audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
+  else if (!want && !audio.paused) audio.pause();
+  // the video follows the audio, but never chases it while it's still loading (that made it loop one second)
   if (video.dataset.src && video.readyState >= 1) {
-    if (Math.abs(video.currentTime - audio.currentTime) > 0.35) { try { video.currentTime = audio.currentTime; } catch {} }
-    video.playbackRate = audio.playbackRate;
-    if (!audio.paused && video.paused) video.play().catch(() => {});
+    if (video.playbackRate !== r) video.playbackRate = r;
+    const vd = video.currentTime - audio.currentTime;
+    if (Math.abs(vd) > 1 && !video.seeking && video.readyState >= 3 && Date.now() - lastVideoSeek > 4000) seekVideo();
+    if (!audio.paused && video.paused && video.isConnected) video.play().catch(() => {});
     if (audio.paused && !video.paused) video.pause();
   }
 }
 setInterval(sync, 700);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(true); });
 
 function setBlocked(b) {
   if (P.blocked === b) return;
   P.blocked = b;
   emit('music:blocked', b);
 }
+export const musicBlocked = () => P.blocked;
 export function unlockAudio() {
   getCtx();
   buildGraph();
@@ -159,71 +170,57 @@ function buildGraph() {
     const lfo = c.createOscillator(); lfo.frequency.value = 0.11;
     const lfoAmt = c.createGain(); lfoAmt.gain.value = 0;
     lfo.connect(lfoAmt); if (pan.pan) lfoAmt.connect(pan.pan); lfo.start();
-    const hrtf = c.createPanner(); hrtf.panningModel = 'HRTF'; hrtf.distanceModel = 'inverse'; hrtf.refDistance = 1; hrtf.rolloffFactor = 0.6;
-    const dry = c.createGain(), sp = c.createGain(); sp.gain.value = 0;
+    const dry = c.createGain();
     const conv = c.createConvolver(); conv.buffer = impulse(c, 2.6, 2.4);
     const wet = c.createGain(); wet.gain.value = 0;
     const comp = c.createDynamicsCompressor(); comp.threshold.value = -12; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.2;
     const master = c.createGain(); master.gain.value = P.vol;
-    src.connect(bass).connect(mid).connect(treble);
-    treble.connect(pan).connect(dry).connect(comp);
-    treble.connect(hrtf).connect(sp).connect(comp);
-    treble.connect(conv).connect(wet).connect(comp);
+    src.connect(bass).connect(mid).connect(treble).connect(pan);
+    pan.connect(dry).connect(comp);
+    pan.connect(conv).connect(wet).connect(comp);
     comp.connect(master).connect(c.destination);
-    G = { c, bass, mid, treble, pan, lfoAmt, hrtf, dry, sp, wet, master, angle: 0 };
+    G = { c, bass, mid, treble, pan, lfoAmt, dry, wet, master };
     applyFx();
+    const sink = store.get('dev:audiooutput', '');
+    if (sink) setMusicSink(sink);
   } catch (e) { console.warn('fx graph failed', e); }
 }
-// moves the 3D source around the head; only runs while Spatial 3D is on
-let spinning = false;
-function spin() {
-  if (spinning) return;
-  spinning = true;
-  let last = performance.now();
-  const step = (t) => {
-    if (!G || FX.mode !== 'spatial') { spinning = false; return; }
-    const dt = Math.min(0.1, (t - last) / 1000); last = t;
-    G.angle += dt * 0.35;
-    const x = Math.sin(G.angle) * 1.6, z = Math.cos(G.angle) * 1.6, y = Math.sin(G.angle * 0.5) * 0.4;
-    const hp = G.hrtf;
-    if (hp.positionX) { hp.positionX.value = x; hp.positionY.value = y; hp.positionZ.value = z; } else hp.setPosition(x, y, z);
-    requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
-}
+// Effects that change only small details or needed headphones to notice (Spatial 3D, Treble) were dropped.
 const PRESETS = {
   normal: { label: 'Normal', e: '🎵', v: { bass: 0, mid: 0, treble: 0, reverb: 0, rate: 1, mode: 'none' } },
   bass: { label: 'Bass Boost', e: '🔊', v: { bass: 9, mid: 0, treble: 1, reverb: 0, rate: 1, mode: 'none' } },
   '8d': { label: '8D Audio', e: '🎧', v: { bass: 2, mid: 0, treble: 1, reverb: 0.22, rate: 1, mode: '8d' } },
-  spatial: { label: 'Spatial 3D', e: '🌐', v: { bass: 2, mid: 0, treble: 1, reverb: 0.18, rate: 1, mode: 'spatial' } },
   hall: { label: 'Concert Hall', e: '🏛️', v: { bass: 2, mid: 0, treble: 1, reverb: 0.5, rate: 1, mode: 'none' } },
-  vocal: { label: 'Vocal', e: '🎤', v: { bass: -3, mid: 4, treble: 2, reverb: 0.05, rate: 1, mode: 'none' } },
+  vocal: { label: 'Vocal', e: '🎤', v: { bass: -4, mid: 6, treble: 3, reverb: 0.05, rate: 1, mode: 'none' } },
   slowed: { label: 'Slowed + Reverb', e: '🌙', v: { bass: 3, mid: 0, treble: -1, reverb: 0.42, rate: 0.85, mode: 'none' } },
   nightcore: { label: 'Nightcore', e: '⚡', v: { bass: 1, mid: 0, treble: 2, reverb: 0, rate: 1.25, mode: 'none' } },
-  treble: { label: 'Treble', e: '✨', v: { bass: -1, mid: 0, treble: 7, reverb: 0, rate: 1, mode: 'none' } },
 };
 function applyFx() {
-  store.set('fx', FX);
-  audio.preservesPitch = audio.mozPreservesPitch = audio.webkitPreservesPitch = FX.rate === 1;
-  audio.playbackRate = FX.rate;
   if (!G) return;
-  const t = G.c.currentTime;
-  G.bass.gain.setTargetAtTime(FX.bass, t, 0.05);
-  G.mid.gain.setTargetAtTime(FX.mid, t, 0.05);
-  G.treble.gain.setTargetAtTime(FX.treble, t, 0.05);
-  G.wet.gain.setTargetAtTime(FX.reverb * 1.4, t, 0.1);
-  G.dry.gain.setTargetAtTime(FX.mode === 'spatial' ? 0 : 1 - FX.reverb * 0.35, t, 0.1);
-  G.sp.gain.setTargetAtTime(FX.mode === 'spatial' ? 1.25 : 0, t, 0.1);
-  G.lfoAmt.gain.setTargetAtTime(FX.mode === '8d' ? 0.95 : 0, t, 0.1);
-  if (FX.mode !== '8d' && G.pan.pan) G.pan.pan.setTargetAtTime(0, t, 0.1);
-  if (FX.mode === 'spatial') spin();
-  if (FX.rate === 1) sync(true);
+  const f = fx(), t = G.c.currentTime;
+  G.bass.gain.setTargetAtTime(f.bass, t, 0.05);
+  G.mid.gain.setTargetAtTime(f.mid, t, 0.05);
+  G.treble.gain.setTargetAtTime(f.treble, t, 0.05);
+  G.wet.gain.setTargetAtTime(f.reverb * 1.4, t, 0.1);
+  G.dry.gain.setTargetAtTime(1 - f.reverb * 0.35, t, 0.1);
+  G.lfoAmt.gain.setTargetAtTime(f.mode === '8d' ? 0.95 : 0, t, 0.1);
+  if (f.mode !== '8d' && G.pan.pan) G.pan.pan.setTargetAtTime(0, t, 0.1);
 }
 function setVol(v) {
   P.vol = v; store.set('vol', v);
   if (G) G.master.gain.setTargetAtTime(v, G.c.currentTime, 0.05);
   else audio.volume = v;
 }
+export const getMusicVolume = () => P.vol;
+export const setMusicVolume = (v) => setVol(v);
+// speaker / Bluetooth choice from the Audio sheet also moves the music
+async function setMusicSink(id) {
+  try {
+    if (G?.c.setSinkId) await G.c.setSinkId(id);
+    else if (audio.setSinkId) await audio.setSinkId(id);
+  } catch (e) { console.warn('music output switch failed', e); }
+}
+on('voice:sink', setMusicSink);
 export function musicTap() { return G ? { ctx: G.c, node: G.master } : null; }
 
 // ======================= colors from artwork =======================
@@ -288,7 +285,10 @@ export function renderCard() {
   }
   el.onclick = () => openNP();
   const isPlay = playing() && !P.localPaused;
+  const showVid = P.mode === 'video' && !NP.open && !FV;
+  el.classList.toggle('has-video', showVid);
   el.append(
+    showVid ? videoBox('card-vid') : null,
     h('div', { class: 'art', style: { backgroundImage: `url("${media(t.thumb)}")` } }),
     h('div', { class: 'meta' },
       h('div', { class: 'ttl' }, h('span', { class: 'eq' }, h('i'), h('i'), h('i')), t.title),
@@ -299,6 +299,21 @@ export function renderCard() {
     h('div', { class: 'bar', id: 'np-bar' }));
 }
 function canAdd() { return S.admin || !S.room.settings?.music_admin_only; }
+
+// ---- music video: one <video> element that lives in the player, in the room card, or full screen ----
+let FV = null;
+function videoBox(cls) {
+  const box = h('div', { class: cls, onclick: (e) => e.stopPropagation() }, video,
+    h('button', { class: 'round vbtn', 'aria-label': 'Full screen', onclick: (e) => { e.stopPropagation(); openVideoFull(); } }, icon('expand')),
+    pipSupported(video) ? h('button', { class: 'round vbtn pip', 'aria-label': 'Picture in picture', onclick: (e) => { e.stopPropagation(); pip(video); } }, icon('pip')) : null);
+  if (P.mode === 'video') loadVideo();
+  return box;
+}
+function openVideoFull() {
+  if (FV) return;
+  haptic('light');
+  FV = fullView(video, { label: cur()?.title || '', onClose: () => { FV = null; renderCard(); if (NP.open) renderStage(); } });
+}
 
 // ======================= controls =======================
 function togglePlay() {
@@ -381,7 +396,7 @@ function closeNP() {
   NP.el.classList.remove('show');
   NP.el.style.transform = '';
   popBack?.(); popBack = null;
-  setTimeout(() => { if (!NP.open && document.pictureInPictureElement !== video && video.webkitPresentationMode !== 'picture-in-picture') unloadVideo(); }, 500);
+  renderCard(); // in video mode the video moves to the room screen and keeps playing
 }
 function setView(v) {
   NP.view = v;
@@ -397,17 +412,8 @@ function renderStage() {
   if (!t) return;
   if (NP.view === 'lyrics') return renderLyrics(st, t);
   if (NP.view === 'queue') return renderQueue(st);
-  if (P.mode === 'video') {
-    st.append(video);
-    const fs = h('button', { class: 'round', style: { position: 'absolute', right: '8px', top: '8px' }, 'aria-label': 'Full screen', onclick: () => {
-      try { (video.requestFullscreen || video.webkitEnterFullscreen || video.webkitRequestFullscreen).call(video); } catch {}
-    } }, icon('expand'));
-    st.append(fs);
-    if (pipSupported(video)) st.append(h('button', { class: 'round', style: { position: 'absolute', right: '50px', top: '8px' }, 'aria-label': 'Picture in picture', onclick: () => pip(video) }, icon('pip')));
-  } else {
-    st.append(h('div', { class: 'big-art', style: { backgroundImage: `url("${media(t.thumb)}")` } }));
-  }
-  if (P.blocked) st.append(h('button', { class: 'btn tap-play', onclick: unlockAudio }, icon('play', 'fill'), 'Tap to listen'));
+  if (P.mode === 'video' && !FV) st.append(videoBox('np-vid'));
+  else st.append(h('div', { class: 'big-art', style: { backgroundImage: `url("${media(t.thumb)}")` } }));
 }
 
 // ---- scrubber (admins seek for everyone) ----
@@ -435,7 +441,7 @@ function tickUI() {
   const d = t?.duration || audio.duration || 0;
   const bar = $('#np-bar'); if (bar) bar.style.width = d ? `${Math.min(100, pos / d * 100)}%` : '0';
   if (NP.open && !NP.scrubbing && d) paintScrub(Math.min(1, pos / d));
-  if (NP.open && NP.view === 'lyrics') highlightLyrics(FX.rate === 1 && !P.localPaused ? pos : audio.currentTime);
+  if (NP.open && NP.view === 'lyrics') highlightLyrics(pos);
 }
 setInterval(tickUI, 250);
 
@@ -459,12 +465,12 @@ export function refresh() {
   el.querySelector('#np-like').classList.toggle('on', S.liked.has(t.id));
   el.querySelector('#np-like').replaceChildren(icon('heart', S.liked.has(t.id) ? 'fill' : ''));
   el.querySelector('#tab-vid').classList.toggle('on', P.mode === 'video');
-  el.querySelector('#tab-fx').classList.toggle('on', FX.preset !== 'normal');
+  el.querySelector('#tab-fx').classList.toggle('on', fx().preset !== 'normal');
   if (NP.view === 'queue') renderStage();
 }
 
 // ======================= server updates =======================
-let lastQid = null;
+let lastQid = null, lastTimeline = '', lastFx = '';
 on('ws:music', (m) => onMusic(m.m));
 on('ws:init', (m) => onMusic(m.music));
 function onMusic(m) {
@@ -476,11 +482,16 @@ function onMusic(m) {
     if (t) extractColors(media(t.thumb));
     if (NP.open) renderStage();
   }
-  sync(true);
+  // Re-align playback only when the timeline really changed (new song, pause, seek, speed). The old code
+  // re-seeked on every update (someone adding a song, a vote…), which made the music skip for everyone.
+  const timeline = [t?.qid, m.status, m.pos, m.upd, m.rate].join('|');
+  sync(timeline !== lastTimeline);
+  lastTimeline = timeline;
+  const fxKey = JSON.stringify(m.fx || FX_NONE);
+  if (fxKey !== lastFx) { lastFx = fxKey; applyFx(); emit('music:fx'); }
   refresh();
   emit('music:changed');
 }
-on('music:blocked', () => { if (NP.open && NP.view === 'art') renderStage(); });
 
 // ======================= lyrics =======================
 async function renderLyrics(st, t) {
@@ -590,7 +601,7 @@ function toggleMode() {
   haptic('select');
   P.mode = P.mode === 'video' ? 'audio' : 'video';
   store.set('mode', P.mode);
-  if (P.mode === 'video') loadVideo(); else unloadVideo();
+  if (P.mode === 'video') loadVideo(); else { FV?.close(); unloadVideo(); }
   toast(P.mode === 'video' ? 'Video on' : 'Audio only — uses less data');
   renderStage(); refresh();
 }
@@ -614,37 +625,54 @@ async function openQuality() {
             String(P.vq) === String(q) ? icon('check') : null))));
   };
   const setAq = (k) => { P.aq = k; store.set('aq', k); const c = cur(); if (c) { audio.src = audioSrc(c); audio.load(); } render(); };
-  const setVq = (q) => { P.vq = q; store.set('vq', q); if (q === 'auto') pickAutoH(); delete video.dataset.src; if (P.mode === 'video' && NP.open) loadVideo(); render(); };
+  const setVq = (q) => { P.vq = q; store.set('vq', q); if (q === 'auto') pickAutoH(); delete video.dataset.src; if (P.mode === 'video') loadVideo(); render(); };
   render();
   if (t) { try { P.heights = (await api(`/api/formats/${t.id}`)).heights; render(); } catch {} }
 }
 
 // ======================= effects sheet =======================
+// Everyone hears the same effect. Only admins, or whoever added the playing song, can change it.
+const canFx = () => S.admin || (cur() && cur().byUid === S.uid);
 function openFx() {
   unlockAudio();
   const body = h('div');
-  const s = sheet({ title: 'Sound', body });
-  const slider = (key, label, min, max, step, fmt) => {
-    const out = h('output', null, fmt(FX[key]));
-    const r = h('input', { type: 'range', min, max, step, value: FX[key], 'aria-label': label });
+  let draft = { ...fx() }, tmr = null;
+  const push = () => { clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 120); };
+  const slider = (key, label, min, max, step, fmt, allowed) => {
+    const out = h('output', null, fmt(draft[key]));
+    const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label, disabled: !allowed });
     const paint = () => r.style.setProperty('--v', ((r.value - min) / (max - min) * 100) + '%');
-    r.oninput = () => { FX[key] = Number(r.value); FX.preset = 'custom'; out.textContent = fmt(FX[key]); paint(); applyFx(); body.querySelectorAll('.fx').forEach(b => b.classList.remove('on')); };
+    r.oninput = () => {
+      draft[key] = Number(r.value); draft.preset = 'custom'; out.textContent = fmt(draft[key]); paint(); push();
+      body.querySelectorAll('.fx').forEach(b => b.classList.remove('on'));
+    };
     paint();
-    return h('div', { class: 'slider-row' }, h('label', null, label), r, out);
+    return h('div', { class: 'slider-row' + (allowed ? '' : ' ro') }, h('label', null, label), r, out);
   };
   const render = () => {
+    draft = { ...fx() };
+    const allowed = canFx();
     body.replaceChildren(
+      allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'Only admins or the person who added this song can change the sound.'),
       h('div', { class: 'fx-grid' }, ...Object.entries(PRESETS).map(([k, p]) =>
-        h('button', { class: 'fx' + (FX.preset === k ? ' on' : ''), onclick: () => { FX = { ...p.v, preset: k }; applyFx(); haptic('select'); render(); refresh(); } }, h('span', null, p.e), p.label))),
-      slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB'),
-      slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB'),
-      slider('treble', 'Treble', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB'),
-      slider('reverb', 'Reverb', 0, 0.8, 0.01, v => Math.round(v * 100) + '%'),
-      slider('rate', 'Speed', 0.7, 1.4, 0.05, v => v.toFixed(2) + '×'),
-      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '12px' } },
-        'Effects change only what you hear. 8D and Spatial 3D sound best with headphones. ',
-        FX.rate !== 1 ? 'Changing speed takes you out of sync with the room until you set it back to 1×.' : ''));
+        h('button', { class: 'fx' + (draft.preset === k ? ' on' : ''), disabled: !allowed, onclick: () => { draft = { ...p.v, preset: k }; send({ t: 'music.fx', fx: draft }); haptic('select'); } }, h('span', null, p.e), p.label))),
+      slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
+      slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
+      slider('treble', 'Treble', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
+      slider('reverb', 'Reverb', 0, 0.8, 0.01, v => Math.round(v * 100) + '%', allowed),
+      slider('rate', 'Speed', 0.7, 1.4, 0.05, v => Number(v).toFixed(2) + '×', allowed),
+      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '12px' } }, 'Everyone in the voice chat hears this effect, in sync. 8D sounds best with headphones.'));
   };
+  // redraw when someone else changes it (not on the echo of our own slider, which would break the drag)
+  const onFx = () => {
+    const f = fx(), same = ['bass', 'mid', 'treble', 'reverb', 'rate', 'mode'].every(k => String(f[k]) === String(draft[k]));
+    if (!same || f.preset !== draft.preset) render();
+  };
+  on('music:fx', onFx);
+  on('music:changed', onFxOwner);
+  let owner = canFx();
+  function onFxOwner() { if (canFx() !== owner) { owner = canFx(); render(); } }
+  sheet({ title: 'Sound effects', body, onClose: () => { off('music:fx', onFx); off('music:changed', onFxOwner); } });
   render();
 }
 

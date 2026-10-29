@@ -1,14 +1,19 @@
 // Voice / video via LiveKit (SFU). Our WebSocket is the source of truth for the room; LiveKit only moves media.
-import { S, api, emit, h, send, store, toast } from './core.js';
+import { S, api, emit, send, store, toast } from './core.js';
 
+const LK_VERSION = '2.23.0';
 let LK = null, room = null, info = null, connecting = false;
 const volumes = new Map(Object.entries(store.get('vols', {})).map(([k, v]) => [Number(k), v]));
 const mutedForMe = new Set(store.get('mutedForMe', []));
-export const V = { ready: false, mic: false, cam: false, screen: false, levels: new Map(), speaking: new Set() };
+let roomVol = store.get('roomVol', 1);
+export const V = {
+  ready: false, mic: false, cam: false, screen: false, facing: 'user',
+  noise: store.get('noise', true), levels: new Map(), speaking: new Set(),
+};
 
 async function loadSDK() {
   if (LK) return LK;
-  for (const src of ['/static/vendor/livekit-client.esm.mjs', 'https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs']) {
+  for (const src of ['/static/vendor/livekit-client.esm.mjs', `https://cdn.jsdelivr.net/npm/livekit-client@${LK_VERSION}/dist/livekit-client.esm.mjs`]) {
     try { LK = await import(src); return LK; } catch (e) { console.warn('livekit load failed', src, e); }
   }
   return null;
@@ -28,10 +33,18 @@ async function connect() {
   const old = room; room = null;
   if (old) { try { await old.disconnect(); } catch {} old.removeAllListeners?.(); }
   try {
+    const mic = store.get('dev:audioinput', ''), out = store.get('dev:audiooutput', '');
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
-      audioCaptureDefaults: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      publishDefaults: { dtx: true, red: true },
+      audioCaptureDefaults: {
+        echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
+        ...(mic ? { deviceId: mic } : {}),
+      },
+      ...(out ? { audioOutput: { deviceId: out } } : {}),
+      // DTX (stop sending in silence) clips the first syllable after a pause, which sounds like the voice
+      // flickering; RED resends audio so lost packets don't crackle. 48 kbps keeps voices clear.
+      publishDefaults: { dtx: false, red: true, audioPreset: { maxBitrate: 48000 } },
+      videoCaptureDefaults: { resolution: LK.VideoPresets?.h540?.resolution },
     });
     wire(room);
     await room.connect(info.url, info.token, { autoSubscribe: true });
@@ -69,39 +82,50 @@ function resetLocal() {
   if (was) emit('voice:local');
 }
 
+const uidOf = (p) => Number(p.identity);
+function videoEvent(pub, p, on) {
+  const local = p === room?.localParticipant;
+  emit('voice:video', { uid: local ? S.uid : uidOf(p), track: pub.track, source: pub.source, on: on && !!pub.track, local });
+}
+
 function wire(r) {
   const E = LK.RoomEvent;
   r.on(E.TrackSubscribed, (track, pub, p) => {
-    const uid = Number(p.identity);
     if (track.kind === 'audio') {
       const el = track.attach();
-      el.dataset.uid = uid;
+      el.dataset.uid = uidOf(p);
       el.style.display = 'none';
       document.body.append(el);
       applyVolume(p);
-      emit('voice:audio-track', { uid, track });
-    } else if (track.kind === 'video') {
-      emit('voice:video', { uid, track, source: pub.source, on: true });
+      emit('voice:audio-track', { uid: uidOf(p), track });
+    } else if (track.kind === 'video' && !pub.isMuted) {
+      videoEvent(pub, p, true);
     }
   });
   r.on(E.TrackUnsubscribed, (track, pub, p) => {
     track.detach().forEach(el => el.remove());
-    if (track.kind === 'video') emit('voice:video', { uid: Number(p.identity), track, source: pub.source, on: false });
+    if (track.kind === 'video') videoEvent(pub, p, false);
   });
+  // A muted camera keeps its publication but sends no frames: hide the tile instead of showing a black box.
+  r.on(E.TrackMuted, (pub, p) => { if (pub.kind === 'video') videoEvent(pub, p, false); });
+  r.on(E.TrackUnmuted, (pub, p) => { if (pub.kind === 'video') videoEvent(pub, p, true); });
+  r.on(E.TrackPublished, (pub, p) => { if (pub.kind === 'audio') applyVolume(p); });
   r.on(E.LocalTrackPublished, (pub) => {
-    if (pub.track?.kind === 'video') emit('voice:video', { uid: S.uid, track: pub.track, source: pub.source, on: true, local: true });
-    if (pub.track?.kind === 'audio') emit('voice:audio-track', { uid: S.uid, track: pub.track, local: true });
+    const p = r.localParticipant;
+    if (pub.kind === 'video' && !pub.isMuted) videoEvent(pub, p, true);
+    if (pub.kind === 'audio') emit('voice:audio-track', { uid: S.uid, track: pub.track, local: true });
   });
   r.on(E.LocalTrackUnpublished, (pub) => {
-    if (pub.track?.kind === 'video' || pub.kind === 'video') emit('voice:video', { uid: S.uid, track: pub.track, source: pub.source, on: false, local: true });
+    if (pub.kind === 'video') videoEvent(pub, r.localParticipant, false);
     if (pub.source === LK.Track.Source.ScreenShare && V.screen) { V.screen = false; send({ t: 'screen', on: false }); emit('voice:local'); }
   });
   r.on(E.ActiveSpeakersChanged, (speakers) => {
-    V.speaking = new Set(speakers.map(p => Number(p.identity)));
+    V.speaking = new Set(speakers.map(uidOf));
     emit('voice:speaking', V.speaking);
   });
   r.on(E.AudioPlaybackStatusChanged, () => emit('voice:blocked', !r.canPlaybackAudio));
   r.on(E.ParticipantConnected, applyVolume);
+  r.on(E.MediaDevicesChanged, () => emit('voice:devices'));
   r.on(E.ParticipantPermissionsChanged, (prev, p) => {
     if (p === r.localParticipant && !p.permissions?.canPublish) {
       V.mic = V.cam = V.screen = false;
@@ -126,8 +150,8 @@ function wire(r) {
   startLevels();
 }
 
-// audio levels for speaking rings. One loop for the whole page (it used to start a new one on every
-// reconnect), ~20 fps and only emitting when something changed, so idle rooms cost nothing.
+// audio levels for speaking rings. One loop for the whole page, ~20 fps and only emitting when
+// something changed, so idle rooms cost nothing.
 let levelsOn = false, lastTick = 0, lastSum = -1;
 function startLevels() {
   if (levelsOn) return;
@@ -139,7 +163,7 @@ function startLevels() {
     let sum = 0;
     const seen = new Set();
     for (const p of [room.localParticipant, ...room.remoteParticipants.values()]) {
-      const uid = Number(p.identity), l = p.isSpeaking ? p.audioLevel : 0;
+      const uid = uidOf(p), l = p.isSpeaking ? p.audioLevel : 0;
       seen.add(uid); V.levels.set(uid, l); sum += l;
     }
     for (const uid of V.levels.keys()) if (!seen.has(uid)) V.levels.delete(uid);
@@ -150,7 +174,12 @@ function startLevels() {
   requestAnimationFrame(tick);
 }
 
-export async function unblockAudio() { try { await room?.startAudio(); emit('voice:blocked', false); } catch {} }
+export async function unblockAudio() {
+  try { if (room && !room.canPlaybackAudio) await room.startAudio(); } catch {}
+  if (ns?.ctx.state === 'suspended') ns.ctx.resume().catch(() => {});
+  if (!room || room.canPlaybackAudio) emit('voice:blocked', false);
+}
+export const audioBlocked = () => !!room && !room.canPlaybackAudio;
 
 // After an admin changes our permissions, LiveKit needs a fresh token with canPublish.
 export async function refreshPermissions() {
@@ -161,11 +190,72 @@ export async function refreshPermissions() {
   await new Promise(r => setTimeout(r, 700));
 }
 
+// ---------------- noise isolation (RNNoise, runs on the phone) ----------------
+// Removes fans, traffic, keyboard and room noise from your mic before it is sent. If the phone can't run it
+// (no AudioWorklet / WebAssembly), the browser's own noise suppression is still on.
+let ns = null, nsWarned = false;
+async function nsSetup() {
+  if (!ns) {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000, latencyHint: 'interactive' });
+    const base = '/static/vendor/nsuppress/';
+    const mod = await import(base + 'index.js');
+    const [wasm] = await Promise.all([
+      mod.loadRnnoise({ url: base + 'rnnoise.wasm', simdUrl: base + 'rnnoise_simd.wasm' }),
+      ctx.audioWorklet.addModule(base + 'rnnoiseWorklet.js'),
+    ]);
+    ns = { ctx, mod, wasm };
+  }
+  if (ns.ctx.state === 'suspended') ns.ctx.resume().catch(() => {});
+  return ns;
+}
+function rnnoiseProcessor() {
+  let src = null, node = null;
+  const proc = {
+    name: 'rnnoise',
+    async init({ track, audioContext }) {
+      src = audioContext.createMediaStreamSource(new MediaStream([track]));
+      node = new ns.mod.RnnoiseWorkletNode(audioContext, { maxChannels: 1, wasmBinary: ns.wasm });
+      const dest = audioContext.createMediaStreamDestination();
+      src.connect(node).connect(dest);
+      proc.processedTrack = dest.stream.getAudioTracks()[0];
+    },
+    async restart(opts) { await proc.destroy(); await proc.init(opts); },
+    async destroy() {
+      try { src?.disconnect(); node?.disconnect(); node?.destroy(); } catch {}
+      src = node = null;
+    },
+  };
+  return proc;
+}
+async function applyNoise() {
+  const track = room?.localParticipant.getTrackPublication(LK.Track.Source.Microphone)?.audioTrack;
+  if (!track) return;
+  const active = !!track.getProcessor?.();
+  try {
+    if (V.noise && !active) {
+      const { ctx } = await nsSetup();
+      await track.setAudioContext(ctx);
+      await track.setProcessor(rnnoiseProcessor());
+    } else if (!V.noise && active) {
+      await track.stopProcessor();
+    }
+  } catch (e) {
+    console.warn('noise isolation unavailable', e);
+    if (!nsWarned) { nsWarned = true; toast('Noise isolation isn’t supported on this phone — using standard noise reduction'); }
+  }
+}
+export async function setNoise(on) {
+  V.noise = on;
+  store.set('noise', on);
+  await applyNoise();
+}
+
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }
   try {
     if (on) await refreshPermissions();
     await room.localParticipant.setMicrophoneEnabled(on);
+    if (on) await applyNoise();
     V.mic = on;
     send({ t: 'mic', on });
     return true;
@@ -175,30 +265,56 @@ export async function setMic(on) {
     return false;
   }
 }
-async function setSource(kind, on) {
-  const lp = room.localParticipant;
-  const fn = kind === 'cam' ? lp.setCameraEnabled : lp.setScreenShareEnabled;
-  if (fn) return fn.call(lp, on, kind === 'cam' ? { resolution: LK.VideoPresets?.h540?.resolution } : { audio: false });
-  return lp.setTrackEnabled(kind === 'cam' ? LK.Track.Source.Camera : LK.Track.Source.ScreenShare, on);
-}
-export async function setCam(on) {
+
+// ---------------- camera + screen ----------------
+const camRes = () => LK.VideoPresets?.h540?.resolution;
+export async function setCam(on, facing = V.facing) {
   if (!room || !V.ready) return toast('Voice is still connecting');
-  try { await setSource('cam', on); V.cam = on; send({ t: 'video', on }); emit('voice:local'); }
-  catch (e) { console.error(e); toast('Camera unavailable — allow camera access'); }
+  const lp = room.localParticipant;
+  try {
+    if (on) {
+      V.facing = facing;
+      await lp.setCameraEnabled(true, { facingMode: facing, resolution: camRes() });
+    } else {
+      // Unpublish instead of mute: the camera light goes off, everyone's tile disappears at once, and the
+      // next start can use the other camera.
+      const pub = lp.getTrackPublication(LK.Track.Source.Camera);
+      if (pub?.track) await lp.unpublishTrack(pub.track, true);
+    }
+    V.cam = on;
+    send({ t: 'video', on });
+    emit('voice:local');
+  } catch (e) {
+    console.error(e);
+    toast('Camera unavailable — allow camera access');
+  }
+}
+export async function flipCamera() {
+  const track = room?.localParticipant.getTrackPublication(LK.Track.Source.Camera)?.videoTrack;
+  if (!track) return;
+  const facing = V.facing === 'user' ? 'environment' : 'user';
+  try {
+    await track.restartTrack({ facingMode: facing, resolution: camRes() });
+    V.facing = facing;
+    emit('voice:local');
+    emit('voice:facing', facing);
+  } catch (e) { console.error(e); toast('Couldn’t switch camera'); }
 }
 export const screenSupported = () => !!navigator.mediaDevices?.getDisplayMedia;
 export async function setScreen(on) {
   if (!room || !V.ready) return toast('Voice is still connecting');
   if (!screenSupported()) return toast('Screen sharing works on desktop Telegram');
-  try { await setSource('screen', on); V.screen = on; send({ t: 'screen', on }); emit('voice:local'); }
+  try { await room.localParticipant.setScreenShareEnabled(on, { audio: false }); V.screen = on; send({ t: 'screen', on }); emit('voice:local'); }
   catch (e) { console.error(e); V.screen = false; emit('voice:local'); }
 }
 
-// per-user volume (0..1) and mute-for-me
+// ---------------- volume + mute for me ----------------
 function applyVolume(p) {
-  const uid = Number(p.identity);
-  const v = mutedForMe.has(uid) ? 0 : (volumes.get(uid) ?? 1);
-  try { p.setVolume(v); } catch {}
+  const uid = uidOf(p);
+  const muted = mutedForMe.has(uid);
+  try { p.setVolume(muted ? 0 : Math.min(1, (volumes.get(uid) ?? 1) * roomVol)); } catch {}
+  // Volume alone isn't enough: iPhones ignore audio element volume. Stop receiving their audio instead.
+  p.audioTrackPublications?.forEach(pub => { try { if (pub.isDesired !== false) pub.setEnabled(!muted); } catch {} });
 }
 export const getVolume = (uid) => volumes.get(uid) ?? 1;
 export const isMutedForMe = (uid) => mutedForMe.has(uid);
@@ -212,6 +328,29 @@ export function toggleMuteForMe(uid) {
   store.set('mutedForMe', [...mutedForMe]);
   const p = room?.remoteParticipants.get(String(uid)); if (p) applyVolume(p);
   return mutedForMe.has(uid);
+}
+export const getRoomVolume = () => roomVol;
+export function setRoomVolume(v) {
+  roomVol = v;
+  store.set('roomVol', v);
+  room?.remoteParticipants.forEach(applyVolume);
+}
+
+// ---------------- audio devices (speaker / Bluetooth / mic) ----------------
+export async function listDevices(kind) {
+  try {
+    return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === kind && d.deviceId);
+  } catch { return []; }
+}
+export const canPickOutput = () => typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
+export const currentDevice = (kind) => store.get('dev:' + kind, '');
+export async function useDevice(kind, deviceId) {
+  store.set('dev:' + kind, deviceId);
+  try { if (room) await room.switchActiveDevice(kind, deviceId); }
+  catch (e) { console.warn(e); toast('Couldn’t switch to that device'); return false; }
+  if (kind === 'audiooutput') emit('voice:sink', deviceId);
+  if (kind === 'audioinput' && V.mic) await applyNoise();
+  return true;
 }
 
 export async function leaveVoice() {

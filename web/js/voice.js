@@ -8,7 +8,7 @@ const mutedForMe = new Set(store.get('mutedForMe', []));
 let roomVol = store.get('roomVol', 1);
 export const V = {
   ready: false, mic: false, cam: false, screen: false, facing: 'user',
-  noise: store.get('noise', true), levels: new Map(), speaking: new Set(),
+  noise: store.get('noise', true), speaking: new Set(),
 };
 
 async function loadSDK() {
@@ -149,31 +149,6 @@ function wire(r) {
     emit('voice', { state: 'connecting' });
     scheduleRetry(1500);
   });
-  startLevels();
-}
-
-// audio levels for speaking rings. One loop for the whole page, ~20 fps and only emitting when
-// something changed, so idle rooms cost nothing.
-let levelsOn = false, lastTick = 0, lastSum = -1;
-function startLevels() {
-  if (levelsOn) return;
-  levelsOn = true;
-  const tick = (t) => {
-    requestAnimationFrame(tick);
-    if (!room || t - lastTick < 50 || document.hidden) return;
-    lastTick = t;
-    let sum = 0;
-    const seen = new Set();
-    for (const p of [room.localParticipant, ...room.remoteParticipants.values()]) {
-      const uid = uidOf(p), l = p.isSpeaking ? p.audioLevel : 0;
-      seen.add(uid); V.levels.set(uid, l); sum += l;
-    }
-    for (const uid of V.levels.keys()) if (!seen.has(uid)) V.levels.delete(uid);
-    if (sum === 0 && lastSum === 0) return;
-    lastSum = sum;
-    emit('voice:levels', V.levels);
-  };
-  requestAnimationFrame(tick);
 }
 
 export async function unblockAudio() {
@@ -276,10 +251,19 @@ export async function setNoise(on) {
   await applyNoise();
   emit('voice:noise', nsState);
 }
-// keep the processing context running after the phone was locked / Telegram was minimized
-const wake = () => { if (nsC && nsC.state !== 'running' && nsState === 'active') nsC.resume().catch(() => {}); };
-document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
-document.addEventListener('pointerdown', wake, { capture: true, passive: true });
+// Telegram in the background: phones give a hidden app little CPU, and the noise isolation (which runs every
+// 2.7 ms) then crackles. While hidden, the mic uses the phone's own noise reduction; it switches back on return.
+let bgOff = false;
+document.addEventListener('visibilitychange', async () => {
+  const track = room?.localParticipant.getTrackPublication(LK?.Track.Source.Microphone)?.audioTrack;
+  if (document.hidden) {
+    if (track?.getProcessor?.()) { bgOff = true; try { await track.stopProcessor(); } catch {} }
+  } else {
+    if (nsC && nsC.state !== 'running') nsC.resume().catch(() => {});
+    if (bgOff) { bgOff = false; await applyNoise(); }
+  }
+});
+document.addEventListener('pointerdown', () => { if (nsC && nsC.state !== 'running' && nsState === 'active') nsC.resume().catch(() => {}); }, { capture: true, passive: true });
 
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }

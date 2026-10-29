@@ -3,10 +3,19 @@ import { $, S, actionRow, api, avatarEl, confirmBox, dragToClose, emit, fmtTime,
 import { getCtx } from './sounds.js';
 
 // ======================= engine =======================
-const audio = new Audio();
-audio.preload = 'auto';
-audio.crossOrigin = 'anonymous';
-audio.preservesPitch = audio.mozPreservesPitch = audio.webkitPreservesPitch = false; // Slowed / Nightcore change pitch too
+// The song plays from a plain <audio> element. It only goes through Web Audio (our effects graph) while an
+// effect is on: phones starve Web Audio when Telegram is in the background, which made the music crackle.
+let audio = makeAudio();
+function makeAudio() {
+  const a = new Audio();
+  a.preload = 'auto';
+  a.crossOrigin = 'anonymous';
+  a.preservesPitch = a.mozPreservesPitch = a.webkitPreservesPitch = false; // Slowed / Nightcore change pitch too
+  a.addEventListener('loadedmetadata', () => sync(true));
+  a.addEventListener('ended', onEnded);
+  a.addEventListener('error', onAudioError);
+  return a;
+}
 const video = h('video', { class: 'vid', playsinline: true, muted: true, preload: 'auto' });
 video.muted = true;
 const isApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document || /iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -19,6 +28,7 @@ const P = {
   vol: store.get('vol', 1),
   localPaused: false, loadedQid: null, blocked: false, heights: [], autoH: 480, maxH: 480, stalls: [], stableSince: 0,
 };
+audio.volume = P.vol;
 // Effects are shared: the server holds them and everyone hears the same thing, in sync.
 const FX_NONE = { preset: 'normal', bass: 0, mid: 0, treble: 0, reverb: 0, rate: 1, mode: 'none' };
 const fx = () => S.music?.fx || FX_NONE;
@@ -76,17 +86,16 @@ video.addEventListener('playing', () => setVideoLoading(false));
 video.addEventListener('canplay', () => setVideoLoading(false));
 function unloadVideo() { if (video.dataset.src) { video.removeAttribute('src'); delete video.dataset.src; video.load(); } }
 
-audio.addEventListener('loadedmetadata', () => sync(true));
-audio.addEventListener('ended', () => { const c = cur(); if (c && !c.duration) send({ t: 'music.ended', qid: c.qid }); });
+function onEnded() { const c = cur(); if (c && !c.duration) send({ t: 'music.ended', qid: c.qid }); }
 // retry a failed stream a few times (with backoff), not forever every 3s
 let errQid = null, errCount = 0;
-audio.addEventListener('error', () => {
+function onAudioError() {
   const t = cur(); if (!t || !audio.getAttribute('src')) return;
   console.warn('audio error', audio.error);
   if (errQid !== t.qid) { errQid = t.qid; errCount = 0; }
   if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
   setTimeout(() => { const c = cur(); if (c && c.qid === t.qid && audio.error) { audio.src = audioSrc(c); audio.load(); } }, 2000 * errCount);
-});
+}
 // Auto quality. Only real stalls count: "waiting" also fires after every load and every sync seek, and
 // counting those made Auto drop a step every few seconds until it got stuck at 144p.
 video.addEventListener('waiting', () => {
@@ -129,7 +138,9 @@ function sync(force = false) {
     const drift = audio.currentTime - expectedPos();
     // Jump only when clearly out of sync. Tiny corrections (and speeding up / slowing down to catch up,
     // which the old code did every 0.7s) are what made songs glitch and wobble.
-    if ((force && Math.abs(drift) > 0.35) || Math.abs(drift) > 1.2 || (!want && Math.abs(drift) > 0.5)) {
+    // in the background timers run late, so only correct big jumps there (small seeks were audible crackles)
+    const limit = document.hidden ? 4 : 1.2;
+    if ((force && Math.abs(drift) > 0.35 && !document.hidden) || Math.abs(drift) > limit || (!want && Math.abs(drift) > 0.5)) {
       try { audio.currentTime = expectedPos(); } catch {}
     }
   }
@@ -143,7 +154,8 @@ function sync(force = false) {
   }
   maybeStepUp();
   // the video follows the audio, but never chases it while it's still loading (that made it loop one second)
-  if (video.dataset.src && video.readyState >= 1) {
+  if (document.hidden) { if (!video.paused) video.pause(); } // nobody sees it: save the phone's power for the sound
+  else if (video.dataset.src && video.readyState >= 1) {
     if (video.playbackRate !== r) video.playbackRate = r;
     const vd = video.currentTime - audio.currentTime;
     if (Math.abs(vd) > 1 && !video.seeking && video.readyState >= 3 && Date.now() - lastVideoSeek > 4000) seekVideo();
@@ -154,7 +166,10 @@ function sync(force = false) {
 setInterval(sync, 700);
 // coming back to the app: jump to where the room is now (not where it was when you left)
 const back = () => { G?.c.resume().catch(() => {}); sync(true); };
-document.addEventListener('visibilitychange', () => { if (!document.hidden) back(); });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return back();
+  if (!G) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
+});
 window.addEventListener('focus', back);
 try { tg?.onEvent?.('activated', back); } catch {}
 
@@ -169,7 +184,7 @@ function setBlocked(b) {
 export const musicBlocked = () => P.blocked;
 export function unlockAudio() {
   getCtx();
-  buildGraph();
+  if (needGraph()) buildGraph();
   if (cur() && playing() && !P.localPaused) audio.play().then(() => setBlocked(false)).catch(() => {});
 }
 
@@ -194,6 +209,23 @@ function impulse(c, secs, decay) {
     for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
   }
   return buf;
+}
+let tapped = false;
+const needGraph = () => {
+  const f = fx();
+  return tapped || f.mode !== 'none' || !!(f.bass || f.mid || f.treble || f.reverb) || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
+};
+// effects switched off: move the song back to a plain <audio> element (keeps playing where it was)
+function releaseGraph() {
+  if (!G || needGraph()) return;
+  const old = audio, src = old.getAttribute('src'), was = !old.paused;
+  audio = makeAudio();
+  audio.volume = P.vol;
+  audio.playbackRate = rate();
+  if (src) { audio.src = src; audio.load(); if (was) audio.play().catch(() => setBlocked(true)); }
+  old.pause(); old.removeAttribute('src'); old.load();
+  try { G.master.disconnect(); } catch {}
+  G = null;
 }
 function buildGraph() {
   if (G) return;
@@ -245,6 +277,7 @@ function applyFx(f = fx()) {
 }
 function setVol(v) {
   P.vol = v; store.set('vol', v);
+  if (!G && isApple && v < 0.99) buildGraph();
   if (G) G.master.gain.setTargetAtTime(v, G.c.currentTime, 0.05);
   else audio.volume = v;
 }
@@ -258,7 +291,8 @@ async function setMusicSink(id) {
   } catch (e) { console.warn('music output switch failed', e); }
 }
 on('voice:sink', setMusicSink);
-export function musicTap() { return G ? { ctx: G.c, node: G.master } : null; }
+// the recorder needs the music as Web Audio
+export function musicTap() { tapped = true; buildGraph(); return G ? { ctx: G.c, node: G.master } : null; }
 
 // ======================= colors from artwork =======================
 const colorCache = new Map();
@@ -339,17 +373,28 @@ function canAdd() { return S.admin || !S.room.settings?.music_admin_only; }
 
 // ---- music video: one <video> element that lives in the player, in the room card, or full screen ----
 let FV = null;
+const vbtn = (ic, label, fn, cls = '') => h('button', { class: 'round vbtn ' + cls, 'aria-label': label, onclick: (e) => { e.stopPropagation(); fn(); } }, icon(ic));
 function videoBox(cls) {
+  const inPlayer = cls === 'np-vid';
+  const btns = inPlayer && NP.fill
+    // big view inside the player: turn to landscape full screen, or go back to the artwork-sized video
+    ? [vbtn('rotate', 'Rotate to full screen', () => openVideoFull(true)), vbtn('shrink', 'Back to normal size', () => setFill(false), 'b2')]
+    : [vbtn('expand', 'Full screen', () => (inPlayer ? setFill(true) : openVideoFull(false)))];
   const box = h('div', { class: cls + (video.readyState < 3 ? ' loading' : ''), onclick: (e) => e.stopPropagation() }, video, h('span', { class: 'vspin' }),
-    h('button', { class: 'round vbtn', 'aria-label': 'Full screen', onclick: (e) => { e.stopPropagation(); openVideoFull(); } }, icon('expand')),
-    pipSupported(video) ? h('button', { class: 'round vbtn pip', 'aria-label': 'Picture in picture', onclick: (e) => { e.stopPropagation(); pip(video); } }, icon('pip')) : null);
+    h('div', { class: 'vbtns' }, ...btns, pipSupported(video) ? vbtn('pip', 'Picture in picture', () => pip(video)) : null));
   if (P.mode === 'video') loadVideo();
   return box;
 }
-function openVideoFull() {
+function setFill(on) {
+  NP.fill = on;
+  haptic('light');
+  NP.el?.classList.toggle('vfill', on);
+  renderStage();
+}
+function openVideoFull(rotate) {
   if (FV) return;
   haptic('light');
-  FV = fullView(video, { label: cur()?.title || '', onClose: () => { FV = null; renderCard(); if (NP.open) renderStage(); } });
+  FV = fullView(video, { label: cur()?.title || '', rotate, onClose: () => { FV = null; renderCard(); if (NP.open) renderStage(); } });
 }
 
 // ======================= controls =======================
@@ -376,7 +421,7 @@ function next() {
 function prev() { haptic('light'); if (S.admin) send({ t: 'music.prev' }); }
 
 // ======================= full player =======================
-const NP = { open: false, el: null, view: 'art', lyrics: null, lyrQid: null, scrubbing: false };
+const NP = { open: false, el: null, view: 'art', lyrics: null, lyrQid: null, scrubbing: false, fill: false };
 function buildNP() {
   if (NP.el) return NP.el;
   const el = h('div', { class: 'np', role: 'dialog', 'aria-label': 'Now playing' },
@@ -449,6 +494,7 @@ function renderStage() {
   if (!t) return;
   if (NP.view === 'lyrics') return renderLyrics(st, t);
   if (NP.view === 'queue') return renderQueue(st);
+  NP.el.classList.toggle('vfill', NP.fill && P.mode === 'video' && NP.view === 'art');
   if (P.mode === 'video' && !FV) st.append(videoBox('np-vid'));
   else st.append(h('div', { class: 'big-art', style: { backgroundImage: `url("${media(t.thumb)}")` } }));
 }
@@ -525,7 +571,11 @@ function onMusic(m) {
   sync(timeline !== lastTimeline);
   lastTimeline = timeline;
   const fxKey = JSON.stringify(m.fx || FX_NONE);
-  if (fxKey !== lastFx) { lastFx = fxKey; applyFx(); emit('music:fx'); }
+  if (fxKey !== lastFx) {
+    lastFx = fxKey;
+    if (needGraph()) buildGraph(); else releaseGraph();
+    applyFx(); emit('music:fx');
+  }
   refresh();
   emit('music:changed');
 }
@@ -675,7 +725,7 @@ function openFx() {
   const body = h('div');
   let draft = { ...fx() }, tmr = null;
   // you hear your change at once (EQ / reverb / 8D); the server then applies it for everyone, speed included
-  const push = () => { applyFx(draft); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
+  const push = () => { buildGraph(); applyFx(draft); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
   const slider = (key, label, min, max, step, fmt, allowed) => {
     const out = h('output', null, fmt(draft[key]));
     const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label, disabled: !allowed });
@@ -693,7 +743,7 @@ function openFx() {
     body.replaceChildren(
       allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'Only admins or the person who added this song can change the sound.'),
       h('div', { class: 'fx-grid' }, ...Object.entries(PRESETS).map(([k, p]) =>
-        h('button', { class: 'fx' + (draft.preset === k ? ' on' : ''), disabled: !allowed, onclick: (e) => { draft = { ...p.v, preset: k }; applyFx(draft); send({ t: 'music.fx', fx: draft }); haptic('select');
+        h('button', { class: 'fx' + (draft.preset === k ? ' on' : ''), disabled: !allowed, onclick: (e) => { draft = { ...p.v, preset: k }; if (k !== 'normal') buildGraph(); applyFx(draft); send({ t: 'music.fx', fx: draft }); haptic('select');
           body.querySelectorAll('.fx').forEach(b => b.classList.toggle('on', b === e.currentTarget)); } }, h('span', null, p.e), p.label))),
       slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
       slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),

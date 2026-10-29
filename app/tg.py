@@ -122,18 +122,16 @@ async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0)
     """DM the person a Join button; if they never started the bot, mention them in the group instead."""
     url = await group_link(chat_id)
     title = await chat_title(chat_id)
-    now_line = (f"\n🎙 {live} {'person is' if live == 1 else 'people are'} in the voice chat now" if live else "")
     try:
         await call("sendMessage", chat_id=uid, parse_mode="HTML",
-                   text=f"👋 <b>{_esc(by_name)}</b> invited you to join the voice chat in <b>{_esc(title)}</b>{now_line}",
+                   text=f"🎧 <b>{_esc(by_name)}</b> invited you to the voice chat in <b>{_esc(title)}</b>",
                    reply_markup=join_button(url))
         return "dm"
     except Exception:
         pass
     g = await db.get_group(chat_id)
     params = {"chat_id": chat_id, "parse_mode": "HTML", "reply_markup": join_button(url),
-              "text": f'👋 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you '
-                      f'to join the voice chat{now_line}'}
+              "text": f'🎧 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you to the voice chat'}
     if g.get("pin_thread"):
         params["message_thread_id"] = g["pin_thread"]
     try:

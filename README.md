@@ -75,8 +75,9 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 - **Invite:** invite members from inside the voice chat. The bot sends them a private Join button, or mentions
   them in the group if they never started the bot. If the group hides its members, only admins are listed;
   anonymous admins are never shown.
-- **Chat:** like Telegram's voice chat: messages pop up over the room for a few seconds; the Message button
-  opens everything sent since you joined, floating reactions and the message box. Replies, message reactions, delete
+- **Chat:** like Telegram's voice chat: the Message button slides a message box up over the room, messages pop up for
+  a few seconds and disappear, tap one to reply, floating reactions. Only admins can read back recent messages
+  (kept 48 hours). Message reactions, delete
 - **Music:** YouTube search, links and playlists, synced for everyone, queue, repeat, shuffle, autoplay (only when on),
   vote skip, audio-only/video switch, audio and video quality (Auto adapts to the connection), lyrics,
   Liked Songs and playlists, history, "Made for you" picks from what each person listens to and likes.

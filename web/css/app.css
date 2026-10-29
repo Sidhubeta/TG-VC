@@ -794,10 +794,7 @@ video.mirror { transform: scaleX(-1); }
 #aura i { background: radial-gradient(circle, var(--c1) 0, transparent 68%) !important; will-change: transform; transition: none; }
 #aura i:nth-child(2) { background: radial-gradient(circle, var(--c2) 0, transparent 68%) !important; }
 #aura i:nth-child(3) { background: radial-gradient(circle, var(--c3) 0, transparent 68%) !important; }
-.np .bg { contain: strict; }
-.np .bg i { filter: none !important; will-change: transform; background: radial-gradient(circle, var(--c2) 0, transparent 66%) !important; opacity: .9; }
-.np .bg i:nth-child(2) { background: radial-gradient(circle, var(--c3) 0, transparent 66%) !important; }
-.np .bg i:nth-child(3) { background: radial-gradient(circle, var(--c1) 0, transparent 66%) !important; }
+.np .bg i { will-change: transform; } /* the player keeps its blurred colour blobs (each one is its own layer) */
 /* speaking rings: plain circles scaled by the voice level (smooth, composited) */
 .prow .pav .wave { animation: none; filter: none; border-radius: 50%; will-change: transform; transition: opacity .2s, transform .12s linear; }
 .mic .b1, .mic .b2 { animation: none !important; border-radius: 50%; will-change: transform; transition: transform .12s linear, opacity .3s; }
@@ -815,9 +812,8 @@ body:not(.playing) .eq i { animation: none; transform: scaleY(.3); height: 100%;
 
 /* ============ round 3 ============ */
 /* full screen: a landscape video on an upright phone is turned sideways to fill the screen */
-.fullview.rot video { position: absolute; left: 50%; top: 50%; width: var(--fh); height: var(--fw); max-width: none;
-  transform: translate(-50%, -50%) rotate(90deg); }
-.fullview.rot video.mirror { transform: translate(-50%, -50%) rotate(90deg) scaleX(-1); }
+.fv-inner { position: absolute; inset: 0; display: grid; place-items: center; }
+.fullview.rot .fv-inner { inset: auto; left: 50%; top: 50%; width: var(--fh); height: var(--fw); transform: translate(-50%, -50%) rotate(90deg); }
 .fullview .fv-bar { transition: opacity .25s; }
 /* video loading spinner over the artwork */
 .vspin { position: absolute; left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%; z-index: 1;
@@ -840,3 +836,43 @@ body:not(.playing) .eq i { animation: none; transform: scaleY(.3); height: 100%;
 .row.route.on .lab { color: var(--accent); font-weight: 600; }
 .row.route .ico:last-child { color: var(--accent); }
 .row.route.on > .ico:first-child { color: var(--accent); }
+
+/* ============ round 4 ============ */
+/* message box that slides up over the room (Telegram voice chat style) */
+#composer { position: relative; z-index: 6; margin: 0 12px 6px; padding: 8px; border-radius: 22px; background: rgba(29, 37, 48, .98);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .45); animation: tin .25s var(--spring) both; }
+.cmp-row { display: flex; align-items: center; gap: 6px; }
+#cmp-input { flex: 1; min-width: 0; height: 40px; border: 0; border-radius: 20px; padding: 0 14px; background: var(--card2); font-size: 16px; outline: none; }
+#cmp-input:focus { box-shadow: 0 0 0 1.5px var(--accent) inset; }
+.cb-btn { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; background: var(--card2); color: var(--fg2); flex: none;
+  transition: transform .2s var(--spring), background .2s, color .2s; }
+.cb-btn:active { transform: scale(.88); }
+.cb-btn .ico { width: 21px; height: 21px; }
+.cb-btn.on, .cb-btn.send { background: var(--accent); color: #fff; }
+#cmp-react { display: flex; gap: 2px; overflow-x: auto; padding: 0 0 6px; scrollbar-width: none; }
+#cmp-react::-webkit-scrollbar { display: none; }
+#cmp-react button { flex: none; width: 42px; height: 42px; border-radius: 50%; font-size: 26px; transition: transform .2s var(--spring); }
+#cmp-react button:active { transform: scale(1.3); }
+#cmp-react img.emj { width: 28px; height: 28px; }
+#cmp-reply { display: flex; align-items: center; gap: 10px; padding: 0 4px 8px; font-size: 13px; }
+#cmp-reply .rb { flex: 1; min-width: 0; border-left: 2.5px solid var(--accent); padding-left: 8px; }
+#cmp-reply b { color: var(--accent); display: block; }
+#cmp-reply span { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--fg2); }
+.cpop .crq { font-size: 11.5px; font-style: normal; opacity: .7; }
+
+/* speaking: no rings or level animation (they made phones lag) — just a green mic */
+.prow .pav .wave { display: none; }
+.prow.speaking .pmic { color: var(--tg-green); transform: none; }
+.mic .b1, .mic .b2 { display: none; }
+.mic.on { --g1: #1fb877; --g2: #1fb877; }
+
+/* video buttons */
+.vbtns { position: absolute; top: 8px; right: 8px; z-index: 2; display: flex; gap: 8px; }
+.vbtn, .vbtn.pip { position: static; }
+/* player "fill" view: the video spreads to the screen edges and blends into the colours behind it */
+.np.vfill .stage-np { margin: 0 -26px; }
+.np.vfill .np-vid { width: 100%; border-radius: 0; box-shadow: none; background: transparent;
+  -webkit-mask-image: linear-gradient(transparent 0, #000 9%, #000 91%, transparent); mask-image: linear-gradient(transparent 0, #000 9%, #000 91%, transparent); }
+.np.vfill .np-vid .vid { max-height: 64vh; background: transparent; }
+.np.vfill .vbtns { top: auto; bottom: 12%; right: 14px; }
+.fv-btns { display: flex; gap: 10px; flex: none; }

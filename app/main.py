@@ -603,7 +603,7 @@ async def ws_endpoint(ws: WebSocket):
     except Exception:
         log.exception("ws")
     finally:
-        conn.alive = False
+        conn.stop()
         await room.leave(conn)
 
 
@@ -617,10 +617,7 @@ async def api_bye(request: Request):
     p = room.parts.get(uid) if room else None
     if p:
         for c in list(p.conns):
-            try:
-                await c.ws.close(1000)
-            except Exception:
-                pass
+            await c.close(1000)
             await room.leave(c)
     return Response(status_code=204)
 

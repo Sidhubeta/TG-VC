@@ -10,7 +10,6 @@ function makeAudio() {
   const a = new Audio();
   a.preload = 'auto';
   a.crossOrigin = 'anonymous';
-  a.preservesPitch = a.mozPreservesPitch = a.webkitPreservesPitch = false; // Slowed / Nightcore change pitch too
   a.addEventListener('loadedmetadata', () => sync(true));
   a.addEventListener('ended', onEnded);
   a.addEventListener('error', onAudioError);
@@ -101,7 +100,7 @@ video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused)
 let lastVideoSeek = 0;
 function seekVideo() {
   // aim a little ahead: after a seek the video needs a moment to buffer before it moves again
-  try { video.currentTime = Math.min(audio.currentTime + 0.3, video.duration || Infinity); lastVideoSeek = Date.now(); } catch {}
+  try { video.currentTime = Math.min(audio.currentTime + 0.2, video.duration || Infinity); lastVideoSeek = Date.now(); } catch {}
 }
 
 function sync(force = false) {
@@ -113,33 +112,74 @@ function sync(force = false) {
   const want = playing() && !P.localPaused;
   const exp = pr ? pr.pos : expectedPos();
   const r = pr ? 1 : rate();
-  if (audio.playbackRate !== r) audio.playbackRate = r;
+  // Slowed / Nightcore change the pitch on purpose; otherwise keep the pitch when we fine-tune the speed
+  const keepPitch = r === 1;
+  if (audio.preservesPitch !== keepPitch) audio.preservesPitch = audio.mozPreservesPitch = audio.webkitPreservesPitch = keepPitch;
+  let speed = r;
   if (audio.readyState >= 1 && !P.localPaused) {
     const drift = audio.currentTime - exp;
-    // Jump only when clearly out of sync: small seeks are audible. In the background timers run late, so only
-    // big jumps are corrected there.
+    // Big gaps: jump. In the background timers run late, so only big jumps are corrected there.
     const limit = document.hidden ? 4 : 1.2;
     if ((force && Math.abs(drift) > 0.35 && !document.hidden) || Math.abs(drift) > limit || (!want && Math.abs(drift) > 0.5)) {
       try { audio.currentTime = exp; } catch {}
+      fine = 0;
+    } else if (want && keepPitch && !document.hidden) {
+      // Small gaps (everyone a bit apart): play 2% faster/slower until we're within 0.1 s. With the pitch kept,
+      // 2% can't be heard, unlike the jumps (or the 4% wobble of the first version).
+      if (Math.abs(drift) > 0.25) fine = drift > 0 ? -1 : 1;
+      else if (Math.abs(drift) < 0.08) fine = 0;
+      speed = r * (1 + 0.02 * fine);
     }
   }
+  if (Math.abs(audio.playbackRate - speed) > 0.001) audio.playbackRate = speed;
+  watchdog(want, exp);
   // A finished <audio> restarts from 0 when played again. That was the "first 1-2 seconds on repeat" in the
   // background: never replay a song whose time is up.
   const over = !pr && t.duration && exp >= t.duration - 0.3;
   if (want && audio.paused && !over) audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
   else if ((!want || over) && !audio.paused) audio.pause();
-  if (want && G && G.c.state !== 'running') G.c.resume().then(() => setBlocked(false), () => setBlocked(true));
-  // the video follows the audio, but never chases it while it's still loading (that made it loop one second)
-  if (document.hidden) { if (!video.paused) video.pause(); } // nobody sees it: save the phone's power for the sound
-  else if (video.dataset.src && video.readyState >= 1) {
-    if (video.playbackRate !== r) video.playbackRate = r;
-    const vd = video.currentTime - audio.currentTime;
-    if (Math.abs(vd) > 1 && !video.seeking && video.readyState >= 3 && Date.now() - lastVideoSeek > 4000) seekVideo();
-    if (!audio.paused && video.paused && video.isConnected) video.play().catch(() => {});
-    if (audio.paused && !video.paused) video.pause();
+  // With an effect on, the song goes through Web Audio; if the phone suspended it, the song "plays" in silence.
+  if (want && G && G.c.state !== 'running') { setBlocked(true); G.c.resume().then(() => { if (G?.c.state === 'running') setBlocked(false); }, () => {}); }
+  syncVideo();
+}
+let fine = 0; // -1 slower, 0 normal, +1 faster (small catch-up on the audio)
+setInterval(sync, 700);
+
+// The video (muted) is kept on the audio's clock 4x a second. Small gaps are closed by playing the video a little
+// faster or slower (it's silent, so nobody hears it); only big gaps seek. Before, anything under 1 s was left,
+// so the picture ran visibly behind the sound.
+function syncVideo() {
+  if (document.hidden) { if (!video.paused) video.pause(); return; } // nobody sees it: save the phone's power for the sound
+  if (!video.dataset.src || video.readyState < 1) return;
+  const r = audio.playbackRate || 1;
+  if (!audio.paused && video.paused && video.isConnected) video.play().catch(() => {});
+  if (audio.paused && !video.paused) video.pause();
+  const vd = video.currentTime - audio.currentTime;
+  let vr = r;
+  if (Math.abs(vd) > 1) {
+    if (!video.seeking && video.readyState >= 3 && Date.now() - lastVideoSeek > 3000) seekVideo();
+  } else if (Math.abs(vd) > 0.08) vr = r * (vd > 0 ? 0.92 : 1.08);
+  if (Math.abs(video.playbackRate - vr) > 0.001) video.playbackRate = vr;
+}
+setInterval(() => { if (video.dataset.src && !document.hidden) syncVideo(); }, 250);
+
+// "Playing" but silent: the stream stalled and the time stopped moving (pausing and playing again fixed it by
+// hand). If it's stuck for 2.5 s, reload the stream at the right spot.
+let stuck = { t: -1, since: 0 };
+function watchdog(want, exp) {
+  if (!want || audio.paused || audio.seeking || P.localPaused || !audio.getAttribute('src')) { stuck.since = 0; return; }
+  const now = Date.now();
+  if (Math.abs(audio.currentTime - stuck.t) > 0.05) { stuck = { t: audio.currentTime, since: now }; return; }
+  if (!stuck.since) { stuck.since = now; return; }
+  // has data but isn't moving: 2.5 s. Still downloading (slow internet): give it 10 s, or it would never start.
+  if (now - stuck.since > (audio.readyState >= 3 ? 2500 : 10000)) {
+    stuck.since = 0;
+    console.warn('music stalled, reloading at', exp.toFixed(1));
+    const src = audio.getAttribute('src');
+    audio.src = src; audio.load(); // loadedmetadata -> sync(true) seeks to the room's position
+    audio.play().catch(() => setBlocked(true));
   }
 }
-setInterval(sync, 700);
 // coming back to the app: jump to where the room is now (not where it was when you left)
 const back = () => { G?.c.resume().catch(() => {}); sync(true); emit('app:back'); };
 document.addEventListener('visibilitychange', () => {
@@ -154,12 +194,14 @@ function setBlocked(b) {
   if (P.blocked === b) return;
   P.blocked = b;
   emit('music:blocked', b);
+  renderCard(); // the card's play button turns into a "sound off" button while the phone holds the sound back
 }
 export const musicBlocked = () => P.blocked;
 export function unlockAudio() {
   getCtx();
   if (needGraph()) buildGraph();
-  if (cur() && playing() && !P.localPaused) audio.play().then(() => setBlocked(false)).catch(() => {});
+  G?.c.resume().catch(() => {});
+  if (cur() && playing() && !P.localPaused) audio.play().then(() => { if (!G || G.c.state === 'running') setBlocked(false); }).catch(() => {});
 }
 
 // ======================= picture in picture =======================
@@ -340,7 +382,10 @@ export function renderCard() {
       h('div', { class: 'art-sub' }, t.artist + (t.by ? ` · added by ${t.by}` : ''))),
     h('div', { class: 'ctl' },
       showVid ? null : h('button', { class: 'vsw', 'aria-label': 'Watch the video', onclick: (e) => { e.stopPropagation(); setVideo(true); } }, icon('video')),
-      h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
+      isPlay && P.blocked
+        // the phone stopped the sound (call, lock screen, no tap yet): one tap here brings it back
+        ? h('button', { class: 'muted-btn', 'aria-label': 'Sound is off — tap to turn it on', onclick: (e) => { e.stopPropagation(); unlockAudio(); } }, icon('vol-x'))
+        : h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
       h('button', { 'aria-label': 'Next', onclick: (e) => { e.stopPropagation(); next(); } }, icon('next', 'fill'))),
     h('div', { class: 'bar', id: 'np-bar' }));
 }
@@ -802,19 +847,30 @@ const bigTitle = (t, extra) => h('div', { class: 'br-h1' }, h('h1', null, t), ex
 function sectionHead(title, onAll) {
   return h('div', { class: 'br-sec' }, h('h2', null, title), onAll ? h('button', { onclick: onAll }, 'See all') : null);
 }
+let lastAdd = { id: '', at: 0 };
 function addTrack(t, el) {
   if (!canAdd()) return deny('add');
+  if (lastAdd.id === t.id && Date.now() - lastAdd.at < 1500) return; // a double tap shouldn't queue it twice
+  lastAdd = { id: t.id, at: Date.now() };
   send({ t: 'music.add', track: t });
   BR.added.add(t.id);
   haptic('success');
   el?.classList.add('added');
 }
+// Tapping a song: three clearly different choices, so people can read and pick (no accidental adds)
 function songMenu(t) {
+  const big = (cls, ic, label, sub, perm, fn) => h('button', { class: 'pick ' + cls + (can(perm) && can('add') ? '' : ' locked'), onclick: () => {
+    if (!can('add')) return deny('add');
+    if (!can(perm)) return deny(perm);
+    fn(); m.close(); haptic('success');
+  } }, icon(ic, ic === 'plus' ? '' : 'fill'), h('span', null, h('b', null, label), h('small', null, sub)));
   const m = sheet({ title: t.title, body: h('div', null,
-    h('p', { class: 'muted', style: { margin: '-6px 0 10px' } }, t.artist),
+    h('p', { class: 'muted', style: { margin: '-6px 0 12px' } }, [t.artist, t.duration ? fmtTime(t.duration) : ''].filter(Boolean).join(' · ')),
+    h('div', { class: 'picks' },
+      big('now', 'play', 'Play now', 'Starts right away for everyone', 'playback', () => send({ t: 'music.add', track: t, now: true })),
+      big('next', 'next', 'Play next', 'Plays after the current song', 'next', () => send({ t: 'music.add', track: t, next: true })),
+      big('queue', 'plus', 'Add to queue', 'Plays after the songs already queued', 'add', () => addTrack(t))),
     h('div', { class: 'list' },
-      canAdd() ? actionRow('plus', 'Add to queue', () => { addTrack(t); m.close(); }) : null,
-      actionRow('play', 'Play next', () => { if (!can('next')) return deny('next'); send({ t: 'music.add', track: t, next: true }); m.close(); toast('Plays next'); }, can('next') ? '' : 'locked'),
       actionRow('list-plus', 'Add to a playlist', () => { m.close(); addToPlaylist([t]); }),
       actionRow('heart', S.liked.has(t.id) ? 'Remove from Liked Songs' : 'Add to Liked Songs', async () => {
         m.close();
@@ -838,7 +894,7 @@ function songCard(t) {
     h('div', { class: 'cc-art', style: { backgroundImage: `url("${media(t.thumb || '/api/thumb/' + t.id)}")` } },
       h('span', { class: 'cc-add' }, icon('plus')), h('span', { class: 'cc-ok' }, icon('check'))),
     h('div', { class: 'cc-t' }, t.title), h('div', { class: 'cc-a' }, t.artist));
-  return pressable(el, () => canAdd() ? addTrack(t, el) : songMenu(t), () => songMenu(t));
+  return pressable(el, () => songMenu(t), () => songMenu(t));
 }
 function skeletonRow() {
   return h('div', { class: 'carousel' }, ...Array.from({ length: 4 }, () => h('div', { class: 'cc sk' }, h('div', { class: 'cc-art' }), h('div', { class: 'cc-t' }, ' '), h('div', { class: 'cc-a' }, ' '))));
@@ -963,7 +1019,7 @@ async function renderLibrary(sc, openId = null) {
           canAdd() ? actionRow('plus', 'Add to queue', () => { addTrack(t); m.close(); }) : null,
           actionRow('trash', 'Remove from playlist', async () => { await api('/api/playlists/' + id, { body: { remove: t.item } }); m.close(); row.remove(); if (p.name === 'Liked Songs') S.liked.delete(t.id); }, 'red')) });
       } });
-      return pressable(row, () => canAdd() ? addTrack(t, row) : songMenu(t), () => songMenu(t));
+      return pressable(row, () => songMenu(t), () => songMenu(t));
     }));
     box.replaceChildren(
       h('div', { class: 'br-sub' }, backBtn(), h('h2', null, p.name)),

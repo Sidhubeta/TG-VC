@@ -1,4 +1,4 @@
-import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
+import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
 import { getMusicVolume, openNP, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
@@ -92,6 +92,7 @@ on('ws:down', () => toast('Reconnecting…', 1500));
 on('ws:kicked', (m) => { closeWS(); emit('fatal', { title: m.ban ? 'Banned' : 'Removed', text: m.reason || (m.ban ? 'An admin banned you from this voice chat.' : 'An admin removed you from this voice chat.') }); });
 on('ws:locked', () => emit('fatal', { title: 'Locked', text: 'Admins locked this voice chat.' }));
 on('ws:toast', (m) => toast(m.text));
+on('ws:denied', (m) => denied(m.text)); // something you're not allowed to do: said in red
 
 // ======================= header =======================
 function renderHeader() {
@@ -296,7 +297,7 @@ function bindDock() {
   $('#b-mic').onclick = async () => {
     const p = me(); if (!p) return;
     if (S.voiceState !== 'ready') return toast(S.voiceState === 'off' ? 'Voice isn’t set up on the server yet' : 'Voice is still connecting');
-    if (p.forceMuted) { haptic('error'); return toast('An admin muted you'); }
+    if (p.forceMuted) return denied('An admin muted you — only admins can let you speak');
     if (!p.canSpeak) { haptic('medium'); send({ t: 'hand', up: !p.hand }); if (!p.hand) toast('Hand raised — admins will let you speak'); return; }
     haptic('medium');
     const want = !V.mic;
@@ -318,7 +319,7 @@ function bindDock() {
 // ---- camera: pick front or back first, then switch or turn off ----
 function openCamera() {
   const p = me();
-  if (!p?.canSpeak) return toast('Only speakers can turn on the camera');
+  if (!p?.canSpeak) return denied('Only speakers can turn on the camera — raise your hand first');
   haptic('light');
   const body = V.cam
     ? h('div', { class: 'list' },
@@ -622,11 +623,11 @@ function openAdmin(tab = 'room') {
   const body = h('div', null, tabs, content);
   let cleanup = null;
   const s = sheet({ title: 'Manage', body, tall: true, onClose: () => cleanup?.() });
-  const TABS = [['room', 'Room'], ['logs', 'Logs'], ['safety', 'Safety']];
+  const TABS = [['room', 'Room'], ['music', 'Music'], ['logs', 'Logs'], ['safety', 'Safety']];
   const go = (k) => {
     tab = k; cleanup?.(); cleanup = null;
     tabs.replaceChildren(...TABS.map(([id, l]) => h('button', { class: id === k ? 'on' : '', onclick: () => go(id) }, l)));
-    const r = ({ room: adminRoom, logs: adminLogs, safety: adminSafety })[k](content, s);
+    const r = ({ room: adminRoom, music: adminMusic, logs: adminLogs, safety: adminSafety })[k](content, s);
     cleanup = typeof r === 'function' ? r : null;
   };
   go(tab);
@@ -645,7 +646,6 @@ function adminRoom(c) {
     h('div', { class: 'list' },
       switchRow('New participants can speak', 'Off: they join as listeners and raise a hand', st.new_can_speak, v => set('new_can_speak', v)),
       switchRow('Lock voice chat', 'No new people can join', st.locked, v => set('locked', v)),
-      switchRow('Only admins add songs', null, st.music_admin_only, v => set('music_admin_only', v)),
       switchRow('Soundboard', null, st.soundboard, v => set('soundboard', v)),
       switchRow('Join & leave sounds', 'For everyone', st.join_sound, v => set('join_sound', v))),
     h('div', { class: 'list' },
@@ -710,6 +710,51 @@ function scheduleBox() {
     h('button', { class: 'btn sm', onclick: () => { const at = new Date(when.value).getTime() / 1000; send({ t: 'admin.schedule', at, title: ttl.value }); setTimeout(load, 400); } }, 'Schedule reminder')), list);
   load().catch(() => {});
   return box;
+}
+
+// ---- music permissions ("music auth") ----
+const MUSIC_PERMS = [
+  ['add', 'Add songs'], ['next', 'Play a song next (jump the queue)'], ['vote', 'Vote to skip'], ['skip_own', 'Skip songs they added'],
+  ['playback', 'Play, pause, seek, previous and skip any song'], ['queue', 'Change the queue', 'Remove, move, play now, shuffle, clear'],
+  ['modes', 'Repeat and autoplay'], ['fx_own', 'Sound effects on their own songs'], ['fx', 'Sound effects on any song'],
+  ['video', 'Turn on video for everyone'], ['stop', 'Stop the music'],
+];
+function adminMusic(c) {
+  const draw = () => {
+    const st = S.room.settings || {}, ev = st.music_everyone || {}, djs = st.music_dj || {};
+    c.replaceChildren(
+      h('p', { class: 'muted note' }, 'Admins can always do everything. Choose what everyone else can do, and give chosen people their own rights as music DJs.'),
+      h('div', { class: 'grp-h' }, 'Everyone can'),
+      h('div', { class: 'list' }, ...MUSIC_PERMS.map(([k, label, sub]) => switchRow(label, sub || null, !!ev[k], v => send({ t: 'admin.musicperms', everyone: { [k]: v } })))),
+      h('div', { class: 'grp-h' }, 'Music DJs'),
+      h('div', { class: 'list' },
+        ...Object.entries(djs).map(([uid, d]) => actionRow('headphones', d.name, () => djSheet(Number(uid), d.name, d.perms), '',
+          `${Object.values(d.perms || {}).filter(Boolean).length} of ${MUSIC_PERMS.length} rights`)),
+        actionRow('plus', 'Add a music DJ', addDj, 'acc', 'Pick someone in the voice chat')));
+  };
+  draw();
+  on('room:changed', draw);
+  return () => off('room:changed', draw);
+}
+function addDj() {
+  const djs = S.room.settings?.music_dj || {};
+  const people = [...S.parts.values()].filter(p => !p.admin && !djs[String(p.uid)]);
+  const body = people.length
+    ? h('div', { class: 'list' }, ...people.map(p => h('button', { class: 'row', onclick: () => {
+      s.close(); djSheet(p.uid, p.name, Object.fromEntries(MUSIC_PERMS.map(([k]) => [k, true])), true);
+    } }, h('div', { class: 'ia' }, avatarEl(p)), h('span', { class: 'lab' }, p.name, p.username ? h('small', null, '@' + p.username) : null))))
+    : h('div', { class: 'empty-note' }, 'Everyone in the voice chat is already an admin or a DJ.');
+  const s = sheet({ title: 'Add a music DJ', body });
+}
+function djSheet(uid, name, perms, isNew = false) {
+  const cur = { ...perms };
+  const save = () => send({ t: 'admin.dj', uid, name, perms: cur });
+  if (isNew) { save(); toast(`${name} is now a music DJ`); }
+  const body = h('div', null,
+    h('p', { class: 'muted note' }, `What ${name} can do with the music:`),
+    h('div', { class: 'list' }, ...MUSIC_PERMS.map(([k, label, sub]) => switchRow(label, sub || null, !!cur[k], v => { cur[k] = v; save(); }))),
+    h('div', { class: 'list' }, actionRow('user-x', 'Remove as DJ', () => { send({ t: 'admin.undj', uid }); toast(`${name} is no longer a DJ`); s.close(); }, 'red')));
+  const s = sheet({ title: '🎧 ' + name, body, tall: true });
 }
 
 // ---- logs ----

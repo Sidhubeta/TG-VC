@@ -18,6 +18,27 @@ REACTIONS = {"👍", "❤️", "😂", "🔥", "😮", "😢", "👏", "🎉"}
 # floating reactions over the room (like Telegram's live reactions)
 FLY = {"👍", "❤️", "🔥", "😂", "😍", "🤩", "👏", "🎉", "😮", "😢", "🙏", "💯", "🥳", "😎", "🤣", "💔"}
 FX_PRESETS = {"normal", "bass", "8d", "hall", "vocal", "slowed", "nightcore", "custom"}
+# ---- music permissions ("music auth") ----
+# What everyone may do by default; admins can change these and give chosen people ("music DJs") their own set.
+MUSIC_PERMS = {
+    "add": "Add songs",
+    "next": "Play a song next (jump the queue)",
+    "vote": "Vote to skip",
+    "skip_own": "Skip songs they added",
+    "playback": "Play, pause, seek, previous and skip any song",
+    "queue": "Change the queue (remove, move, play now, shuffle, clear)",
+    "modes": "Repeat and autoplay",
+    "fx_own": "Sound effects on their own songs",
+    "fx": "Sound effects on any song",
+    "video": "Turn on video for everyone",
+    "stop": "Stop the music",
+}
+MUSIC_DEFAULT = {"add": True, "next": False, "vote": True, "skip_own": True, "playback": False, "queue": False,
+                 "modes": False, "fx_own": True, "fx": False, "video": True, "stop": False}
+DENY = {"add": "add songs", "next": "play songs next", "vote": "vote to skip", "skip_own": "skip songs",
+        "playback": "control playback", "queue": "change the queue", "modes": "change repeat and autoplay",
+        "fx_own": "change the sound", "fx": "change the sound", "video": "turn on video for everyone",
+        "stop": "stop the music"}
 CHAT_KEEP = 48 * 3600  # recent messages are kept 48 hours, and only admins can read them back
 EMPTY_GRACE = 600  # keep the music running this long after the last person leaves (minimized apps reconnect)
 FX_DEFAULT = {"preset": "normal", "bass": 0, "mid": 0, "treble": 0, "reverb": 0.0, "rate": 1.0, "mode": "none"}
@@ -132,6 +153,12 @@ class Room:
     def __init__(self, chat_id: int, group: dict):
         self.chat_id = chat_id
         self.settings = {**DEFAULT_SETTINGS, **group["settings"]}
+        ev = self.settings.get("music_everyone") if isinstance(self.settings.get("music_everyone"), dict) else {}
+        if "music_everyone" not in group["settings"] and self.settings.get("music_admin_only"):
+            ev = {"add": False}  # old "only admins add songs" switch
+        self.settings["music_everyone"] = {**MUSIC_DEFAULT, **{k: bool(v) for k, v in ev.items() if k in MUSIC_DEFAULT}}
+        if not isinstance(self.settings.get("music_dj"), dict):
+            self.settings["music_dj"] = {}
         if not self.settings["title"]:
             self.settings["title"] = group.get("title") or "Voice Chat"
         self.group_title = group.get("title") or "Group"
@@ -608,19 +635,32 @@ class Room:
             if self.queue:
                 await self._start(self.queue.pop(0))
 
+    def can(self, p: Participant, perm: str) -> bool:
+        if p.admin:
+            return True
+        dj = self.settings["music_dj"].get(str(p.uid))
+        if dj and perm in dj.get("perms", {}):
+            return bool(dj["perms"][perm])
+        return bool(self.settings["music_everyone"].get(perm, False))
+
+    async def deny(self, p: Participant, perm: str):
+        who = "admins and music DJs" if self.settings["music_dj"] else "admins"
+        await self.send_to(p.uid, {"t": "denied", "text": f"Only {who} can {DENY.get(perm, 'do that')}"})
+
     async def on_music(self, p: Participant, cmd: str, msg: dict):
         admin = p.admin
-        can_add = admin or not self.settings["music_admin_only"]
         if cmd in ("add", "addMany"):
-            if not can_add:
-                return await self.toast(p.uid, "Only admins can add songs right now")
+            if not self.can(p, "add"):
+                return await self.deny(p, "add")
+            if msg.get("next") and not self.can(p, "next"):
+                return await self.deny(p, "next")
             tracks = msg.get("tracks") if cmd == "addMany" else [msg.get("track") or {}]
             items = [it for t in (tracks or [])[:200] if (it := self._item(t, p))]
             if not items:
                 return
             if len([q for q in self.queue if q["byUid"] == p.uid]) + len(items) > 200 and not admin:
                 return await self.toast(p.uid, "Queue limit reached")
-            if msg.get("next") and admin:
+            if msg.get("next"):
                 self.queue[0:0] = items
             else:
                 # people's songs go before the songs autoplay picked; autoplay carries on after them
@@ -638,6 +678,8 @@ class Room:
         if cmd == "voteskip":
             if not self.current:
                 return
+            if not self.can(p, "vote"):
+                return await self.deny(p, "vote")
             self.votes.add(p.uid)
             if len(self.votes) >= max(1, (len(self.parts) + 1) // 2):
                 await self._next()
@@ -647,15 +689,30 @@ class Room:
         if cmd == "remove":
             qid = msg.get("qid")
             for q in self.queue:
-                if q["qid"] == qid and (admin or q["byUid"] == p.uid):
+                if q["qid"] == qid:
+                    if not (q["byUid"] == p.uid or self.can(p, "queue")):
+                        return await self.deny(p, "queue")
                     self.queue.remove(q)
                     await self.push_music()
                     return
             return
-        if cmd == "skip" and self.current and self.current["byUid"] == p.uid and not admin:
-            return await self._next()
-        if not admin:
-            return await self.toast(p.uid, "Only admins can control playback — use vote skip")
+        if cmd == "skip":
+            if not self.current:
+                return
+            if (self.current["byUid"] == p.uid and self.can(p, "skip_own")) or self.can(p, "playback"):
+                return await self._next()
+            return await self.deny(p, "playback")
+        need = {"play": "playback", "pause": "playback", "seek": "playback", "prev": "playback", "stop": "stop",
+                "clear": "queue", "move": "queue", "playnow": "queue", "shuffle": "queue",
+                "loop": "modes", "autoplay": "modes", "video": "video"}.get(cmd)
+        if need and not self.can(p, need):
+            return await self.deny(p, need)
+        if cmd == "video":
+            # a song switched to video is shown as video to everyone (each person can still switch back to audio)
+            if self.current and msg.get("on") and not self.current.get("video"):
+                self.current["video"] = True
+                await self.push_music()
+            return
         if cmd == "play":
             if self.status == "paused":
                 self.status, self.upd = "playing", now()
@@ -674,8 +731,6 @@ class Room:
                 self.pos, self.upd = max(0.0, min(float(msg.get("pos", 0)), dur - 1)), now()
                 self._arm_timer()
                 await self.push_music()
-        elif cmd == "skip":
-            await self._next()
         elif cmd == "prev":
             if self.current and self.cur_pos() > 5:
                 self.pos, self.upd = 0.0, now()
@@ -731,8 +786,9 @@ class Room:
                 await self._next(auto=True)
 
     async def set_fx(self, p: Participant, new: dict):
-        if not (p.admin or (self.current and self.current["byUid"] == p.uid)):
-            return await self.toast(p.uid, "Only admins or the person who added this song can change the sound")
+        own = bool(self.current and self.current["byUid"] == p.uid)
+        if not (self.can(p, "fx") or (own and self.can(p, "fx_own"))):
+            return await self.deny(p, "fx")
         if not isinstance(new, dict):
             return
 
@@ -810,6 +866,32 @@ class Room:
                     await c.close(4003)
                 await lk.remove(self.chat_id, uid)
             await self.toast(p.uid, f"{'Banned' if t == 'admin.ban' else 'Removed'} {name}")
+        elif t == "admin.musicperms":
+            ev = msg.get("everyone") or {}
+            if isinstance(ev, dict):
+                for k, v in ev.items():
+                    if k in MUSIC_PERMS:
+                        self.settings["music_everyone"][k] = bool(v)
+                self.settings["music_admin_only"] = not self.settings["music_everyone"]["add"]
+                await db.save_group_settings(self.chat_id, self.settings)
+                await self.broadcast({"t": "room", "room": self.room_state()})
+        elif t == "admin.dj":
+            uid = int(msg.get("uid", 0) or 0)
+            perms = msg.get("perms") or {}
+            djs = self.settings["music_dj"]
+            if not uid or not isinstance(perms, dict) or (str(uid) not in djs and len(djs) >= 50):
+                return
+            who = self.parts.get(uid)
+            name = (who.name if who else str(msg.get("name") or djs.get(str(uid), {}).get("name") or "User"))[:64]
+            djs[str(uid)] = {"name": name, "perms": {k: bool(v) for k, v in perms.items() if k in MUSIC_PERMS}}
+            await db.save_group_settings(self.chat_id, self.settings)
+            await self.broadcast({"t": "room", "room": self.room_state()})
+            if who:
+                await self.toast(uid, "🎧 An admin made you a music DJ")
+        elif t == "admin.undj":
+            if self.settings["music_dj"].pop(str(int(msg.get("uid", 0) or 0)), None) is not None:
+                await db.save_group_settings(self.chat_id, self.settings)
+                await self.broadcast({"t": "room", "room": self.room_state()})
         elif t == "admin.unban":
             await db.x("DELETE FROM bans WHERE chat_id=? AND uid=?", (self.chat_id, int(msg.get("uid", 0))))
             await self.toast(p.uid, "Unbanned")
@@ -838,6 +920,8 @@ class Room:
                     self.settings[k] = v.strip()[:80 if k == "title" else 300]
                 elif k in ("locked", "new_can_speak", "music_admin_only", "soundboard", "join_sound"):
                     self.settings[k] = bool(v)
+                    if k == "music_admin_only":
+                        self.settings["music_everyone"]["add"] = not bool(v)
             await db.save_group_settings(self.chat_id, self.settings)
             await self.broadcast({"t": "room", "room": self.room_state()})
         elif t == "admin.resetlink":

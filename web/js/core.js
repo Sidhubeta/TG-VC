@@ -161,6 +161,13 @@ export function connectWS(opts = {}) {
     retryTimer = setTimeout(() => connectWS(), 500 * 2 ** retry);
   };
 }
+// Back in the app after the phone paused it: reconnect now instead of waiting out the retry delay
+// (that wait was why the song jumped around for a while after coming back).
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || closedByUs || !S.session) return;
+  if (!ws || ws.readyState > 1) { retry = 0; connectWS(); }
+  else syncClock();
+});
 export function reconnectWS(opts) { closedByUs = true; try { ws?.close(); } catch {} setTimeout(() => connectWS(opts), 200); }
 export function closeWS() { closedByUs = true; clearTimeout(retryTimer); try { ws?.close(); } catch {} }
 let pingId = 0; const pings = {};
@@ -177,8 +184,8 @@ function onPong(m) {
 }
 
 // ---------- toasts ----------
-export function toast(text, ms = 2600) {
-  const el = h('div', { class: 'toast' }, text);
+export function toast(text, ms = 2600, kind = '') {
+  const el = h('div', { class: 'toast' + (kind ? ' ' + kind : '') }, text);
   const box = $('#toasts');
   while (box.children.length >= 2) box.firstChild.remove();
   box.append(el);
@@ -323,4 +330,25 @@ export function fullView(el, { label = '', onClose = null, rotate = null } = {})
     el.play?.().catch(() => {});
   }
   return { close };
+}
+
+// ---------- music permissions ("music auth") ----------
+// Mirrors the server: admins can do everything; music DJs get their own set; everyone else gets the room defaults.
+export function can(perm) {
+  if (S.admin) return true;
+  const st = S.room?.settings || {};
+  const dj = st.music_dj?.[String(S.uid)];
+  if (dj && perm in (dj.perms || {})) return !!dj.perms[perm];
+  return !!(st.music_everyone || {})[perm];
+}
+const DENY = {
+  add: 'add songs', next: 'play songs next', vote: 'vote to skip', skip_own: 'skip songs', playback: 'control playback',
+  queue: 'change the queue', modes: 'change repeat and autoplay', fx_own: 'change the sound', fx: 'change the sound',
+  video: 'turn on video for everyone', stop: 'stop the music',
+};
+// shown in red when someone taps something they aren't allowed to use
+export function denied(text) { haptic('error'); toast('🔒 ' + text, 2800, 'err'); }
+export function deny(perm) {
+  const djs = Object.keys(S.room?.settings?.music_dj || {}).length;
+  denied(`Only ${djs ? 'admins and music DJs' : 'admins'} can ${DENY[perm] || 'do that'}`);
 }

@@ -876,3 +876,26 @@ body:not(.playing) .eq i { animation: none; transform: scaleY(.3); height: 100%;
 .np.vfill .np-vid .vid { max-height: 64vh; background: transparent; }
 .np.vfill .vbtns { top: auto; bottom: 12%; right: 14px; }
 .fv-btns { display: flex; gap: 10px; flex: none; }
+
+/* ============ round 5 ============ */
+/* things you aren't allowed to use: dimmed, and tapping says why in red */
+.toast.err { background: rgba(240, 81, 106, .97); color: #fff; font-weight: 600; }
+.locked { opacity: .45; }
+.row.locked .lab { text-decoration: none; }
+.fx.locked { opacity: .45; }
+.slider-row.ro input { pointer-events: none; }
+.ctrls button.locked { opacity: .35; }
+/* the message box and popups sit above the big mic button instead of under it */
+#composer { margin-bottom: 34px; }
+#chat-pop { margin-bottom: 30px; }
+body.composing #chat-pop { margin-bottom: 0; }
+/* video switch on the music card */
+.np-card .ctl .vsw .ico { width: 22px; height: 22px; }
+/* Lag: the player and the music page kept animating (and stayed composited) after being closed. Hide them fully
+   once the slide-out finishes, pause their animations, and keep the room background still. */
+.np, .br { transition: transform .55s var(--ease), visibility 0s linear .55s; visibility: hidden; }
+.np.show, .br.show { visibility: visible; transition: transform .55s var(--ease), visibility 0s; }
+.np:not(.show) .bg i { animation-play-state: paused; }
+#aura i { animation: none !important; }
+.sheet, .np, .br { will-change: auto; }
+.sheet.show, .np.show, .br.show { will-change: transform; }

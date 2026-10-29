@@ -85,7 +85,12 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 - **Sound:** Bass Boost, 8D, Concert Hall, Vocal, Slowed + Reverb, Nightcore, plus EQ, reverb and speed.
   Everyone hears the same effect in sync; only admins or the person who added the song can change it.
 - **Soundboard:** sounds everyone hears (admins can switch it off)
-- **Admin:** title/description, lock, new participants can speak, only admins add songs, mute everyone,
+- **Music auth:** admins choose what everyone may do with the music (add, play next, vote skip, skip own songs,
+  playback, queue, repeat/autoplay, effects on own / any song, video for everyone, stop) and can make chosen people
+  music DJs with their own rights. The server enforces it; anything you can't use tells you why in red.
+- **Video:** turning a song's video on shows it to everyone (anyone can switch back to audio for themselves);
+  480p by default and it never changes by itself; fills the player edge to edge, full screen turns it sideways
+- **Admin:** title/description, lock, new participants can speak, music permissions and DJs, mute everyone,
   invite link copy/reset, recording (named, renamable while recording; the bot sends the file only to the
   admin who recorded it, in private), scheduled reminders
 - **Logs:** who joined, when they left, how long they stayed, mic on and off time. Search by name, @username or ID.

@@ -265,8 +265,16 @@ document.addEventListener('visibilitychange', async () => {
 });
 document.addEventListener('pointerdown', () => { if (nsC && nsC.state !== 'running' && nsState === 'active') nsC.resume().catch(() => {}); }, { capture: true, passive: true });
 
+// iPhone: tell iOS up front whether we record. Otherwise it flips the audio session between "playback" and
+// "voice call" as mics start and stop, and the volume jumps up and down (and music gets ducked).
+function iosSession(recording) {
+  try { if (navigator.audioSession) navigator.audioSession.type = recording ? 'play-and-record' : 'playback'; } catch {}
+}
+iosSession(false);
+
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }
+  if (on) iosSession(true);
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
     if (on) await refreshPermissions();
@@ -274,6 +282,7 @@ export async function setMic(on) {
     if (on) await applyNoise();
     V.mic = on;
     send({ t: 'mic', on });
+    if (!on) iosSession(false);
     return true;
   } catch (e) {
     console.error(e);

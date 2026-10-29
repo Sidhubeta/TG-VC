@@ -15,20 +15,25 @@ def _hmac(data: str, n: int = 32) -> str:
 # ---- Telegram WebApp initData -----------------------------------------------------------
 def verify_init_data(init_data: str, max_age: int = 86400) -> dict:
     """Validate Telegram Mini App initData. Raises ValueError if forged or expired."""
-    received = dict(parse_qsl(init_data, keep_blank_values=True)).get("hash")
-    data_with_sig = dict(parse_qsl(init_data, keep_blank_values=True))
-    data_with_sig.pop("hash", None)
-    if not received:
+    data_with_sig = dict(parse_qsl(init_data or "", keep_blank_values=True))
+    received = data_with_sig.pop("hash", None)
+    if not received or not config.BOT_TOKEN:
         raise ValueError("missing hash")
     check = "\n".join(f"{k}={v}" for k, v in sorted(data_with_sig.items()))
     secret = hmac.new(b"WebAppData", config.BOT_TOKEN.encode(), hashlib.sha256).digest()
     calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(calc, received):
         raise ValueError("bad hash")
-    if time.time() - int(data_with_sig.get("auth_date", "0")) > max_age:
+    try:
+        auth_date = int(data_with_sig.get("auth_date", "0"))
+        user = json.loads(data_with_sig.get("user", "{}"))
+        int(user["id"])
+    except Exception:
+        raise ValueError("bad init data")
+    if time.time() - auth_date > max_age:
         raise ValueError("expired")
     out = dict(data_with_sig)
-    out["user"] = json.loads(data_with_sig.get("user", "{}"))
+    out["user"] = user
     return out
 
 
@@ -63,7 +68,11 @@ def read_session(token: str) -> tuple[int, int]:
         raise ValueError("bad session")
     if not hmac.compare_digest(sig, _hmac("s:" + payload, 40)):
         raise ValueError("bad session")
-    d = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-    if d["e"] < time.time():
+    try:
+        d = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp, uid, chat_id = float(d["e"]), int(d["u"]), int(d["c"])
+    except Exception:
+        raise ValueError("bad session")
+    if exp < time.time():
         raise ValueError("session expired")
-    return int(d["u"]), int(d["c"])
+    return uid, chat_id

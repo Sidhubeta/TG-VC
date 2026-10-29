@@ -10,6 +10,7 @@ export const S = {
 // ---------- tiny event bus ----------
 const listeners = {};
 export const on = (t, fn) => ((listeners[t] ||= []).push(fn), fn);
+export const off = (t, fn) => { const l = listeners[t]; const i = l ? l.indexOf(fn) : -1; if (i >= 0) l.splice(i, 1); };
 export const emit = (t, d) => (listeners[t] || []).forEach(fn => { try { fn(d); } catch (e) { console.error(e); } });
 
 // ---------- storage (may be unavailable) ----------
@@ -121,7 +122,7 @@ export async function api(path, opts = {}) {
 }
 
 // ---------- WebSocket ----------
-let ws = null, wsTimer = null, retry = 0, closedByUs = false, asGroup = false;
+let ws = null, wsTimer = null, retryTimer = null, retry = 0, closedByUs = false, asGroup = false;
 const outbox = [];
 export function send(msg) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
@@ -129,6 +130,7 @@ export function send(msg) {
 }
 export function connectWS(opts = {}) {
   if (opts.asGroup != null) asGroup = opts.asGroup;
+  clearTimeout(retryTimer); retryTimer = null;
   closedByUs = false;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws?s=${encodeURIComponent(S.session)}${asGroup ? '&asg=1' : ''}`);
@@ -146,7 +148,9 @@ export function connectWS(opts = {}) {
     if (m.now && m.t === 'init') S.offset = m.now - Date.now() / 1000;
     emit('ws:' + m.t, m);
   };
+  const sock = ws;
   ws.onclose = (e) => {
+    if (sock !== ws) return; // an old socket we already replaced
     clearInterval(wsTimer);
     if (closedByUs) return;
     if (e.code === 4003) return emit('fatal', { title: 'Removed', text: 'You were removed from this voice chat.' });
@@ -154,13 +158,17 @@ export function connectWS(opts = {}) {
     if (e.code === 4001) return emit('fatal', { title: 'Session expired', text: 'Close and reopen the voice chat from your group.' });
     emit('ws:down');
     retry = Math.min(retry + 1, 6);
-    setTimeout(() => connectWS(), 500 * 2 ** retry);
+    retryTimer = setTimeout(() => connectWS(), 500 * 2 ** retry);
   };
 }
 export function reconnectWS(opts) { closedByUs = true; try { ws?.close(); } catch {} setTimeout(() => connectWS(opts), 200); }
-export function closeWS() { closedByUs = true; try { ws?.close(); } catch {} }
+export function closeWS() { closedByUs = true; clearTimeout(retryTimer); try { ws?.close(); } catch {} }
 let pingId = 0; const pings = {};
-function syncClock() { const id = ++pingId; pings[id] = Date.now() / 1000; send({ t: 'ping', id }); }
+function syncClock() {
+  if (!ws || ws.readyState !== 1) return; // don't queue clock pings while offline (stale timings)
+  const id = ++pingId; pings[id] = Date.now() / 1000; send({ t: 'ping', id });
+  for (const k in pings) if (pings[k] < pings[id] - 60) delete pings[k];
+}
 function onPong(m) {
   const t0 = pings[m.id]; delete pings[m.id];
   if (!t0) return;
@@ -243,7 +251,13 @@ export function switchRow(label, sub, value, onchange) {
 export function actionRow(ic, label, onclick, cls = '', sub = null) {
   return h('button', { class: 'row ' + cls, onclick }, ic ? icon(ic) : null, h('span', { class: 'lab' }, label, sub ? h('small', null, sub) : null));
 }
+function copyFallback(text) {
+  const t = h('textarea', null, text); document.body.append(t); t.select();
+  try { document.execCommand('copy'); toast('Copied'); } catch { toast('Couldn’t copy'); }
+  t.remove();
+}
 export function copyText(text) {
-  try { navigator.clipboard.writeText(text); toast('Copied'); }
-  catch { const t = h('textarea', null, text); document.body.append(t); t.select(); document.execCommand('copy'); t.remove(); toast('Copied'); }
+  // writeText returns a promise that rejects (it doesn't throw) when the clipboard is blocked
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => toast('Copied'), () => copyFallback(text));
+  else copyFallback(text);
 }

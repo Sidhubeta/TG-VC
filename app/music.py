@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from urllib.parse import parse_qs, urlparse
 
 from starlette.requests import Request
@@ -24,15 +25,22 @@ CACHE_DIR = os.path.join(config.DATA_DIR, "audio")
 os.makedirs(CACHE_DIR, exist_ok=True)
 COOKIE_FILE = os.path.join(config.DATA_DIR, "cookies.txt")
 if config.YT_COOKIES_B64:
-    open(COOKIE_FILE, "wb").write(base64.b64decode(config.YT_COOKIES_B64))
+    with open(COOKIE_FILE, "wb") as _fh:
+        _fh.write(base64.b64decode(config.YT_COOKIES_B64))
 elif config.YT_COOKIES:
-    open(COOKIE_FILE, "w").write(config.YT_COOKIES.replace("\\n", "\n"))
+    with open(COOKIE_FILE, "w") as _fh:
+        _fh.write(config.YT_COOKIES.replace("\\n", "\n"))
 
 _info_cache: dict[str, tuple[float, dict]] = {}
 _downloads: dict[str, asyncio.Task] = {}
 _resolve_locks: dict[str, asyncio.Lock] = {}
 _http: httpx.AsyncClient | None = None
 CHUNK = 8 * 1024 * 1024  # googlevideo throttles big open ranges; serve in 8MB pieces
+VID_RE = re.compile(r"[\w-]{11}")
+
+
+def valid_id(vid: str) -> bool:
+    return bool(vid) and bool(VID_RE.fullmatch(vid))
 
 
 def http() -> httpx.AsyncClient:
@@ -96,7 +104,11 @@ def parse_youtube(text: str) -> tuple[str | None, str | None]:
         vid = qs["v"][0][:11]
     elif m := re.match(r"/(shorts|live|embed)/([\w-]{11})", u.path):
         vid = m.group(2)
+    if vid and not valid_id(vid):
+        vid = None
     pl = qs.get("list", [None])[0]
+    if pl and not re.fullmatch(r"[\w-]{10,64}", pl):
+        pl = None
     if pl and pl.startswith("RD"):  # auto mixes: treat as single video
         pl = None
     return vid, pl
@@ -130,6 +142,9 @@ async def resolve(vid: str, force: bool = False) -> dict:
     hit = _info_cache.get(vid)
     if hit and not force and time.time() - hit[0] < 3 * 3600:
         return hit[1]
+    if len(_resolve_locks) > 1000:  # forget idle locks so the dict doesn't grow forever
+        for k in [k for k, lk in _resolve_locks.items() if not lk.locked()]:
+            _resolve_locks.pop(k, None)
     lock = _resolve_locks.setdefault(vid, asyncio.Lock())
     async with lock:
         hit = _info_cache.get(vid)
@@ -188,7 +203,8 @@ def video_heights(info: dict) -> list[int]:
 
 # ---- audio cache ---------------------------------------------------------------------------
 def _cache_path(vid: str, fid: str) -> str:
-    return os.path.join(CACHE_DIR, f"{vid}_{re.sub(r'[^\w-]', '', fid)}.bin")
+    safe = re.sub(r"[^\w-]", "", str(fid))
+    return os.path.join(CACHE_DIR, f"{vid}_{safe}.bin")
 
 
 async def _download(vid: str, fmt: dict):
@@ -216,7 +232,7 @@ async def _download(vid: str, fmt: dict):
 
 def _trim_cache():
     files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(".bin")]
-    files.sort(key=os.path.getatime)
+    files.sort(key=os.path.getmtime)
     total = sum(os.path.getsize(f) for f in files)
     while files and total > config.AUDIO_CACHE_MB * 1024 * 1024:
         f = files.pop(0)
@@ -263,8 +279,16 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         return Response("no format", status_code=404)
     path = _cache_path(vid, fmt["id"])
     if os.path.exists(path):
+        try:
+            os.utime(path)  # LRU: mark as recently used (atime is often not updated on volumes)
+        except OSError:
+            pass
         return FileResponse(path, media_type=_mime(fmt), headers={"Cache-Control": "private, max-age=3600"})
-    return await _proxy(request, vid, fmt, retry=True)
+    try:
+        return await _proxy(request, vid, fmt, retry=True)
+    except Exception as e:
+        log.warning("stream proxy failed %s: %s", vid, e)
+        return Response("upstream error", status_code=502)
 
 
 async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response:
@@ -300,20 +324,37 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
     return StreamingResponse(body(), status_code=r.status_code, media_type=_mime(fmt), headers=headers)
 
 
+_thumbs: "OrderedDict[str, bytes | None]" = OrderedDict()  # small in-memory LRU so ytimg isn't hit on every view
+
+
 async def thumb(vid: str) -> Response:
-    for q in ("maxresdefault", "hqdefault", "mqdefault"):
-        try:
-            r = await http().get(f"https://i.ytimg.com/vi/{vid}/{q}.jpg")
-            if r.status_code == 200 and len(r.content) > 2000:
-                return Response(r.content, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
-        except Exception:
-            pass
-    return Response(status_code=404)
+    if not valid_id(vid):
+        return Response(status_code=404)
+    if vid in _thumbs:
+        _thumbs.move_to_end(vid)
+        data = _thumbs[vid]
+    else:
+        data, failed = None, False
+        for q in ("maxresdefault", "hqdefault", "mqdefault"):
+            try:
+                r = await http().get(f"https://i.ytimg.com/vi/{vid}/{q}.jpg")
+                if r.status_code == 200 and len(r.content) > 2000:
+                    data = r.content
+                    break
+            except Exception:
+                failed = True
+        if data or not failed:  # don't remember network errors as "no thumbnail"
+            _thumbs[vid] = data
+            while len(_thumbs) > 300:
+                _thumbs.popitem(last=False)
+    if not data:
+        return Response(status_code=404)
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
 
 
 # ---- lyrics (LRCLIB, free) -----------------------------------------------------------------
 _JUNK = re.compile(r"[\(\[][^\)\]]*(official|video|audio|lyric|lyrics|visualizer|hd|4k|remaster|full song|mv)[^\)\]]*[\)\]]", re.I)
-_lyr_cache: dict[str, dict] = {}
+_lyr_cache: "OrderedDict[str, dict]" = OrderedDict()
 
 
 def _clean(title: str, artist: str) -> tuple[str, str]:
@@ -328,6 +369,7 @@ def _clean(title: str, artist: str) -> tuple[str, str]:
 
 async def lyrics(vid: str, title: str, artist: str, duration: float) -> dict:
     if vid in _lyr_cache:
+        _lyr_cache.move_to_end(vid)
         return _lyr_cache[vid]
     name, art = _clean(title, artist)
     res = {"synced": None, "plain": None}
@@ -346,7 +388,10 @@ async def lyrics(vid: str, title: str, artist: str, duration: float) -> dict:
                 res = {"synced": best.get("syncedLyrics"), "plain": best.get("plainLyrics")}
     except Exception as e:
         log.info("lyrics failed: %s", e)
+        return res  # don't cache failures: try again next time
     _lyr_cache[vid] = res
+    while len(_lyr_cache) > 500:
+        _lyr_cache.popitem(last=False)
     return res
 
 
@@ -395,6 +440,10 @@ async def _cached(key: str, ttl: float, fn):
                 return hit[1]
             raise
         _bcache[key] = (time.time(), val)
+        if len(_bcache) > 200:  # recommendation keys are per seed set; drop the oldest
+            for k, _ in sorted(_bcache.items(), key=lambda kv: kv[1][0])[:50]:
+                _bcache.pop(k, None)
+                _blocks.pop(k, None)
         return val
 
 

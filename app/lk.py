@@ -8,6 +8,14 @@ from . import config
 from .http import httpx
 
 log = logging.getLogger("livekit")
+_client: httpx.AsyncClient | None = None
+
+
+def _http() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=10)
+    return _client
 
 
 def enabled() -> bool:
@@ -39,13 +47,12 @@ async def _twirp(method: str, body: dict):
     if not enabled():
         return None
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"{config.LIVEKIT_HTTP_URL}/twirp/livekit.RoomService/{method}", json=body,
-                             headers={"Authorization": f"Bearer {_admin_token(body.get('room', ''))}"})
-            if r.status_code >= 400:
-                log.info("livekit %s -> %s %s", method, r.status_code, r.text[:200])
-                return None
-            return r.json()
+        r = await _http().post(f"{config.LIVEKIT_HTTP_URL}/twirp/livekit.RoomService/{method}", json=body,
+                               headers={"Authorization": f"Bearer {_admin_token(body.get('room', ''))}"})
+        if r.status_code >= 400:
+            log.info("livekit %s -> %s %s", method, r.status_code, r.text[:200])
+            return None
+        return r.json()
     except Exception as e:
         log.warning("livekit %s failed: %s", method, e)
         return None

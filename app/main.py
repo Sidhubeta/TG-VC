@@ -141,7 +141,7 @@ async def api_auth(request: Request):
     if room.settings["locked"] and not st["admin"] and uid not in room.parts:
         return err("The voice chat is locked by admins", 403)
     can_pub = st["admin"] or room.settings["new_can_speak"] or (uid in room.parts and room.can_speak(room.parts[uid]))
-    out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"],
+    out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"], "bot": tg.BOT_USERNAME,
            "group": "Dev Group" if config.DEV_MODE and uid < 0 else await tg.chat_title(chat_id),
            "livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, name, can_pub)} if lk.enabled() else None}
     return JSONResponse(out)
@@ -476,12 +476,78 @@ async def api_recording(request: Request, uid, chat_id, st):
     if ext not in ("webm", "m4a", "ogg", "mp4"):
         ext = "webm"
     room = ROOMS.get(chat_id)
-    title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", room.settings["title"] if room else "Voice chat").strip() or "Voice chat"
-    name = f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{ext}"
-    to = await tg.send_recording(uid, chat_id, data, name, f"🎙 Recording — {title}")
-    if to is None:
-        return err("Couldn't send the recording. Start the bot in private (/start) and try again.")
-    return JSONResponse({"ok": True, "to": "dm" if to == uid else "group"})
+    clean = lambda v: re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", str(v or "")).strip()
+    title = clean(room.settings["title"] if room else "") or "Voice chat"
+    custom = clean(form.get("name"))[:60]
+    name = f"{custom}.{ext}" if custom else f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{ext}"
+    if not await tg.send_recording(uid, data, name, f"🎙 {custom or 'Recording'} — {title}"):
+        return err("Couldn't send the recording to your private chat. Open the bot, press Start, and try again.")
+    return JSONResponse({"ok": True, "to": "dm"})
+
+
+@guarded()
+async def api_dm_check(request: Request, uid, chat_id, st):
+    """Can the bot message this person privately? (Only if they pressed Start in the bot.)"""
+    try:
+        await tg.call("sendChatAction", chat_id=uid, action="typing")
+        ok = True
+    except Exception:
+        ok = False
+    return JSONResponse({"ok": ok, "bot": tg.BOT_USERNAME})
+
+
+# ---------------- invites ----------------
+_invite_last: dict[tuple, float] = {}
+
+
+@guarded()
+async def api_invite(request: Request, uid, chat_id, st):
+    room = await get_room(chat_id)
+    in_room = set(room.parts)
+    hidden = await tg.hidden_members(chat_id)
+    admins = await tg.admin_list(chat_id)
+    banned = {r["uid"] for r in await db.q("SELECT uid FROM bans WHERE chat_id=?", (chat_id,))}
+    people: dict[int, dict] = {}
+    for a in admins:
+        if not a["anonymous"]:  # anonymous admins stay hidden
+            people[a["uid"]] = {"uid": a["uid"], "name": a["name"], "username": a["username"], "admin": True}
+    if not hidden:
+        rows = await db.q("SELECT uid, name, username FROM members WHERE chat_id=? ORDER BY seen DESC LIMIT 400", (chat_id,))
+        rows += await db.q("""SELECT s.uid, MAX(s.name) AS name, MAX(s.username) AS username FROM sessions s
+                              WHERE s.chat_id=? AND s.uid > 0 GROUP BY s.uid ORDER BY MAX(s.joined) DESC LIMIT 200""", (chat_id,))
+        for r in rows:
+            people.setdefault(r["uid"], {"uid": r["uid"], "name": r["name"] or "User", "username": r["username"] or "", "admin": False})
+    anon = {a["uid"] for a in admins if a["anonymous"]}
+    out = [p for p in people.values() if p["uid"] not in in_room and p["uid"] != uid and p["uid"] not in banned
+           and p["uid"] not in anon and p["uid"] > 0]
+    if request.method == "GET":
+        out.sort(key=lambda p: (not p["admin"], p["name"].lower()))
+        for p in out:
+            p["photo"] = f"/api/avatar/{p['uid']}"
+        return JSONResponse({"people": out, "hidden": hidden})
+    body = await _json(request)
+    target = int(_num(body.get("uid")))
+    person = next((p for p in out if p["uid"] == target), None)
+    if not person:
+        return err("You can't invite this person")
+    t = time.time()
+    if t - _invite_last.get(("by", chat_id, uid), 0) < 4:
+        return err("Slow down a little 🙂", 429)
+    if t - _invite_last.get(("to", chat_id, target), 0) < 600:
+        return err(f"{person['name']} was invited recently", 429)
+    if not (await tg.member_status(chat_id, target, fresh=True))["member"]:
+        return err(f"{person['name']} isn't in the group any more")
+    _invite_last[("by", chat_id, uid)] = _invite_last[("to", chat_id, target)] = t
+    if len(_invite_last) > 5000:
+        for k in [k for k, v in _invite_last.items() if t - v > 600]:
+            _invite_last.pop(k, None)
+    me = room.parts.get(uid)
+    by = room.group_title if me and me.as_group else (me.name if me else "Someone")
+    via = await tg.invite(chat_id, target, person["name"], by)
+    if not via:
+        _invite_last.pop(("to", chat_id, target), None)
+        return err("Couldn't send the invite")
+    return JSONResponse({"ok": True, "via": via})
 
 
 # ---------------- websocket ----------------
@@ -598,6 +664,8 @@ routes = [
     Route("/api/logs/users", api_logs_users),
     Route("/api/reports", api_reports, methods=["GET", "POST"]),
     Route("/api/recording", api_recording, methods=["POST"]),
+    Route("/api/dmcheck", api_dm_check),
+    Route("/api/invite", api_invite, methods=["GET", "POST"]),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),
     Mount("/static", StaticFiles(directory=WEB), name="static"),

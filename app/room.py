@@ -15,6 +15,10 @@ log = logging.getLogger("room")
 ROOMS: dict[int, "Room"] = {}
 SOUNDS = {"airhorn", "applause", "drumroll", "rimshot", "bell", "whoosh", "laugh", "wow"}
 REACTIONS = {"👍", "❤️", "😂", "🔥", "😮", "😢", "👏", "🎉"}
+# floating reactions over the room (like Telegram's live reactions)
+FLY = {"👍", "❤️", "🔥", "😂", "😍", "🤩", "👏", "🎉", "😮", "😢", "🙏", "💯", "🥳", "😎", "🤣", "💔"}
+FX_PRESETS = {"normal", "bass", "8d", "hall", "vocal", "slowed", "nightcore", "custom"}
+FX_DEFAULT = {"preset": "normal", "bass": 0, "mid": 0, "treble": 0, "reverb": 0.0, "rate": 1.0, "mode": "none"}
 DEFAULT_SETTINGS = {"title": "", "description": "", "locked": False, "new_can_speak": True,
                     "music_admin_only": False, "soundboard": True, "join_sound": True}
 
@@ -61,6 +65,7 @@ class Participant:
         self.mic_secs = 0.0
         self.flags: list[str] = []
         self.last_sound = 0.0
+        self.fly_times: deque[float] = deque(maxlen=6)
 
 
 class Conn:
@@ -90,7 +95,7 @@ class Room:
         self.chat: deque[dict] = deque(maxlen=80)
         self.join_times: deque[float] = deque(maxlen=50)
         self.user_joins: dict[int, deque] = {}
-        self.rec = {"on": False, "by": None, "since": 0}
+        self.rec = {"on": False, "by": None, "since": 0, "name": ""}
         # music
         self.queue: list[dict] = []
         self.current: dict | None = None
@@ -102,6 +107,9 @@ class Room:
         self.votes: set[int] = set()
         self.recent: deque[str] = deque(maxlen=60)
         self.history: deque[dict] = deque(maxlen=50)  # played tracks, for "previous"
+        # sound effects are shared: everyone hears the same effect, in sync (speed changes the timeline)
+        self.fx: dict = dict(FX_DEFAULT)
+        self.fx_by_admin = False
         self._timer: asyncio.Task | None = None
         self._qid = 0
         self._lock = asyncio.Lock()
@@ -152,7 +160,7 @@ class Room:
         need = max(1, (len(self.parts) + 1) // 2)
         return {"queue": self.queue, "current": self.current, "status": self.status, "pos": self.pos,
                 "upd": self.upd, "loop": self.loop, "autoplay": self.autoplay, "votes": len(self.votes),
-                "need": need}
+                "need": need, "fx": self.fx, "rate": self.fx["rate"]}
 
     async def push_music(self):
         await self.broadcast({"t": "music", "m": self.music_state(), "now": now()})
@@ -182,8 +190,10 @@ class Room:
         p.admin = admin
         p.conns.add(conn)
         everyone = [self.pub(q, admin) for q in self.parts.values()]
+        # chat is like Telegram's voice chat: you only see messages sent since you joined
+        since = p.joined - 1
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
-                         "music": self.music_state(), "chat": list(self.chat), "admin": admin,
+                         "music": self.music_state(), "chat": [m for m in self.chat if m["ts"] >= since], "admin": admin,
                          "group": self.group_title})
         if first:
             a, n = {"t": "p.join", "p": self.pub(p, True)}, {"t": "p.join", "p": self.pub(p, False)}
@@ -216,7 +226,7 @@ class Room:
         await db.x("UPDATE sessions SET left=?, last_seen=?, mic_secs=?, open=0 WHERE id=?",
                    (t, t, p.mic_secs, p.session_id))
         if self.rec["on"] and self.rec["by"] == p.uid:
-            self.rec = {"on": False, "by": None, "since": 0}
+            self.rec = {"on": False, "by": None, "since": 0, "name": ""}
         await self.broadcast({"t": "p.leave", "uid": p.uid})
         await self.broadcast({"t": "room", "room": self.room_state()})
         pin.schedule(self.chat_id)
@@ -313,6 +323,8 @@ class Room:
                 await self.on_chat_delete(p, msg)
             elif t == "sound":
                 await self.on_sound(p, msg)
+            elif t == "fly":
+                await self.on_fly(p, msg)
             elif t == "report":
                 await self.on_report(p, msg)
             elif t.startswith("music."):
@@ -393,6 +405,17 @@ class Room:
         await self.broadcast({"t": "sound", "id": sid, "uid": p.uid,
                               "name": self.group_title if p.as_group else p.name})
 
+    async def on_fly(self, p: Participant, msg: dict):
+        emoji = msg.get("emoji")
+        if emoji not in FLY:
+            return
+        t = now()
+        if len(p.fly_times) == p.fly_times.maxlen and t - p.fly_times[0] < 3:
+            return  # max 6 every 3 seconds
+        p.fly_times.append(t)
+        await self.broadcast({"t": "fly", "emoji": emoji, "uid": p.uid,
+                              "name": self.group_title if p.as_group else p.name})
+
     async def on_report(self, p: Participant, msg: dict):
         target = self.parts.get(int(msg.get("uid", 0)))
         if not target or target.uid == p.uid:
@@ -413,7 +436,7 @@ class Room:
     # ---------------- music -----------------
     def cur_pos(self) -> float:
         if self.status == "playing":
-            return self.pos + (now() - self.upd)
+            return self.pos + (now() - self.upd) * self.fx["rate"]
         return self.pos
 
     def _cancel_timer(self):
@@ -430,7 +453,7 @@ class Room:
         dur = self.current.get("duration") or 0
         if dur <= 0:
             return
-        remaining = max(0.5, dur - self.cur_pos()) + 0.8
+        remaining = max(0.5, dur - self.cur_pos()) / self.fx["rate"] + 0.8
         qid = self.current["qid"]
 
         async def fire():
@@ -454,6 +477,8 @@ class Room:
         cur = self.current
         if cur and not from_prev and (not item or item["id"] != cur["id"]):
             self.history.append(cur)
+        if (item or {}).get("qid") != (cur or {}).get("qid") and not self.fx_by_admin:
+            self.fx = dict(FX_DEFAULT)  # an effect picked by a song's owner ends with their song
         self.current = item
         self.votes.clear()
         self.pos = 0.0
@@ -516,6 +541,7 @@ class Room:
             for r in rel[:3]:
                 it = self._item(r, None, by="Autoplay")
                 if it:
+                    it["auto"] = True
                     self.queue.append(it)
             if self.queue:
                 await self._start(self.queue.pop(0))
@@ -535,7 +561,9 @@ class Room:
             if msg.get("next") and admin:
                 self.queue[0:0] = items
             else:
-                self.queue.extend(items)
+                # people's songs go before the songs autoplay picked; autoplay carries on after them
+                at = next((i for i, q in enumerate(self.queue) if q.get("auto")), len(self.queue))
+                self.queue[at:at] = items
             if not self.current:
                 await self._start(self.queue.pop(0))
             else:
@@ -543,6 +571,8 @@ class Room:
                 spawn(music.prefetch(self.queue[0]["id"]))
             await self.toast(p.uid, f"Added {len(items)} songs" if len(items) > 1 else f"Added: {items[0]['title']}")
             return
+        if cmd == "fx":
+            return await self.set_fx(p, msg.get("fx") or {})
         if cmd == "voteskip":
             if not self.current:
                 return
@@ -637,6 +667,29 @@ class Room:
             # client hint for tracks with unknown duration
             if self.current and self.current["qid"] == msg.get("qid") and not self.current.get("duration"):
                 await self._next(auto=True)
+
+    async def set_fx(self, p: Participant, new: dict):
+        if not (p.admin or (self.current and self.current["byUid"] == p.uid)):
+            return await self.toast(p.uid, "Only admins or the person who added this song can change the sound")
+        if not isinstance(new, dict):
+            return
+
+        def num(k, lo, hi):
+            try:
+                v = float(new.get(k, self.fx[k]))
+            except (TypeError, ValueError):
+                return self.fx[k]
+            return min(hi, max(lo, v)) if v == v else self.fx[k]
+        fx = {"preset": new.get("preset") if new.get("preset") in FX_PRESETS else "custom",
+              "bass": num("bass", -12, 12), "mid": num("mid", -12, 12), "treble": num("treble", -12, 12),
+              "reverb": num("reverb", 0, 0.8), "rate": round(num("rate", 0.7, 1.4), 2),
+              "mode": "8d" if new.get("mode") == "8d" else "none"}
+        if fx["rate"] != self.fx["rate"]:
+            self.pos, self.upd = self.cur_pos(), now()  # keep the song where it is, then run at the new speed
+        self.fx = fx
+        self.fx_by_admin = p.admin
+        self._arm_timer()
+        await self.push_music()
 
     def _remember(self, q: Participant):
         self.sticky[q.uid] = {"force_muted": q.force_muted, "role": q.role}
@@ -745,11 +798,19 @@ class Room:
         elif t == "rec.start":
             if self.rec["on"]:
                 return await self.toast(p.uid, "Already recording")
-            self.rec = {"on": True, "by": p.uid, "since": now()}
+            self.rec = {"on": True, "by": p.uid, "since": now(), "name": _clean_name(msg.get("name"))}
             await self.broadcast({"t": "room", "room": self.room_state()})
+        elif t == "rec.name":
+            if self.rec["on"] and self.rec["by"] == p.uid:
+                self.rec["name"] = _clean_name(msg.get("name"))
+                await self.broadcast({"t": "room", "room": self.room_state()})
         elif t == "rec.stop":
-            self.rec = {"on": False, "by": None, "since": 0}
+            self.rec = {"on": False, "by": None, "since": 0, "name": ""}
             await self.broadcast({"t": "room", "room": self.room_state()})
+
+
+def _clean_name(v) -> str:
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", str(v or "")).strip()[:60]
 
 
 async def p_send(room: Room, p: Participant, msg: dict):

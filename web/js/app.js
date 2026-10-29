@@ -1,7 +1,10 @@
-import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, emit, fmtDate, fmtDur, fmtTime, grad, h, haptic, icon, initials, on, pushBack, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
-import { openNP, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, stopMusic, unlockAudio } from './player.js';
+import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
+import { getMusicVolume, openNP, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
-import { V, attachVideo, getVolume, isMutedForMe, leaveVoice, screenSupported, setCam, setMic, setScreen, setVolume, startVoice, toggleMuteForMe, unblockAudio } from './voice.js';
+import {
+  V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
+  screenSupported, setCam, setMic, setNoise, setRoomVolume, setScreen, setVolume, startVoice, toggleMuteForMe, unblockAudio, useDevice,
+} from './voice.js';
 import { recorder } from './recorder.js';
 import { startEmoji } from './emoji.js';
 startEmoji();
@@ -39,13 +42,15 @@ async function boot() {
       ? h('button', { class: 'btn soft', onclick: () => tg?.close?.() }, 'Close')
       : h('button', { class: 'btn soft', onclick: () => location.reload() }, 'Try again'));
   }
-  Object.assign(S, { session: r.session, uid: r.uid, chat: r.chat, admin: r.admin, group: r.group });
+  Object.assign(S, { session: r.session, uid: r.uid, chat: r.chat, admin: r.admin, group: r.group, bot: r.bot || '' });
   S.lk = r.livekit;
   connectWS({ asGroup: store.get('asGroup:' + r.chat, false) && r.admin });
   try { tg?.enableClosingConfirmation?.(); } catch {}
-  document.addEventListener('pointerdown', firstTap, { once: true, capture: true });
 }
-function firstTap() { unlockAudio(); unblockAudio(); }
+// Browsers only allow sound after a tap. Instead of a "Tap to listen" button, any tap anywhere starts it.
+const unlockAll = () => { unlockAudio(); unblockAudio(); };
+document.addEventListener('pointerdown', unlockAll, { capture: true, passive: true });
+document.addEventListener('keydown', unlockAll, { capture: true });
 
 // Closing the app = leaving the voice chat (the socket also drops, this just makes it instant)
 let byeSent = false;
@@ -68,13 +73,17 @@ let started = false;
 on('ws:init', (m) => {
   S.admin = m.admin; S.room = m.room; S.group = m.group;
   S.parts = new Map(m.parts.map(p => [p.uid, p]));
-  S.chat = m.chat;
+  // keep what we already saw (reconnects), add what's new; the server only sends messages since we joined
+  const known = new Set(S.msgs.map(x => x.id));
+  for (const x of m.chat) if (!known.has(x.id)) S.msgs.push(x);
+  S.msgs.sort((a, b) => a.id - b.id);
   $('#gate').hidden = true;
   $('#room').hidden = false;
   if (!started) {
     started = true;
     startVoice(S.lk);
     bindDock();
+    bindChatbar();
   }
   renderHeader(); renderGrid(true); renderDock();
 });
@@ -95,12 +104,14 @@ function renderHeader() {
   const d = $('#r-desc'); d.hidden = !s.description; d.textContent = s.description || '';
   $('#b-admin').querySelector('use').setAttribute('href', S.admin ? '#i-shield' : '#i-more');
 }
-on('ws:room', (m) => { S.room = m.room; renderHeader(); renderDock(); refreshMusic(); });
+on('ws:room', (m) => { S.room = m.room; renderHeader(); renderDock(); refreshMusic(); emit('room:changed'); });
 $('#b-search').onclick = () => openSearch('home');
 $('#b-admin').onclick = () => (S.admin ? openAdmin() : openMore());
 
 // ======================= participants =======================
 const tiles = new Map();
+const inviteRow = h('button', { class: 'prow invite-row', onclick: () => openInvite() },
+  h('div', { class: 'pav' }, icon('user-plus')), h('div', { class: 'pmeta' }, h('div', { class: 'pname' }, 'Invite members')));
 function sortParts() {
   return [...S.parts.values()].sort((a, b) =>
     (b.uid === S.uid) - (a.uid === S.uid) || (!!b.hand - !!a.hand) || (b.mic - a.mic) || (b.canSpeak - a.canSpeak) || (a.joined - b.joined));
@@ -114,12 +125,10 @@ function statusOf(p) {
   if (p.mic && p.canSpeak) return ['unmuted', 'blue'];
   return ['listening', ''];
 }
-const statusText = (p) => statusOf(p)[0];
 function tileFor(p) {
   let t = tiles.get(p.uid);
   if (!t) {
     t = h('button', { class: 'prow', onclick: () => openParticipant(p.uid) });
-    t._photo = null;
     tiles.set(p.uid, t);
   }
   const live = p.mic && p.canSpeak;
@@ -142,7 +151,7 @@ function tileFor(p) {
 function renderGrid(full = false) {
   const g = $('#grid');
   const list = sortParts();
-  const want = list.map(tileFor);
+  const want = [inviteRow, ...list.map(tileFor)];
   if (full || g.children.length !== want.length || want.some((el, i) => g.children[i] !== el)) g.replaceChildren(...want);
   const lh = $('#lh-count'); if (lh) lh.textContent = `${list.length} ${list.length === 1 ? 'participant' : 'participants'}`;
 }
@@ -221,22 +230,27 @@ function openParticipant(uid) {
 
 // ======================= video stage =======================
 const vids = new Map();
-on('voice:video', ({ uid, track, source, on: isOn }) => {
+on('voice:video', ({ uid, track, source, on: isOn, local }) => {
   const key = uid + ':' + source;
   if (!isOn) return removeVideo(uid, key);
-  if (vids.has(key)) return;
+  const old = vids.get(key);
+  if (old?.track === track) return;
+  if (old) removeVideo(uid, key);
   const p = S.parts.get(uid);
+  const screen = source === 'screen_share';
   const el = attachVideo(track);
-  const tile = h('div', { class: 'vtile' + (source === 'screen_share' ? ' screen' : '') }, el,
-    h('span', { class: 'lbl' }, (p?.name || '') + (source === 'screen_share' ? ' · screen' : '')),
-    h('button', { class: 'fs', 'aria-label': 'Full screen', onclick: () => { try { (el.requestFullscreen || el.webkitEnterFullscreen).call(el); } catch {} } }, icon('expand')),
+  const label = (p?.name || '') + (screen ? ' · screen' : '');
+  const tile = h('div', { class: 'vtile' + (screen ? ' screen' : '') }, el,
+    h('span', { class: 'lbl' }, label),
+    h('button', { class: 'fs', 'aria-label': 'Full screen', onclick: () => fullView(el, { label }) }, icon('expand')),
     pipSupported(el) ? h('button', { class: 'fs pip', 'aria-label': 'Picture in picture', onclick: () => pip(el) }, icon('pip')) : null);
-  if (uid === S.uid && source !== 'screen_share') el.style.transform = 'scaleX(-1)';
-  vids.set(key, { tile, uid });
+  vids.set(key, { tile, uid, track, el, local: local && !screen });
+  if (local && !screen) el.classList.toggle('mirror', V.facing === 'user'); // only the selfie camera is mirrored
   $('#stage').append(tile);
 });
+on('voice:facing', () => { for (const v of vids.values()) if (v.local) v.el.classList.toggle('mirror', V.facing === 'user'); });
 function removeVideo(uid, key) {
-  for (const [k, v] of vids) if ((key ? k === key : v.uid === uid)) { v.tile.remove(); vids.delete(k); }
+  for (const [k, v] of vids) if ((key ? k === key : v.uid === uid)) { v.tile.remove(); try { v.track?.detach?.(v.el); } catch {} vids.delete(k); }
 }
 
 // ======================= dock =======================
@@ -259,15 +273,9 @@ function renderDock() {
 }
 on('voice', ({ state }) => { S.voiceState = state; renderDock(); });
 on('voice:local', renderDock);
-let unlockBtn = null;
-on('voice:blocked', (b) => {
-  if (b && !unlockBtn) { unlockBtn = h('button', { class: 'btn unlock', onclick: () => { unblockAudio(); unlockAudio(); unlockBtn.remove(); unlockBtn = null; } }, icon('vol'), 'Tap to hear the room'); document.body.append(unlockBtn); }
-  if (!b && unlockBtn) { unlockBtn.remove(); unlockBtn = null; }
-});
 
 function bindDock() {
   $('#b-mic').onclick = async () => {
-    unlockAudio();
     const p = me(); if (!p) return;
     if (S.voiceState !== 'ready') return toast(S.voiceState === 'off' ? 'Voice isn’t set up on the server yet' : 'Voice is still connecting');
     if (p.forceMuted) { haptic('error'); return toast('An admin muted you'); }
@@ -276,11 +284,8 @@ function bindDock() {
     const want = !V.mic;
     if (await setMic(want)) { micSound(want); renderDock(); }
   };
-  $('#b-cam').onclick = () => {
-    const p = me(); if (!p?.canSpeak) return toast('Only speakers can turn on the camera');
-    haptic('light'); setCam(!V.cam);
-  };
-  $('#b-chat').onclick = openChat;
+  $('#b-cam').onclick = openCamera;
+  $('#b-speaker').onclick = openAudio;
   $('#b-more').onclick = openMore;
   $('#b-leave').onclick = async () => {
     if (!(await confirmBox('Leave the voice chat?', 'Leave', true))) return;
@@ -292,18 +297,83 @@ function bindDock() {
   };
 }
 
+// ---- camera: pick front or back first, then switch or turn off ----
+function openCamera() {
+  const p = me();
+  if (!p?.canSpeak) return toast('Only speakers can turn on the camera');
+  haptic('light');
+  const body = V.cam
+    ? h('div', { class: 'list' },
+      actionRow('flip', V.facing === 'user' ? 'Switch to back camera' : 'Switch to front camera', () => { s.close(); flipCamera(); }),
+      actionRow('video-off', 'Turn off camera', () => { s.close(); setCam(false); }, 'red'))
+    : h('div', { class: 'list' },
+      actionRow('video', 'Front camera', () => { s.close(); setCam(true, 'user'); }, '', 'Selfie camera'),
+      actionRow('flip', 'Back camera', () => { s.close(); setCam(true, 'environment'); }));
+  const s = sheet({ title: V.cam ? 'Camera' : 'Turn on camera', body });
+}
+
+// ---- audio: speaker / Bluetooth, mic, volumes, noise isolation ----
+const isBt = (label) => /bluetooth|airpods|buds|headset|hands-?free|\bbt\b/i.test(label);
+function devLabel(d, i, kind) {
+  if (d.deviceId === 'default') return kind === 'audioinput' ? 'Phone default' : 'Phone default';
+  if (d.deviceId === 'communications') return 'Call device';
+  return d.label || (kind === 'audioinput' ? `Microphone ${i + 1}` : `Speaker ${i + 1}`);
+}
+function volRow(ic, label, value, set) {
+  const r = h('input', { type: 'range', min: 0, max: 1, step: 0.02, value, 'aria-label': label, style: { color: 'var(--accent)', flex: 1 } });
+  const paint = () => r.style.setProperty('--v', (r.value * 100) + '%');
+  r.oninput = () => { set(Number(r.value)); paint(); };
+  paint();
+  return h('div', { class: 'row' }, icon(ic), h('span', { style: { width: '58px', fontSize: '14px' } }, label), r);
+}
+function openAudio() {
+  haptic('light');
+  const body = h('div');
+  const render = async () => {
+    const [outs, ins] = await Promise.all([canPickOutput() ? listDevices('audiooutput') : [], listDevices('audioinput')]);
+    const pick = (kind, list) => {
+      const curId = currentDevice(kind) || 'default';
+      return h('div', { class: 'list' }, ...list.map((d, i) => {
+        const label = devLabel(d, i, kind);
+        return h('button', { class: 'row', onclick: async () => { haptic('select'); if (await useDevice(kind, d.deviceId)) { toast(`Using ${label}`); render(); } } },
+          icon(isBt(label) ? 'bt' : kind === 'audioinput' ? 'mic' : 'speaker'), h('span', { class: 'lab' }, label),
+          d.deviceId === curId ? icon('check') : null);
+      }));
+    };
+    body.replaceChildren(
+      h('div', { class: 'grp-h' }, 'Speaker'),
+      outs.length > 1 ? pick('audiooutput', outs)
+        : h('p', { class: 'muted note' }, 'Your phone chooses the speaker itself: connect Bluetooth or earphones and the sound moves there. Choosing a Bluetooth microphone below also moves the sound to it.'),
+      h('div', { class: 'grp-h' }, 'Microphone'),
+      ins.length > 1 ? pick('audioinput', ins) : h('p', { class: 'muted note' }, 'Only one microphone found.'),
+      h('div', { class: 'grp-h' }, 'Volume'),
+      h('div', { class: 'list' },
+        volRow('group', 'Voices', getRoomVolume(), setRoomVolume),
+        volRow('music', 'Music', getMusicVolume(), (v) => { unlockAudio(); setMusicVolume(v); })),
+      h('p', { class: 'muted note' }, 'During a call, the phone’s volume buttons change the call volume, which Android never lets go fully silent. Use these sliders to make voices or music quieter.'),
+      h('div', { class: 'list' },
+        switchRow('Noise isolation', 'Removes background noise from your microphone', V.noise, (v) => { setNoise(v); toast(v ? 'Noise isolation on' : 'Noise isolation off'); }),
+        switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
+  };
+  const onDev = () => render();
+  on('voice:devices', onDev);
+  sheet({ title: 'Audio', body, onClose: () => off('voice:devices', onDev) });
+  render();
+}
+
 // ======================= more =======================
 function openMore() {
   const p = me();
   const body = h('div',
     h('div', { class: 'list' },
       p && !p.canSpeak ? actionRow('hand', p.hand ? 'Lower hand' : 'Raise hand', () => { send({ t: 'hand', up: !p.hand }); s.close(); }) : null,
+      actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
       actionRow('music', 'Music player', () => { s.close(); openNP(); }),
       actionRow('search', 'Browse music', () => { s.close(); openSearch('home'); }),
+      actionRow('speaker', 'Speaker, mic & volume', () => { s.close(); openAudio(); }),
       S.room.settings?.soundboard ? actionRow('sound', 'Soundboard', () => { s.close(); openBoard(); }) : null,
       screenSupported() && p?.canSpeak ? actionRow('screen', V.screen ? 'Stop sharing screen' : 'Share screen', () => { s.close(); setScreen(!V.screen); }) : null),
     h('div', { class: 'list' },
-      switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v)),
       S.admin ? switchRow(`Appear as ${S.group}`, 'Others see the group name instead of you', store.get('asGroup:' + S.chat, false), v => {
         store.set('asGroup:' + S.chat, v); toast('Rejoining…'); reconnectWS({ asGroup: v }); s.close();
       }) : null));
@@ -322,20 +392,101 @@ on('ws:sound', (m) => {
   document.body.append(pop); setTimeout(() => pop.remove(), 1500);
 });
 
-// ======================= chat =======================
+// ======================= invite =======================
+async function openInvite() {
+  haptic('light');
+  const search = h('input', { type: 'search', placeholder: 'Search members', 'aria-label': 'Search members' });
+  const list = h('div', null, h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
+  const note = h('p', { class: 'muted note' });
+  const body = h('div', null, h('div', { class: 'searchbar', style: { margin: '4px 0 6px' } }, icon('search'), search), note, list);
+  sheet({ title: 'Invite to voice chat', body, tall: true });
+  let people = [];
+  const sent = new Set();
+  const draw = () => {
+    const q = search.value.trim().toLowerCase().replace(/^@/, '');
+    const shown = people.filter(p => !q || p.name.toLowerCase().includes(q) || p.username.toLowerCase().includes(q));
+    list.replaceChildren(shown.length ? h('div', { class: 'list' }, ...shown.map(p => {
+      const btn = h('button', { class: 'btn sm' + (sent.has(p.uid) ? ' soft' : ''), disabled: sent.has(p.uid) }, sent.has(p.uid) ? 'Invited' : 'Invite');
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          const r = await api('/api/invite', { body: { uid: p.uid } });
+          sent.add(p.uid); haptic('success');
+          toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} was mentioned in the group`);
+          btn.textContent = 'Invited'; btn.classList.add('soft');
+        } catch (e) { btn.disabled = false; toast(e.message); }
+      };
+      return h('div', { class: 'row' }, h('div', { class: 'ia' }, avatarEl(p)),
+        h('span', { class: 'lab' }, p.name, h('small', null, [p.admin ? 'admin' : null, p.username ? '@' + p.username : null].filter(Boolean).join(' · '))), btn);
+    })) : h('div', { class: 'empty-note' }, q ? 'Nobody found.' : 'Nobody to invite right now.'));
+  };
+  search.oninput = draw;
+  try {
+    const r = await api('/api/invite');
+    people = r.people;
+    note.textContent = r.hidden
+      ? 'This group hides its member list, so only admins are shown.'
+      : 'Shows admins and members who have chatted in the group or joined the voice chat before. Telegram doesn’t let bots see the full member list.';
+    draw();
+  } catch (e) { list.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
+}
+
+// ======================= chat (like Telegram's voice chat) =======================
+// Messages pop up over the room for a few seconds, then disappear; the history button shows everything
+// sent since you joined. Floating reactions fly up over the room.
 const REACTS = ['👍', '❤️', '😂', '🔥', '😮', '😢', '👏', '🎉'];
-let chatSheet = null, replyTo = null;
+const FLY = ['👍', '❤️', '🔥', '😂', '😍', '🤩', '👏', '🎉', '😮', '😢', '🙏', '💯', '🥳', '😎', '🤣', '💔'];
+const nameColor = (uid) => `hsl(${(Math.abs(uid) * 47) % 360} 70% 62%)`;
+let historySheet = null, replyTo = null;
+
+function bindChatbar() {
+  const input = $('#cb-input'), sendBtn = $('#b-send'), reactBtn = $('#b-react');
+  const toggle = () => { const has = !!input.value.trim(); sendBtn.hidden = !has; reactBtn.hidden = has; };
+  const go = () => {
+    const text = input.value.trim(); if (!text) return;
+    send({ t: 'chat', text }); input.value = ''; toggle(); haptic('light');
+  };
+  input.addEventListener('input', toggle);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  sendBtn.onclick = () => { go(); input.focus(); };
+  $('#b-history').onclick = openHistory;
+  const bar = $('#react-bar');
+  bar.replaceChildren(...FLY.map(e => h('button', { 'aria-label': 'React ' + e, onclick: () => { haptic('light'); send({ t: 'fly', emoji: e }); } }, e)));
+  const showBar = (open) => { bar.hidden = !open; reactBtn.classList.toggle('on', open); document.body.classList.toggle('reacting', open); };
+  reactBtn.onclick = (e) => { e.stopPropagation(); showBar(bar.hidden); };
+  document.addEventListener('pointerdown', (e) => {
+    if (!bar.hidden && !bar.contains(e.target) && !reactBtn.contains(e.target)) showBar(false);
+  });
+}
+function showPop(m) {
+  if (historySheet) return;
+  const box = $('#chat-pop');
+  const el = h('button', { class: 'cpop', onclick: openHistory },
+    avatarEl({ uid: m.uid, name: m.name, photo: m.photo }, 'ma'),
+    h('span', { class: 'cbub' }, h('b', { style: { color: nameColor(m.uid) } }, m.name), h('span', null, m.text)));
+  box.append(el);
+  while (box.children.length > 3) box.firstChild.remove();
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 400); }, 12000);
+}
+on('ws:fly', (m) => {
+  const layer = $('#fly-layer');
+  if (layer.children.length > 24) return;
+  const el = h('div', { class: 'fly', style: { left: `${8 + Math.random() * 70}%`, '--dx': `${Math.round(Math.random() * 60 - 30)}px` } },
+    h('span', null, m.emoji), h('small', null, m.name));
+  layer.append(el);
+  setTimeout(() => el.remove(), 3200);
+});
+
 function msgEl(m) {
   const mine = m.uid === S.uid;
-  const el = h('div', { class: 'msg' + (mine ? ' mine' : ''), 'data-id': m.id, onclick: () => msgMenu(m) },
+  return h('div', { class: 'msg' + (mine ? ' mine' : ''), 'data-id': m.id, onclick: () => msgMenu(m) },
     mine ? null : avatarEl({ uid: m.uid, name: m.name, photo: m.photo }, 'ma'),
     h('div', { class: 'bub' },
-      mine ? null : h('div', { class: 'who', style: { color: `hsl(${(Math.abs(m.uid) * 47) % 360} 70% 62%)` } }, m.name),
+      mine ? null : h('div', { class: 'who', style: { color: nameColor(m.uid) } }, m.name),
       m.reply ? h('div', { class: 'rq' }, h('b', null, m.reply.name), h('span', null, m.reply.text)) : null,
       h('span', { class: 'txt' }, m.text),
       h('span', { class: 'tm' }, new Date(m.ts * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })),
       reactsEl(m)));
-  return el;
 }
 function reactsEl(m) {
   const e = Object.entries(m.reactions || {});
@@ -354,16 +505,17 @@ function msgMenu(m) {
 }
 function setReply(m) {
   replyTo = m;
-  const bar = chatSheet?.el.querySelector('.reply-bar');
+  const bar = historySheet?.el.querySelector('.reply-bar');
   if (!bar) return;
   bar.hidden = !m;
   if (m) bar.replaceChildren(h('div', { class: 'rb' }, h('b', null, m.name), h('span', null, m.text)), h('button', { class: 'close-x', 'aria-label': 'Cancel reply', onclick: () => setReply(null) }, icon('close')));
-  chatSheet.el.querySelector('textarea').focus();
+  historySheet.el.querySelector('textarea').focus();
 }
-function openChat() {
+function openHistory() {
   S.unread = 0; updateChatBadge();
-  const list = h('div', { class: 'chat-list' }, ...S.chat.map(msgEl));
-  if (!S.chat.length) list.append(h('div', { class: 'empty-note' }, 'Say hi to everyone in the voice chat 👋'));
+  $('#chat-pop').replaceChildren();
+  const list = h('div', { class: 'chat-list' }, ...S.msgs.map(msgEl));
+  if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, 'No messages since you joined. Say hi 👋'));
   const ta = h('textarea', { rows: 1, placeholder: 'Message', maxlength: 1000, 'aria-label': 'Message' });
   const sendIt = () => {
     const text = ta.value.trim(); if (!text) return;
@@ -372,29 +524,32 @@ function openChat() {
   };
   ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(120, ta.scrollHeight) + 'px'; });
   ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); sendIt(); } });
-  chatSheet = sheet({ title: 'Chat', body: list, tall: true, onClose: () => { chatSheet = null; replyTo = null; } });
-  chatSheet.el.append(h('div', { class: 'reply-bar', hidden: true }), h('div', { class: 'composer' }, ta, h('button', { class: 'send', 'aria-label': 'Send', onclick: sendIt }, icon('send'))));
-  setTimeout(() => (chatSheet.body.scrollTop = chatSheet.body.scrollHeight), 50);
+  historySheet = sheet({ title: 'Chat', body: list, tall: true, onClose: () => { historySheet = null; replyTo = null; } });
+  historySheet.el.append(h('div', { class: 'reply-bar', hidden: true }), h('div', { class: 'composer' }, ta, h('button', { class: 'send', 'aria-label': 'Send', onclick: sendIt }, icon('send'))));
+  setTimeout(() => (historySheet && (historySheet.body.scrollTop = historySheet.body.scrollHeight)), 50);
 }
 function updateChatBadge() { const b = $('#chat-badge'); b.hidden = !S.unread; b.textContent = S.unread > 99 ? '99+' : S.unread; }
 on('ws:chat', ({ m }) => {
-  S.chat.push(m); if (S.chat.length > 80) S.chat.shift();
-  if (chatSheet) {
-    const body = chatSheet.body;
+  S.msgs.push(m); if (S.msgs.length > 200) S.msgs.shift();
+  if (historySheet) {
+    const body = historySheet.body;
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
     body.querySelector('.empty-note')?.remove();
     body.querySelector('.chat-list').append(msgEl(m));
     if (atBottom || m.uid === S.uid) body.scrollTo({ top: body.scrollHeight, behavior: 'smooth' });
-  } else if (m.uid !== S.uid) { S.unread++; updateChatBadge(); }
+  } else {
+    showPop(m);
+    if (m.uid !== S.uid) { S.unread++; updateChatBadge(); }
+  }
 });
 on('ws:react', ({ id, reactions }) => {
-  const m = S.chat.find(x => x.id === id); if (!m) return; m.reactions = reactions;
-  const el = chatSheet?.body.querySelector(`.msg[data-id="${id}"]`);
+  const m = S.msgs.find(x => x.id === id); if (!m) return; m.reactions = reactions;
+  const el = historySheet?.body.querySelector(`.msg[data-id="${id}"]`);
   if (el) el.replaceWith(msgEl(m));
 });
 on('ws:chat.del', ({ id }) => {
-  S.chat = S.chat.filter(x => x.id !== id);
-  chatSheet?.body.querySelector(`.msg[data-id="${id}"]`)?.remove();
+  S.msgs = S.msgs.filter(x => x.id !== id);
+  historySheet?.body.querySelector(`.msg[data-id="${id}"]`)?.remove();
 });
 
 // ======================= admin =======================
@@ -405,9 +560,15 @@ function openAdmin(tab = 'room') {
   const tabs = h('div', { class: 'seg', style: { marginBottom: '6px' } });
   const content = h('div');
   const body = h('div', null, tabs, content);
-  const s = sheet({ title: 'Manage', body, tall: true });
+  let cleanup = null;
+  const s = sheet({ title: 'Manage', body, tall: true, onClose: () => cleanup?.() });
   const TABS = [['room', 'Room'], ['logs', 'Logs'], ['safety', 'Safety']];
-  const go = (k) => { tab = k; tabs.replaceChildren(...TABS.map(([id, l]) => h('button', { class: id === k ? 'on' : '', onclick: () => go(id) }, l))); ({ room: adminRoom, logs: adminLogs, safety: adminSafety })[k](content, s); };
+  const go = (k) => {
+    tab = k; cleanup?.(); cleanup = null;
+    tabs.replaceChildren(...TABS.map(([id, l]) => h('button', { class: id === k ? 'on' : '', onclick: () => go(id) }, l)));
+    const r = ({ room: adminRoom, logs: adminLogs, safety: adminSafety })[k](content, s);
+    cleanup = typeof r === 'function' ? r : null;
+  };
   go(tab);
 }
 function adminRoom(c) {
@@ -415,6 +576,7 @@ function adminRoom(c) {
   const set = (k, v) => send({ t: 'admin.settings', settings: { [k]: v } });
   const title = h('input', { class: 'field', value: st.title || '', maxlength: 80, placeholder: 'Title' });
   const desc = h('textarea', { class: 'field', maxlength: 300, placeholder: 'Description (optional)' }, st.description || '');
+  const recBox = h('div');
   c.replaceChildren(
     h('div', { class: 'grp-h' }, 'Title and description'),
     h('div', { style: { display: 'grid', gap: '8px', margin: '8px 0 16px' } }, title, desc,
@@ -434,12 +596,39 @@ function adminRoom(c) {
       actionRow('link', 'Copy invite link', () => { pendingLink = (url) => copyText(url); send({ t: 'admin.link' }); }, '', 'Only members of this group can use it'),
       actionRow('lock', 'Reset link', async () => { if (await confirmBox('The old link will stop working. Members need the new one (/vc in the group).', 'Reset link', true)) { pendingLink = (url) => { copyText(url); toast('New link copied'); }; send({ t: 'admin.resetlink' }); } }, 'red')),
     h('div', { class: 'grp-h' }, 'Recording'),
-    h('div', { class: 'list' },
-      S.room.rec?.on
-        ? actionRow('rec', S.room.rec.by === S.uid ? 'Stop recording and send' : 'Recording in progress', () => { if (S.room.rec.by === S.uid) recorder.stop(); }, 'red', 'The file is sent to you by the bot')
-        : actionRow('rec', 'Start recording', () => recorder.start(), '', 'Records voices and music from your device')),
+    recBox,
     h('div', { class: 'grp-h' }, 'Schedule'),
     scheduleBox());
+  // the recording section follows the room state (start / rename / stop) without redrawing the whole tab
+  const drawRec = () => {
+    const rec = S.room.rec || {};
+    const mine = rec.on && rec.by === S.uid;
+    const name = h('input', { class: 'field', maxlength: 60, placeholder: 'Recording name (optional)', value: rec.name || '' });
+    name.addEventListener('change', () => send({ t: 'rec.name', name: name.value }));
+    recBox.replaceChildren(
+      mine ? h('div', { style: { margin: '8px 0 0' } }, name) : null,
+      h('div', { class: 'list' },
+        rec.on
+          ? actionRow('rec', mine ? 'Stop recording and send' : 'Another admin is recording', () => { if (mine) { send({ t: 'rec.name', name: name.value }); recorder.stop(name.value); } }, 'red', mine ? 'The bot sends the file to your private chat' : null)
+          : actionRow('rec', 'Start recording', startRecording, '', 'Records voices and music. The bot sends the file only to you, in private')));
+  };
+  drawRec();
+  on('room:changed', drawRec);
+  return () => off('room:changed', drawRec);
+}
+async function startRecording() {
+  // recordings go to your private chat with the bot, so check the bot can message you before recording
+  let ok = false;
+  try { ok = (await api('/api/dmcheck')).ok; } catch {}
+  if (!ok) {
+    const bot = S.bot;
+    const body = h('div', null,
+      h('p', { style: { margin: '0 0 16px', color: 'var(--fg2)' } }, 'The bot sends recordings to your private chat. Open the bot and press Start once, then come back and start recording.'),
+      bot ? h('button', { class: 'btn block', onclick: () => { try { tg?.openTelegramLink ? tg.openTelegramLink(`https://t.me/${bot}?start=rec`) : window.open(`https://t.me/${bot}?start=rec`); } catch {} s.close(); } }, `Open @${bot}`) : null);
+    const s = sheet({ title: 'Start the bot first', body });
+    return;
+  }
+  recorder.start();
 }
 let pendingLink = null;
 on('ws:link', (m) => { pendingLink?.(m.url); pendingLink = null; });

@@ -49,6 +49,8 @@ CREATE INDEX IF NOT EXISTS ix_rep_chat ON reports(chat_id, resolved);
 CREATE TABLE IF NOT EXISTS schedules(
   id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, title TEXT, at REAL, by_uid INTEGER, sent INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS ix_sched ON schedules(sent, at);
+CREATE TABLE IF NOT EXISTS members(
+  chat_id INTEGER, uid INTEGER, name TEXT, username TEXT, seen REAL, PRIMARY KEY(chat_id, uid));
 """
 _conn.executescript(SCHEMA)
 for _sql in ("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''",

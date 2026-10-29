@@ -686,7 +686,7 @@ app = Starlette(routes=routes, lifespan=lifespan)
 def run():
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=config.PORT, proxy_headers=True, forwarded_allow_ips="*",
-                ws_ping_interval=10, ws_ping_timeout=10)
+                ws_ping_interval=20, ws_ping_timeout=30)  # phones in the background answer late
 
 
 if __name__ == "__main__":

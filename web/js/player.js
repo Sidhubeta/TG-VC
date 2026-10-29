@@ -1,5 +1,5 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
-import { $, S, actionRow, api, avatarEl, confirmBox, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
+import { $, S, actionRow, api, avatarEl, can, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
 
 // ======================= engine =======================
@@ -20,13 +20,16 @@ const video = h('video', { class: 'vid', playsinline: true, muted: true, preload
 video.muted = true;
 const isApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document || /iPhone|iPad|iPod/.test(navigator.userAgent);
 const CODEC = !isApple && audio.canPlayType('audio/webm; codecs="opus"') ? 'opus' : 'aac';
+const HEIGHTS = [144, 240, 360, 480, 720, 1080];
 
 const P = {
-  mode: store.get('mode', 'audio'),          // audio | video
   aq: store.get('aq', 'medium'),             // low | medium | high
-  vq: store.get('vq', 'auto'),               // auto | 144..1080
+  // video quality: 480p unless the person picks another one (it never changes by itself)
+  vq: HEIGHTS.includes(Number(store.get('vq', 480))) ? Number(store.get('vq', 480)) : 480,
   vol: store.get('vol', 1),
-  localPaused: false, loadedQid: null, blocked: false, heights: [], autoH: 480, maxH: 480, stalls: [], stableSince: 0,
+  localPaused: false, loadedQid: null, blocked: false, heights: [],
+  optOut: null,   // qid of a video song this person switched back to audio
+  localVid: null, // qid this person watches as video (without the right to turn it on for everyone)
 };
 audio.volume = P.vol;
 // Effects are shared: the server holds them and everyone hears the same thing, in sync.
@@ -37,27 +40,26 @@ let G = null; // WebAudio graph
 
 const cur = () => S.music?.current || null;
 const playing = () => S.music?.status === 'playing';
+// video is on when someone turned it on for this song (and you didn't switch back), or you turned it on for you
+export const isVideo = () => { const c = cur(); return !!c && ((c.video && P.optOut !== c.qid) || P.localVid === c.qid); };
 export function expectedPos() {
   const m = S.music; if (!m?.current) return 0;
   const p = m.status === 'playing' ? m.pos + (serverNow() - m.upd) * (m.rate || 1) : m.pos;
   const d = m.current.duration || Infinity;
   return Math.max(0, Math.min(p, d));
 }
+// The server starts the next song ~0.8 s after one ends. If that news hasn't arrived (phones pause the app's
+// connection in the background), play the next song from the queue ourselves instead of sitting on the old one.
+function predicted() {
+  const m = S.music, c = m?.current;
+  if (!c || m.status !== 'playing' || !c.duration) return null;
+  const over = (m.pos + (serverNow() - m.upd) * (m.rate || 1) - c.duration) / (m.rate || 1);
+  if (over < 1.5) return null;
+  const next = m.loop === 'one' ? c : (m.queue[0] || (m.loop === 'all' ? c : null));
+  return next ? { track: next, pos: over - 0.8 } : { ended: true };
+}
 
 function audioSrc(t) { return media(`/api/stream/${t.id}/audio?c=${CODEC}&q=${P.aq}`); }
-function videoHeight() {
-  if (P.vq !== 'auto') return Number(P.vq);
-  return P.autoH;
-}
-const STEPS = [144, 240, 360, 480, 720, 1080];
-function pickAutoH() {
-  const c = navigator.connection;
-  const dl = c?.downlink || 5;
-  P.maxH = c?.saveData ? 240 : dl >= 8 ? 720 : dl >= 3 ? 480 : dl >= 1.2 ? 360 : 240;
-  P.autoH = Math.min(P.maxH, 480); // start modest so the video appears fast, then step up if it plays smoothly
-  P.stalls = []; P.stableSince = Date.now();
-}
-pickAutoH();
 
 function load(t) {
   P.loadedQid = t ? t.qid : null;
@@ -65,19 +67,17 @@ function load(t) {
   if (!t) { audio.removeAttribute('src'); audio.load(); unloadVideo(); return; }
   audio.src = audioSrc(t);
   audio.load();
-  if (P.mode === 'video') loadVideo(t);
+  if (isVideo()) loadVideo(t);
   else unloadVideo();
 }
-let lastVideoLoad = 0;
 function loadVideo(t) {
   t = t || cur(); if (!t) return;
-  const src = media(`/api/stream/${t.id}/video?q=${videoHeight()}`);
+  const src = media(`/api/stream/${t.id}/video?q=${P.vq}`);
   if (video.dataset.src === src) return;
   video.dataset.src = src;
   video.poster = media(t.thumb); // show the artwork while the video loads instead of a black box
   video.src = src;
   video.load();
-  lastVideoLoad = Date.now();
   setVideoLoading(true);
 }
 function setVideoLoading(on) { video.parentNode?.classList.toggle('loading', on); }
@@ -96,29 +96,6 @@ function onAudioError() {
   if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
   setTimeout(() => { const c = cur(); if (c && c.qid === t.qid && audio.error) { audio.src = audioSrc(c); audio.load(); } }, 2000 * errCount);
 }
-// Auto quality. Only real stalls count: "waiting" also fires after every load and every sync seek, and
-// counting those made Auto drop a step every few seconds until it got stuck at 144p.
-video.addEventListener('waiting', () => {
-  if (P.vq !== 'auto' || audio.paused) return;
-  const now = Date.now();
-  if (now - lastVideoLoad < 8000 || now - lastVideoSeek < 4000) return;
-  P.stalls = P.stalls.filter(x => now - x < 30000); P.stalls.push(now);
-  P.stableSince = now;
-  const i = STEPS.indexOf(P.autoH);
-  if (P.stalls.length >= 3 && i > 1) { // never drop below 240p on its own
-    setAutoH(STEPS[i - 1], `Video lowered to ${STEPS[i - 1]}p for smoother playback`);
-  }
-});
-function setAutoH(hgt, msg) {
-  P.autoH = hgt; P.stalls = []; P.stableSince = Date.now();
-  if (msg) toast(msg);
-  const t = cur(); if (t && video.dataset.src) { delete video.dataset.src; loadVideo(t); }
-}
-function maybeStepUp() {
-  // after 90s without a stall, try one step better (up to what the connection allows)
-  if (P.vq !== 'auto' || !video.dataset.src || video.paused || P.autoH >= P.maxH) return;
-  if (Date.now() - P.stableSince > 90000) setAutoH(STEPS[STEPS.indexOf(P.autoH) + 1]);
-}
 video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused) video.play().catch(() => {}); });
 
 let lastVideoSeek = 0;
@@ -128,31 +105,30 @@ function seekVideo() {
 }
 
 function sync(force = false) {
-  const t = cur();
+  const pr = predicted();
+  if (pr?.ended) { if (!audio.paused) audio.pause(); return; } // song over, nothing queued: wait, don't replay it
+  const t = pr ? pr.track : cur();
   if (!t) { if (!audio.paused) audio.pause(); return; }
   if (t.qid !== P.loadedQid) load(t);
   const want = playing() && !P.localPaused;
-  const r = rate();
+  const exp = pr ? pr.pos : expectedPos();
+  const r = pr ? 1 : rate();
   if (audio.playbackRate !== r) audio.playbackRate = r;
   if (audio.readyState >= 1 && !P.localPaused) {
-    const drift = audio.currentTime - expectedPos();
-    // Jump only when clearly out of sync. Tiny corrections (and speeding up / slowing down to catch up,
-    // which the old code did every 0.7s) are what made songs glitch and wobble.
-    // in the background timers run late, so only correct big jumps there (small seeks were audible crackles)
+    const drift = audio.currentTime - exp;
+    // Jump only when clearly out of sync: small seeks are audible. In the background timers run late, so only
+    // big jumps are corrected there.
     const limit = document.hidden ? 4 : 1.2;
     if ((force && Math.abs(drift) > 0.35 && !document.hidden) || Math.abs(drift) > limit || (!want && Math.abs(drift) > 0.5)) {
-      try { audio.currentTime = expectedPos(); } catch {}
+      try { audio.currentTime = exp; } catch {}
     }
   }
-  if (want && audio.paused) audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
-  else if (!want && !audio.paused) audio.pause();
-  // The music runs through our effects (Web Audio). Phones suspend that after a call interruption, locking
-  // the screen or switching apps, and the song kept "playing" silently until it was paused and resumed.
-  if (want && G && G.c.state !== 'running') {
-    G.c.resume().then(() => setBlocked(false), () => {});
-    if (G.c.state !== 'running') setBlocked(true);
-  }
-  maybeStepUp();
+  // A finished <audio> restarts from 0 when played again. That was the "first 1-2 seconds on repeat" in the
+  // background: never replay a song whose time is up.
+  const over = !pr && t.duration && exp >= t.duration - 0.3;
+  if (want && audio.paused && !over) audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
+  else if ((!want || over) && !audio.paused) audio.pause();
+  if (want && G && G.c.state !== 'running') G.c.resume().then(() => setBlocked(false), () => setBlocked(true));
   // the video follows the audio, but never chases it while it's still loading (that made it loop one second)
   if (document.hidden) { if (!video.paused) video.pause(); } // nobody sees it: save the phone's power for the sound
   else if (video.dataset.src && video.readyState >= 1) {
@@ -165,7 +141,7 @@ function sync(force = false) {
 }
 setInterval(sync, 700);
 // coming back to the app: jump to where the room is now (not where it was when you left)
-const back = () => { G?.c.resume().catch(() => {}); sync(true); };
+const back = () => { G?.c.resume().catch(() => {}); sync(true); emit('app:back'); };
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) return back();
   if (!G) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
@@ -173,13 +149,11 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('focus', back);
 try { tg?.onEvent?.('activated', back); } catch {}
 
-let hintAt = 0;
+// If the browser blocks sound until the first tap, the next tap anywhere starts it (no prompt, as asked).
 function setBlocked(b) {
   if (P.blocked === b) return;
   P.blocked = b;
   emit('music:blocked', b);
-  // no "Tap to listen" button any more; a short hint once in a while is enough (any tap fixes it)
-  if (b && cur() && Date.now() - hintAt > 30000) { hintAt = Date.now(); toast('🔈 Tap anywhere to hear the music'); }
 }
 export const musicBlocked = () => P.blocked;
 export function unlockAudio() {
@@ -356,7 +330,7 @@ export function renderCard() {
   }
   el.onclick = () => openNP();
   const isPlay = playing() && !P.localPaused;
-  const showVid = P.mode === 'video' && !NP.open && !FV;
+  const showVid = isVideo() && !NP.open && !FV;
   el.classList.toggle('has-video', showVid);
   el.append(
     showVid ? videoBox('card-vid') : null,
@@ -365,31 +339,47 @@ export function renderCard() {
       h('div', { class: 'ttl' }, h('span', { class: 'eq' }, h('i'), h('i'), h('i')), t.title),
       h('div', { class: 'art-sub' }, t.artist + (t.by ? ` · added by ${t.by}` : ''))),
     h('div', { class: 'ctl' },
+      showVid ? null : h('button', { class: 'vsw', 'aria-label': 'Watch the video', onclick: (e) => { e.stopPropagation(); setVideo(true); } }, icon('video')),
       h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
       h('button', { 'aria-label': 'Next', onclick: (e) => { e.stopPropagation(); next(); } }, icon('next', 'fill'))),
     h('div', { class: 'bar', id: 'np-bar' }));
 }
-function canAdd() { return S.admin || !S.room.settings?.music_admin_only; }
+function canAdd() { return can('add'); }
 
 // ---- music video: one <video> element that lives in the player, in the room card, or full screen ----
 let FV = null;
 const vbtn = (ic, label, fn, cls = '') => h('button', { class: 'round vbtn ' + cls, 'aria-label': label, onclick: (e) => { e.stopPropagation(); fn(); } }, icon(ic));
 function videoBox(cls) {
   const inPlayer = cls === 'np-vid';
-  const btns = inPlayer && NP.fill
-    // big view inside the player: turn to landscape full screen, or go back to the artwork-sized video
-    ? [vbtn('rotate', 'Rotate to full screen', () => openVideoFull(true)), vbtn('shrink', 'Back to normal size', () => setFill(false), 'b2')]
-    : [vbtn('expand', 'Full screen', () => (inPlayer ? setFill(true) : openVideoFull(false)))];
   const box = h('div', { class: cls + (video.readyState < 3 ? ' loading' : ''), onclick: (e) => e.stopPropagation() }, video, h('span', { class: 'vspin' }),
-    h('div', { class: 'vbtns' }, ...btns, pipSupported(video) ? vbtn('pip', 'Picture in picture', () => pip(video)) : null));
-  if (P.mode === 'video') loadVideo();
+    h('div', { class: 'vbtns' },
+      inPlayer ? null : vbtn('headphones', 'Switch to audio only', () => setVideo(false)),
+      pipSupported(video) ? vbtn('pip', 'Picture in picture', () => pip(video)) : null,
+      vbtn('expand', 'Full screen', () => openVideoFull(inPlayer ? true : null))));
+  if (isVideo()) loadVideo();
   return box;
 }
-function setFill(on) {
-  NP.fill = on;
-  haptic('light');
-  NP.el?.classList.toggle('vfill', on);
-  renderStage();
+// Video on: for everyone (if allowed), otherwise just for you. Video off: just for you, for this song.
+export function setVideo(on) {
+  const c = cur(); if (!c) return;
+  haptic('select');
+  if (on) {
+    P.optOut = null;
+    P.localVid = c.qid;
+    if (!c.video && can('video')) { send({ t: 'music.video', on: true }); toast('Video on for everyone'); }
+    else if (!c.video) toast('Video on for you');
+  } else {
+    P.optOut = c.qid; P.localVid = null;
+    FV?.close();
+    toast('Audio only — uses less data');
+  }
+  applyVideo();
+}
+let lastVid = false;
+function applyVideo() {
+  const v = isVideo();
+  if (v) loadVideo(); else unloadVideo();
+  if (v !== lastVid || !v) { lastVid = v; renderCard(); if (NP.open) renderStage(); refresh(); }
 }
 function openVideoFull(rotate) {
   if (FV) return;
@@ -402,11 +392,11 @@ function togglePlay() {
   haptic('light');
   unlockAudio();
   const m = S.music; if (!m) return;
-  if (S.admin) {
+  if (can('playback')) {
     if (P.localPaused) { P.localPaused = false; sync(true); refresh(); return; }
     send({ t: m.status === 'playing' ? 'music.pause' : 'music.play' });
   } else {
-    // non-admins pause only for themselves; resuming jumps back to live
+    // without playback rights you pause only for yourself; resuming jumps back to live
     P.localPaused = !P.localPaused;
     sync(true); refresh();
     if (P.localPaused) toast('Paused for you only');
@@ -415,13 +405,14 @@ function togglePlay() {
 function next() {
   haptic('medium');
   const t = cur(); if (!t) return;
-  if (S.admin || t.byUid === S.uid) send({ t: 'music.skip' });
-  else { send({ t: 'music.voteskip' }); toast('Voted to skip'); }
+  if ((t.byUid === S.uid && can('skip_own')) || can('playback')) send({ t: 'music.skip' });
+  else if (can('vote')) { send({ t: 'music.voteskip' }); toast('Voted to skip'); }
+  else deny('vote');
 }
-function prev() { haptic('light'); if (S.admin) send({ t: 'music.prev' }); }
+function prev() { haptic('light'); if (can('playback')) send({ t: 'music.prev' }); else deny('playback'); }
 
 // ======================= full player =======================
-const NP = { open: false, el: null, view: 'art', lyrics: null, lyrQid: null, scrubbing: false, fill: false };
+const NP = { open: false, el: null, view: 'art', lyrics: null, lyrQid: null, scrubbing: false };
 function buildNP() {
   if (NP.el) return NP.el;
   const el = h('div', { class: 'np', role: 'dialog', 'aria-label': 'Now playing' },
@@ -468,7 +459,7 @@ export function openNP() {
   NP.open = true;
   requestAnimationFrame(() => el.classList.add('show'));
   popBack = pushBack(closeNP);
-  if (P.mode === 'video') loadVideo();
+  if (isVideo()) loadVideo();
   setView(NP.view);
   refresh();
 }
@@ -494,8 +485,9 @@ function renderStage() {
   if (!t) return;
   if (NP.view === 'lyrics') return renderLyrics(st, t);
   if (NP.view === 'queue') return renderQueue(st);
-  NP.el.classList.toggle('vfill', NP.fill && P.mode === 'video' && NP.view === 'art');
-  if (P.mode === 'video' && !FV) st.append(videoBox('np-vid'));
+  // video in the player always spreads edge to edge and blends into the colours behind it
+  NP.el.classList.toggle('vfill', isVideo() && NP.view === 'art');
+  if (isVideo() && !FV) st.append(videoBox('np-vid'));
   else st.append(h('div', { class: 'big-art', style: { backgroundImage: `url("${media(t.thumb)}")` } }));
 }
 
@@ -503,7 +495,7 @@ function renderStage() {
 function setupScrub(sc) {
   let drag = false, ratio = 0;
   const at = (e) => { const r = sc.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
-  sc.addEventListener('pointerdown', (e) => { if (!S.admin || !cur()?.duration) return; drag = true; NP.scrubbing = true; sc.classList.add('drag'); sc.setPointerCapture(e.pointerId); ratio = at(e); paintScrub(ratio); });
+  sc.addEventListener('pointerdown', (e) => { if (!cur()?.duration) return; if (!can('playback')) return deny('playback'); drag = true; NP.scrubbing = true; sc.classList.add('drag'); sc.setPointerCapture(e.pointerId); ratio = at(e); paintScrub(ratio); });
   sc.addEventListener('pointermove', (e) => { if (!drag) return; ratio = at(e); paintScrub(ratio); });
   const end = () => {
     if (!drag) return; drag = false; NP.scrubbing = false; sc.classList.remove('drag');
@@ -541,13 +533,13 @@ export function refresh() {
   el.querySelector('#np-by').textContent = t.by ? `Added by ${t.by}` : '';
   const pp = el.querySelector('#np-pp'); pp.replaceChildren(icon(isPlay ? 'pause' : 'play', 'fill'));
   pp.setAttribute('aria-label', isPlay ? 'Pause' : 'Play');
-  el.querySelector('#np-prev').disabled = !S.admin;
+  el.querySelector('#np-prev').classList.toggle('locked', !can('playback'));
   const v = S.music;
-  el.querySelector('#np-votes').textContent = !S.admin && t.byUid !== S.uid && v.votes ? `${v.votes}/${v.need}` : '';
-  el.querySelector('#np-scrub').classList.toggle('ro', !S.admin);
+  el.querySelector('#np-votes').textContent = !can('playback') && t.byUid !== S.uid && v.votes ? `${v.votes}/${v.need}` : '';
+  el.querySelector('#np-scrub').classList.toggle('ro', !can('playback'));
   el.querySelector('#np-like').classList.toggle('on', S.liked.has(t.id));
   el.querySelector('#np-like').replaceChildren(icon('heart', S.liked.has(t.id) ? 'fill' : ''));
-  el.querySelector('#tab-vid').classList.toggle('on', P.mode === 'video');
+  el.querySelector('#tab-vid').classList.toggle('on', isVideo());
   el.querySelector('#tab-fx').classList.toggle('on', fx().preset !== 'normal');
   if (NP.view === 'queue') renderStage();
 }
@@ -570,6 +562,7 @@ function onMusic(m) {
   const timeline = [t?.qid, m.status, m.pos, m.upd, m.rate].join('|');
   sync(timeline !== lastTimeline);
   lastTimeline = timeline;
+  if (isVideo() !== lastVid) applyVideo(); // someone turned the video on for everyone (or a new song started)
   const fxKey = JSON.stringify(m.fx || FX_NONE);
   if (fxKey !== lastFx) {
     lastFx = fxKey;
@@ -600,7 +593,7 @@ async function renderLyrics(st, t) {
       const m = l.match(/^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/);
       return m ? { t: Number(m[1]) * 60 + Number(m[2]), text: m[3] || '♪' } : null;
     }).filter(Boolean);
-    NP.lines.forEach((ln, i) => box.append(h('p', { 'data-i': i, onclick: () => { if (S.admin) send({ t: 'music.seek', pos: ln.t }); } }, ln.text)));
+    NP.lines.forEach((ln, i) => box.append(h('p', { 'data-i': i, onclick: () => { if (can('playback')) send({ t: 'music.seek', pos: ln.t }); } }, ln.text)));
     NP.lyrIdx = -1;
   } else if (L.plain) {
     NP.lines = null;
@@ -630,13 +623,13 @@ function renderQueue(st) {
   const loopIcon = m.loop === 'one' ? 'repeat1' : 'repeat';
   box.append(
     h('div', { class: 'qbtns' },
-      h('button', { onclick: () => S.admin ? send({ t: 'music.shuffle' }) : toast('Admins only'), 'aria-label': 'Shuffle' }, icon('shuffle'), 'Shuffle'),
-      h('button', { class: m.loop !== 'off' ? 'on' : '', onclick: () => S.admin ? send({ t: 'music.loop', mode: { off: 'all', all: 'one', one: 'off' }[m.loop] }) : toast('Admins only') }, icon(loopIcon), m.loop === 'one' ? 'Repeat 1' : 'Repeat'),
-      h('button', { class: m.autoplay ? 'on' : '', onclick: () => S.admin ? send({ t: 'music.autoplay', on: !m.autoplay }) : toast('Admins only') }, icon('infinity'), 'Autoplay')),
+      h('button', { class: can('queue') ? '' : 'locked', onclick: () => can('queue') ? send({ t: 'music.shuffle' }) : deny('queue'), 'aria-label': 'Shuffle' }, icon('shuffle'), 'Shuffle'),
+      h('button', { class: (m.loop !== 'off' ? 'on' : '') + (can('modes') ? '' : ' locked'), onclick: () => can('modes') ? send({ t: 'music.loop', mode: { off: 'all', all: 'one', one: 'off' }[m.loop] }) : deny('modes') }, icon(loopIcon), m.loop === 'one' ? 'Repeat 1' : 'Repeat'),
+      h('button', { class: (m.autoplay ? 'on' : '') + (can('modes') ? '' : ' locked'), onclick: () => can('modes') ? send({ t: 'music.autoplay', on: !m.autoplay }) : deny('modes') }, icon('infinity'), 'Autoplay')),
     h('div', { class: 'qh' }, h('span', null, 'Playing next'),
       h('span', { style: { display: 'flex', gap: '6px' } },
         m.queue.length ? h('button', { class: 'round', 'aria-label': 'Save queue as playlist', onclick: saveQueue }, icon('list-plus')) : null,
-        S.admin && m.queue.length ? h('button', { class: 'round', 'aria-label': 'Clear queue', onclick: async () => { if (await confirmBox('Clear the whole queue?', 'Clear', true)) send({ t: 'music.clear' }); } }, icon('trash')) : null,
+        m.queue.length ? h('button', { class: 'round' + (can('queue') ? '' : ' locked'), 'aria-label': 'Clear queue', onclick: async () => { if (!can('queue')) return deny('queue'); if (await confirmBox('Clear the whole queue?', 'Clear', true)) send({ t: 'music.clear' }); } }, icon('trash')) : null,
         canAdd() ? h('button', { class: 'round', 'aria-label': 'Add songs', onclick: () => openSearch('search') }, icon('plus')) : null)));
   if (!m.queue.length) box.append(h('p', { style: { color: 'rgba(255,255,255,.6)', margin: '14px 0' } }, m.autoplay ? 'Autoplay is on — similar songs will play when the queue ends.' : 'Queue is empty. When this song ends, the music stops.'));
   m.queue.forEach((t, i) => box.append(trackRow(t, {
@@ -649,10 +642,10 @@ function renderQueue(st) {
 function queueMenu(t, i) {
   const mine = t.byUid === S.uid;
   const body = h('div', { class: 'list' },
-    S.admin ? actionRow('play', 'Play now', () => { send({ t: 'music.playnow', qid: t.qid }); s.close(); }) : null,
-    S.admin && i > 0 ? actionRow('up', 'Move to top', () => { send({ t: 'music.move', qid: t.qid, to: 0 }); s.close(); }) : null,
+    actionRow('play', 'Play now', () => { if (!can('queue')) return deny('queue'); send({ t: 'music.playnow', qid: t.qid }); s.close(); }, can('queue') ? '' : 'locked'),
+    i > 0 ? actionRow('up', 'Move to top', () => { if (!can('queue')) return deny('queue'); send({ t: 'music.move', qid: t.qid, to: 0 }); s.close(); }, can('queue') ? '' : 'locked') : null,
     actionRow('list-plus', 'Add to a playlist', () => { s.close(); addToPlaylist([t]); }),
-    S.admin || mine ? actionRow('trash', 'Remove from queue', () => { send({ t: 'music.remove', qid: t.qid }); s.close(); }, 'red') : null);
+    actionRow('trash', 'Remove from queue', () => { if (!(mine || can('queue'))) return deny('queue'); send({ t: 'music.remove', qid: t.qid }); s.close(); }, mine || can('queue') ? 'red' : 'red locked'));
   const s = sheet({ title: t.title, body });
 }
 
@@ -679,19 +672,12 @@ function trackMenu() {
     actionRow('list-plus', 'Add to a playlist', () => { s.close(); addToPlaylist([t]); }),
     actionRow('heart', S.liked.has(t.id) ? 'Remove from Liked Songs' : 'Add to Liked Songs', () => { s.close(); like(); }),
     actionRow('copy', 'Copy YouTube link', () => { s.close(); import('./core.js').then(c => c.copyText(`https://youtu.be/${t.id}`)); }),
-    S.admin ? actionRow('close', 'Stop music', async () => { s.close(); if (await confirmBox('Stop the music and clear the queue?', 'Stop', true)) send({ t: 'music.stop' }); }, 'red') : null);
+    actionRow('close', 'Stop music', async () => { if (!can('stop')) return deny('stop'); s.close(); if (await confirmBox('Stop the music and clear the queue?', 'Stop', true)) send({ t: 'music.stop' }); }, can('stop') ? 'red' : 'red locked'));
   const s = sheet({ title: t.title, body });
 }
 
 // ======================= audio / video + quality =======================
-function toggleMode() {
-  haptic('select');
-  P.mode = P.mode === 'video' ? 'audio' : 'video';
-  store.set('mode', P.mode);
-  if (P.mode === 'video') loadVideo(); else { FV?.close(); unloadVideo(); }
-  toast(P.mode === 'video' ? 'Video on' : 'Audio only — uses less data');
-  renderStage(); refresh();
-}
+function toggleMode() { setVideo(!isVideo()); }
 async function openQuality() {
   const t = cur();
   const body = h('div');
@@ -700,26 +686,26 @@ async function openQuality() {
     body.replaceChildren(
       h('div', { class: 'grp-h' }, 'Mode'),
       h('div', { class: 'seg', style: { margin: '8px 0 16px' } },
-        ...[['audio', 'Audio only'], ['video', 'Video']].map(([k, l]) => h('button', { class: P.mode === k ? 'on' : '', onclick: () => { if (P.mode !== k) toggleMode(); render(); } }, l))),
+        ...[['audio', 'Audio only'], ['video', 'Video']].map(([k, l]) => h('button', { class: (isVideo() ? 'video' : 'audio') === k ? 'on' : '', onclick: () => { if ((k === 'video') !== isVideo()) toggleMode(); render(); } }, l))),
       h('div', { class: 'grp-h' }, 'Audio quality'),
       h('div', { class: 'seg', style: { margin: '8px 0 16px' } },
         ...[['low', 'Data saver'], ['medium', 'Standard'], ['high', 'High']].map(([k, l]) => h('button', { class: P.aq === k ? 'on' : '', onclick: () => setAq(k) }, l))),
       h('div', { class: 'grp-h' }, 'Video quality'),
       h('div', { class: 'list' },
-        ...['auto', ...(P.heights.length ? P.heights : [144, 240, 360, 480, 720, 1080])].map(q =>
+        ...(P.heights.length ? P.heights : HEIGHTS).map(q =>
           h('button', { class: 'row', onclick: () => setVq(q) },
-            h('span', { class: 'lab' }, q === 'auto' ? 'Auto' : `${q}p`, q === 'auto' ? h('small', null, `Adjusts to your connection (now ${P.autoH}p)`) : null),
+            h('span', { class: 'lab' }, `${q}p`, q === 480 ? h('small', null, 'Default') : null),
             String(P.vq) === String(q) ? icon('check') : null))));
   };
   const setAq = (k) => { P.aq = k; store.set('aq', k); const c = cur(); if (c) { audio.src = audioSrc(c); audio.load(); } render(); };
-  const setVq = (q) => { P.vq = q; store.set('vq', q); if (q === 'auto') pickAutoH(); delete video.dataset.src; if (P.mode === 'video') loadVideo(); render(); };
+  const setVq = (q) => { P.vq = Number(q); store.set('vq', P.vq); delete video.dataset.src; if (isVideo()) loadVideo(); render(); };
   render();
   if (t) { try { P.heights = (await api(`/api/formats/${t.id}`)).heights; render(); } catch {} }
 }
 
 // ======================= effects sheet =======================
 // Everyone hears the same effect. Only admins, or whoever added the playing song, can change it.
-const canFx = () => S.admin || (cur() && cur().byUid === S.uid);
+const canFx = () => can('fx') || (!!cur() && cur().byUid === S.uid && can('fx_own'));
 function openFx() {
   unlockAudio();
   const body = h('div');
@@ -728,22 +714,23 @@ function openFx() {
   const push = () => { buildGraph(); applyFx(draft); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
   const slider = (key, label, min, max, step, fmt, allowed) => {
     const out = h('output', null, fmt(draft[key]));
-    const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label, disabled: !allowed });
+    const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label });
     const paint = () => r.style.setProperty('--v', ((r.value - min) / (max - min) * 100) + '%');
     r.oninput = () => {
       draft[key] = Number(r.value); draft.preset = 'custom'; out.textContent = fmt(draft[key]); paint(); push();
       body.querySelectorAll('.fx').forEach(b => b.classList.remove('on'));
     };
     paint();
-    return h('div', { class: 'slider-row' + (allowed ? '' : ' ro') }, h('label', null, label), r, out);
+    // not allowed: the slider can't move, and tapping it says why (in red)
+    return h('div', { class: 'slider-row' + (allowed ? '' : ' ro'), onclick: () => { if (!allowed) deny('fx'); } }, h('label', null, label), r, out);
   };
   const render = () => {
     draft = { ...fx() };
     const allowed = canFx();
     body.replaceChildren(
-      allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'Only admins or the person who added this song can change the sound.'),
+      allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'You can’t change the sound of this song.'),
       h('div', { class: 'fx-grid' }, ...Object.entries(PRESETS).map(([k, p]) =>
-        h('button', { class: 'fx' + (draft.preset === k ? ' on' : ''), disabled: !allowed, onclick: (e) => { draft = { ...p.v, preset: k }; if (k !== 'normal') buildGraph(); applyFx(draft); send({ t: 'music.fx', fx: draft }); haptic('select');
+        h('button', { class: 'fx' + (draft.preset === k ? ' on' : '') + (allowed ? '' : ' locked'), onclick: (e) => { if (!allowed) return deny('fx'); draft = { ...p.v, preset: k }; if (k !== 'normal') buildGraph(); applyFx(draft); send({ t: 'music.fx', fx: draft }); haptic('select');
           body.querySelectorAll('.fx').forEach(b => b.classList.toggle('on', b === e.currentTarget)); } }, h('span', null, p.e), p.label))),
       slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
       slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
@@ -816,7 +803,7 @@ function sectionHead(title, onAll) {
   return h('div', { class: 'br-sec' }, h('h2', null, title), onAll ? h('button', { onclick: onAll }, 'See all') : null);
 }
 function addTrack(t, el) {
-  if (!canAdd()) return toast('Only admins can add songs right now');
+  if (!canAdd()) return deny('add');
   send({ t: 'music.add', track: t });
   BR.added.add(t.id);
   haptic('success');
@@ -827,7 +814,7 @@ function songMenu(t) {
     h('p', { class: 'muted', style: { margin: '-6px 0 10px' } }, t.artist),
     h('div', { class: 'list' },
       canAdd() ? actionRow('plus', 'Add to queue', () => { addTrack(t); m.close(); }) : null,
-      S.admin ? actionRow('play', 'Play next', () => { send({ t: 'music.add', track: t, next: true }); m.close(); toast('Plays next'); }) : null,
+      actionRow('play', 'Play next', () => { if (!can('next')) return deny('next'); send({ t: 'music.add', track: t, next: true }); m.close(); toast('Plays next'); }, can('next') ? '' : 'locked'),
       actionRow('list-plus', 'Add to a playlist', () => { m.close(); addToPlaylist([t]); }),
       actionRow('heart', S.liked.has(t.id) ? 'Remove from Liked Songs' : 'Add to Liked Songs', async () => {
         m.close();

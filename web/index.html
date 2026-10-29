@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Voice Chat</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></symbol>
+    <symbol id="i-mic-off" viewBox="0 0 24 24"><path d="M15 9.5V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 4.6 2.5M18.5 11a6.4 6.4 0 0 1-1 3.4M5.5 11a6.5 6.5 0 0 0 10.3 5.3M12 17.5V21M3 3l18 18"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="3"/><path d="m15.5 10.5 6-3.5v10l-6-3.5"/></symbol>
+    <symbol id="i-video-off" viewBox="0 0 24 24"><path d="M15.5 13v2a3 3 0 0 1-3 3h-7a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3h1M10 6h2.5a3 3 0 0 1 3 3v1.5l6-3.5v10M3 3l18 18"/></symbol>
+    <symbol id="i-screen" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2.5"/><path d="M8 21h8M12 17v4M12 13.5V8m-2.5 2.5L12 8l2.5 2.5"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-12.6 7.4L3 20.5l1.6-5A8.5 8.5 0 1 1 21 11.5Z"/></symbol>
+    <symbol id="i-leave" viewBox="0 0 24 24"><path d="M3.2 13.6c4.9-4.4 12.7-4.4 17.6 0 .6.6.6 1.6 0 2.2l-1.4 1.4a1.6 1.6 0 0 1-2.1.1l-1.8-1.4a1.6 1.6 0 0 1-.6-1.4l.1-1.3a10 10 0 0 0-6 0l.1 1.3c.1.5-.2 1.1-.6 1.4l-1.8 1.4a1.6 1.6 0 0 1-2.1-.1l-1.4-1.4c-.6-.6-.6-1.6 0-2.2Z"/></symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11m0-6.5V4a1.5 1.5 0 0 1 3 0v7m0-5.5a1.5 1.5 0 0 1 3 0V12m0-4.5a1.5 1.5 0 0 1 3 0V15a7 7 0 0 1-7 7h-.6a7 7 0 0 1-5.7-2.9L3.5 15.6a1.6 1.6 0 0 1 2.5-2L8 15.5"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.6v14.8c0 .8.9 1.3 1.6.9l12-7.4c.6-.4.6-1.4 0-1.8l-12-7.4C7.9 3.3 7 3.8 7 4.6Z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="5.5" y="4" width="4.5" height="16" rx="1.3"/><rect x="14" y="4" width="4.5" height="16" rx="1.3"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="M2.5 6.4v11.2c0 .8.9 1.2 1.5.8L12 13v4.6c0 .8.9 1.2 1.5.8l8.6-5.6c.6-.4.6-1.2 0-1.6l-8.6-5.6c-.6-.4-1.5 0-1.5.8V11L4 5.6c-.6-.4-1.5 0-1.5.8Z"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="M21.5 6.4v11.2c0 .8-.9 1.2-1.5.8L12 13v4.6c0 .8-.9 1.2-1.5.8l-8.6-5.6c-.6-.4-.6-1.2 0-1.6l8.6-5.6c.6-.4 1.5 0 1.5.8V11l8-5.4c.6-.4 1.5 0 1.5.8Z"/></symbol>
+    <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M3 7h3.5a5 5 0 0 1 4 2l3 4a5 5 0 0 0 4 2H21m0 0-3-3m3 3-3 3M3 17h3.5a5 5 0 0 0 3.3-1.3M21 7h-3.5a5 5 0 0 0-3.3 1.3M21 7l-3-3m3 3-3 3"/></symbol>
+    <symbol id="i-repeat" viewBox="0 0 24 24"><path d="M17 3l3 3-3 3M20 6H8a4 4 0 0 0-4 4v1M7 21l-3-3 3-3M4 18h12a4 4 0 0 0 4-4v-1"/></symbol>
+    <symbol id="i-repeat1" viewBox="0 0 24 24"><path d="M17 3l3 3-3 3M20 6H8a4 4 0 0 0-4 4v1M7 21l-3-3 3-3M4 18h12a4 4 0 0 0 4-4v-1M11 10l1.5-1v6"/></symbol>
+    <symbol id="i-infinity" viewBox="0 0 24 24"><path d="M12 12c-2-2.7-3.6-4-5.5-4a4 4 0 0 0 0 8c1.9 0 3.5-1.3 5.5-4Zm0 0c2 2.7 3.6 4 5.5 4a4 4 0 0 0 0-8c-1.9 0-3.5 1.3-5.5 4Z"/></symbol>
+    <symbol id="i-queue" viewBox="0 0 24 24"><path d="M3 6h13M3 12h13M3 18h8M17 15v6m0 0 2.5-1.5M17 21l-2.5-1.5M20 6h1M20 12h1"/></symbol>
+    <symbol id="i-lyrics" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-12.6 7.4L3 20.5l1.6-5A8.5 8.5 0 1 1 21 11.5ZM8.5 10h7M8.5 13.5h4.5"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-plus-c" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 8v8M8 12h8"/></symbol>
+    <symbol id="i-check-c" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="m8 12.5 2.8 2.8L16.5 9.5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20.5s-8.5-5-8.5-11A4.8 4.8 0 0 1 12 6.6a4.8 4.8 0 0 1 8.5 2.9c0 6-8.5 11-8.5 11Z"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="19" cy="12" r="1.6" fill="currentColor"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-vol" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></symbol>
+    <symbol id="i-vol-low" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7"/></symbol>
+    <symbol id="i-vol-x" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5ZM16 9.5l5 5M21 9.5l-5 5"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5.5l11-2V16M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0Zm11-2a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3c.6 4.2 1.8 5.4 6 6-4.2.6-5.4 1.8-6 6-.6-4.2-1.8-5.4-6-6 4.2-.6 5.4-1.8 6-6ZM18.5 15c.3 2 .9 2.6 2.9 2.9-2 .3-2.6.9-2.9 2.9-.3-2-.9-2.6-2.9-2.9 2-.3 2.6-.9 2.9-2.9Z"/></symbol>
+    <symbol id="i-sound" viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 21.5s8-3.6 8-10V5l-8-2.5L4 5v6.5c0 6.4 8 10 8 10Z"/></symbol>
+    <symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 21V4m0 0c4-2 6.5 2 10.5 0 1.2-.6 2.5-.8 3.5-.4V14c-1-.4-2.3-.2-3.5.4-4 2-6.5-2-10.5 0"/></symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></symbol>
+    <symbol id="i-user-x" viewBox="0 0 24 24"><circle cx="9.5" cy="8" r="4"/><path d="M2.5 20.5a7 7 0 0 1 14 0M17 8.5l4 4M21 8.5l-4 4"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3.3-3.3a4.5 4.5 0 0 0-6.4-6.4L12 5.6M14 10a4.5 4.5 0 0 0-6.4 0l-3.3 3.3a4.5 4.5 0 0 0 6.4 6.4l1.3-1.3"/></symbol>
+    <symbol id="i-rec" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor"/></symbol>
+    <symbol id="i-cal" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="16" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M5.5 7l1 12a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2l1-12M9 7V4.5h6V7"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5m0 0-6 6m6-6 6 6"/></symbol>
+    <symbol id="i-reply" viewBox="0 0 24 24"><path d="M9.5 8 4 13l5.5 5M4 13h10a6 6 0 0 1 6 6"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="12" height="12" rx="2.5"/><path d="M15.5 8.5V6a2.5 2.5 0 0 0-2.5-2.5H6A2.5 2.5 0 0 0 3.5 6v7A2.5 2.5 0 0 0 6 15.5h2.5"/></symbol>
+    <symbol id="i-list-plus" viewBox="0 0 24 24"><path d="M3 6h14M3 12h10M3 18h8M18 13v8M14 17h8"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3.5 12a8.5 8.5 0 1 0 2.5-6L3.5 8.5M3.5 4v4.5H8M12 7.5V12l3 2"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+    <symbol id="i-hq" viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="14" rx="3"/><path d="M7 9v6M7 12h3.5M10.5 9v6M17.5 14.5l1 1M15.5 9a2.5 3 0 1 1 0 6 2.5 3 0 1 1 0-6Z"/></symbol>
+    <symbol id="i-headphones" viewBox="0 0 24 24"><path d="M3.5 17v-4a8.5 8.5 0 0 1 17 0v4M3.5 15.5h3v5h-1a2 2 0 0 1-2-2v-3Zm17 0h-3v5h1a2 2 0 0 0 2-2v-3Z"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M15 3.5h5.5V9M9 20.5H3.5V15M20.5 3.5 14 10M3.5 20.5 10 14"/></symbol>
+    <symbol id="i-group" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.6a3.5 3.5 0 0 1 0 6.8M18.5 14.5a6.5 6.5 0 0 1 3 5.5"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M3.5 10.5 12 3.5l8.5 7V19a1.5 1.5 0 0 1-1.5 1.5h-4v-6h-6v6H5A1.5 1.5 0 0 1 3.5 19v-8.5Z"/></symbol>
+    <symbol id="i-library" viewBox="0 0 24 24"><path d="M4 4v16M8.5 4v16M13 4.5l5.5 15M3.5 20.5h17"/></symbol>
+    <symbol id="i-pip" viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><rect x="12" y="11.5" width="7" height="5.5" rx="1.2" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 3v2m0 0a6 6 0 0 1 6 6v3l2 3H4l2-3v-3a6 6 0 0 1 6-6Zm-2 15a2 2 0 0 0 4 0"/></symbol>
+  </defs>
+</svg>
+
+<div id="aura"><i></i><i></i><i></i></div>
+<div id="grain"></div>
+
+<div id="gate"><div class="box"><div class="spinner"></div><h1>Joining</h1><p>Connecting to the voice chat…</p></div></div>
+
+<main id="room" hidden>
+  <header class="top">
+    <button class="icon-btn" id="b-admin" aria-label="Menu"><svg class="ico"><use href="#i-more"/></svg><span class="badge" id="admin-badge" hidden></span></button>
+    <div class="t">
+      <h1 id="r-title">Voice Chat</h1>
+      <div class="sub"><span class="live-dot"></span><span id="r-count">0 listening</span><span id="r-rec" class="rec" hidden>REC</span><span id="r-lock" hidden>🔒</span></div>
+    </div>
+    <button class="icon-btn" id="b-search" aria-label="Search music"><svg class="ico"><use href="#i-music"/></svg></button>
+  </header>
+  <div class="desc" id="r-desc" hidden></div>
+  <div class="scroll" id="scroll">
+    <div class="np-card empty" id="np-card"></div>
+    <div class="stage" id="stage"></div>
+    <div class="list-h"><span id="lh-count">Participants</span></div>
+    <div class="plist" id="grid"></div>
+  </div>
+  <nav class="dock">
+    <button class="dk" id="b-cam"><span class="c"><svg class="ico"><use href="#i-video-off"/></svg></span><span>Video</span></button>
+    <button class="dk" id="b-more"><span class="c"><svg class="ico"><use href="#i-more"/></svg></span><span>More</span></button>
+    <div class="mic-wrap"><button class="mic wait" id="b-mic" aria-label="Microphone"><span class="halo"></span><span class="blob"></span><svg class="ico"><use href="#i-mic-off"/></svg></button><div class="mic-lbl" id="mic-lbl">Connecting</div></div>
+    <button class="dk" id="b-chat"><span class="c"><svg class="ico"><use href="#i-chat"/></svg></span><span>Chat</span><span class="badge" id="chat-badge" hidden></span></button>
+    <button class="dk red" id="b-leave"><span class="c"><svg class="ico"><use href="#i-leave"/></svg></span><span>Leave</span></button>
+  </nav>
+</main>
+
+<div id="toasts"></div>
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

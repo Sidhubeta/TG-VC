@@ -1,0 +1,553 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from contextlib import asynccontextmanager
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
+
+from . import auth, config, db, lk, music, pin, tg
+from .room import Conn, ROOMS, get_room, heartbeat_loop
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+log = logging.getLogger("main")
+WEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+
+
+class Denied(Exception):
+    def __init__(self, msg: str, code: int = 403):
+        self.msg, self.code = msg, code
+
+
+def err(msg: str, code: int = 400):
+    return JSONResponse({"error": msg}, status_code=code)
+
+
+async def is_banned(chat_id: int, uid: int) -> bool:
+    return bool(await db.q1("SELECT 1 FROM bans WHERE chat_id=? AND uid=?", (chat_id, uid)))
+
+
+async def session(request: Request, need_admin: bool = False) -> tuple[int, int, dict]:
+    tok = request.headers.get("x-session") or request.query_params.get("s") or ""
+    try:
+        uid, chat_id = auth.read_session(tok)
+    except ValueError:
+        raise Denied("Session expired — reopen the app", 401)
+    st = await tg.member_status(chat_id, uid)
+    if not st["member"] or await is_banned(chat_id, uid):
+        raise Denied("Not allowed")
+    if need_admin and not st["admin"]:
+        raise Denied("Admins only")
+    return uid, chat_id, st
+
+
+def guarded(need_admin: bool = False):
+    def deco(fn):
+        async def wrapper(request: Request):
+            try:
+                uid, chat_id, st = await session(request, need_admin)
+            except Denied as d:
+                return err(d.msg, d.code)
+            try:
+                return await fn(request, uid, chat_id, st)
+            except Denied as d:
+                return err(d.msg, d.code)
+            except Exception as e:
+                log.exception("api error")
+                return err(f"Something went wrong: {str(e)[:150]}", 500)
+        return wrapper
+    return deco
+
+
+# ---------------- auth ----------------
+async def api_auth(request: Request):
+    body = await request.json()
+    if config.DEV_MODE and body.get("dev"):
+        uid = -abs(int(body.get("uid", 1)))
+        user = {"id": uid, "first_name": body.get("name", f"Dev {abs(uid)}"), "username": f"dev{abs(uid)}"}
+        chat_id = int(body.get("chat", -100123))
+        await db.get_group(chat_id)
+        await db.x("UPDATE groups SET title=COALESCE(NULLIF(title,''),'Dev Group') WHERE chat_id=?", (chat_id,))
+    else:
+        try:
+            data = auth.verify_init_data(body.get("initData", ""))
+        except ValueError:
+            return err("Please open this app from Telegram", 401)
+        user = data["user"]
+        uid = int(user["id"])
+        sp = data.get("start_param") or ""
+        if not sp:
+            return err("Open the voice chat from your group's link (send /vc in the group)", 403)
+        try:
+            chat_id, version = auth.parse_group_token(sp)
+        except ValueError:
+            return err("Invalid link", 403)
+        g = await db.get_group(chat_id)
+        if version != g["link_version"]:
+            return err("This link was reset by an admin. Ask for the new link (/vc in the group)", 403)
+    st = await tg.member_status(chat_id, uid, fresh=True)
+    if not st["member"]:
+        return err("Only members of this group can join", 403)
+    if await is_banned(chat_id, uid):
+        return err("You are banned from this voice chat", 403)
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x).strip() or "User"
+    old = await db.q1("SELECT bio, updated FROM users WHERE uid=?", (uid,))
+    bio = (old or {}).get("bio") or ""
+    if uid > 0 and (not old or time.time() - (old.get("updated") or 0) > 1800):
+        bio = await tg.fetch_bio(uid)
+    if config.DEV_MODE and uid < 0:
+        bio = ["Music lover 🎧", "", "Living one song at a time", "", "Punjab ⇄ Toronto", ""][abs(uid) % 6]
+    await db.x("INSERT OR REPLACE INTO users(uid,name,username,photo,bio,updated) VALUES(?,?,?,?,?,?)",
+               (uid, name[:64], user.get("username") or "", user.get("photo_url") or "", bio, time.time()))
+    room = await get_room(chat_id)
+    if room.settings["locked"] and not st["admin"] and uid not in room.parts:
+        return err("The voice chat is locked by admins", 403)
+    can_pub = st["admin"] or room.settings["new_can_speak"] or (uid in room.parts and room.can_speak(room.parts[uid]))
+    out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"],
+           "group": await tg.chat_title(chat_id) if not config.DEV_MODE else "Dev Group",
+           "livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, name, can_pub)} if lk.enabled() else None}
+    return JSONResponse(out)
+
+
+async def api_lk_token(request: Request):
+    """Fresh LiveKit token reflecting current permissions (used on reconnect)."""
+    try:
+        uid, chat_id, st = await session(request)
+    except Denied as d:
+        return err(d.msg, d.code)
+    if not lk.enabled():
+        return JSONResponse({"livekit": None})
+    room = await get_room(chat_id)
+    p = room.parts.get(uid)
+    u = await db.q1("SELECT name FROM users WHERE uid=?", (uid,))
+    can = room.can_speak(p) if p else (st["admin"] or room.settings["new_can_speak"])
+    return JSONResponse({"livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, (u or {}).get("name", "User"), can)}})
+
+
+# ---------------- music ----------------
+@guarded()
+async def api_search(request: Request, uid, chat_id, st):
+    q = (request.query_params.get("q") or "").strip()[:200]
+    if not q:
+        return JSONResponse({"tracks": []})
+    vid, pl = music.parse_youtube(q)
+    if pl:
+        title, tracks = await music.playlist(pl)
+        return JSONResponse({"playlist": {"id": pl, "title": title, "tracks": tracks}})
+    if vid:
+        info = await music.resolve(vid)
+        return JSONResponse({"tracks": [info["track"]] if info.get("track") else []})
+    return JSONResponse({"tracks": await music.search(q)})
+
+
+async def api_stream(request: Request):
+    try:
+        await session(request)
+    except Denied as d:
+        return Response(d.msg, status_code=d.code)
+    vid = request.path_params["vid"]
+    kind = request.path_params["kind"]
+    if kind not in ("audio", "video") or len(vid) != 11:
+        return Response(status_code=404)
+    return await music.stream(request, vid, kind, request.query_params.get("c", "aac"),
+                              request.query_params.get("q", "medium"))
+
+
+async def api_avatar(request: Request):
+    try:
+        uid, chat_id, _ = await session(request)
+    except Denied as d:
+        return Response(status_code=d.code)
+    try:
+        eid = int(request.path_params["eid"])
+    except ValueError:
+        return Response(status_code=404)
+    # only people/groups relevant to this room
+    if eid != chat_id and not await db.q1("SELECT 1 FROM sessions WHERE chat_id=? AND uid=? LIMIT 1", (chat_id, eid)):
+        return Response(status_code=404)
+    u = await db.q1("SELECT photo FROM users WHERE uid=?", (eid,)) if eid > 0 else None
+    path = await tg.avatar_path(eid, (u or {}).get("photo") or "")
+    if not path:
+        return Response(status_code=404, headers={"Cache-Control": "private, max-age=3600"})
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+
+EMOJI_DIR = os.path.join(config.DATA_DIR, "emoji")
+os.makedirs(EMOJI_DIR, exist_ok=True)
+EMOJI_CDN = "https://cdn.jsdelivr.net/npm/emoji-datasource-apple@15/img/apple/64/"
+
+
+async def emoji(request: Request):
+    """Apple-style emoji images, cached on our server (same on Android and iPhone)."""
+    name = request.path_params["name"]
+    if not re.fullmatch(r"[0-9a-f]{2,6}(-[0-9a-f]{2,6}){0,9}\.png", name):
+        return Response(status_code=404)
+    path = os.path.join(EMOJI_DIR, name)
+    if not os.path.exists(path):
+        try:
+            r = await music.http().get(EMOJI_CDN + name, timeout=8)
+        except Exception:
+            return Response(status_code=502)
+        if r.status_code != 200:
+            return Response(status_code=404, headers={"Cache-Control": "public, max-age=86400"})
+        with open(path, "wb") as fh:
+            fh.write(r.content)
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+async def api_thumb(request: Request):
+    try:
+        await session(request)
+    except Denied as d:
+        return Response(status_code=d.code)
+    return await music.thumb(request.path_params["vid"][:11])
+
+
+@guarded()
+async def api_formats(request: Request, uid, chat_id, st):
+    info = await music.resolve(request.path_params["vid"][:11])
+    return JSONResponse({"heights": music.video_heights(info)})
+
+
+@guarded()
+async def api_lyrics(request: Request, uid, chat_id, st):
+    p = request.query_params
+    res = await music.lyrics(request.path_params["vid"][:11], p.get("title", ""), p.get("artist", ""),
+                             float(p.get("duration") or 0))
+    return JSONResponse(res)
+
+
+@guarded()
+async def api_history(request: Request, uid, chat_id, st):
+    rows = await db.q("SELECT vid as id,title,artist,duration,by_name,ts FROM plays WHERE chat_id=? ORDER BY id DESC LIMIT 100", (chat_id,))
+    for r in rows:
+        r["thumb"] = f"/api/thumb/{r['id']}"
+    return JSONResponse({"tracks": rows})
+
+
+@guarded()
+async def api_browse(request: Request, uid, chat_id, st):
+    rows = await db.q("SELECT vid as id,title,artist,duration,MAX(ts) AS ts FROM plays WHERE chat_id=? GROUP BY vid ORDER BY ts DESC LIMIT 20", (chat_id,))
+    for r in rows:
+        r["thumb"] = f"/api/thumb/{r['id']}"
+    return JSONResponse({"genres": music.genre_list(), "recent": rows})
+
+
+@guarded()
+async def api_browse_section(request: Request, uid, chat_id, st):
+    sec = request.path_params["sec"]
+    if sec == "foryou":
+        rows = await db.q("SELECT vid, MAX(ts) AS ts FROM plays WHERE chat_id=? GROUP BY vid ORDER BY ts DESC LIMIT 30", (chat_id,))
+        liked = await db.q("""SELECT i.track FROM playlist_items i JOIN playlists p ON p.id=i.playlist_id
+                              WHERE p.uid=? AND p.name='Liked Songs' ORDER BY i.id DESC LIMIT 3""", (uid,))
+        seeds = [json.loads(l["track"])["id"] for l in liked][:1] + [r["vid"] for r in rows]
+        seeds = list(dict.fromkeys(seeds))
+        if not seeds:
+            return JSONResponse({"title": "For You", "tracks": (await music.collection("trending"))["tracks"][:20], "fallback": True})
+        return JSONResponse({"title": "For You", "tracks": await music.recommend(seeds, {r["vid"] for r in rows[:10]})})
+    try:
+        return JSONResponse(await music.collection(sec))
+    except KeyError:
+        return err("Not found", 404)
+
+
+# ---------------- playlists (per user) ----------------
+LIKED = "Liked Songs"
+
+
+async def _liked_id(uid: int) -> int:
+    r = await db.q1("SELECT id FROM playlists WHERE uid=? AND name=?", (uid, LIKED))
+    return r["id"] if r else await db.x("INSERT INTO playlists(uid,name,created) VALUES(?,?,?)", (uid, LIKED, time.time()))
+
+
+def _clean_track(t: dict) -> dict:
+    vid = str(t.get("id", ""))[:11]
+    return {"id": vid, "title": str(t.get("title", ""))[:200], "artist": str(t.get("artist", ""))[:120],
+            "duration": float(t.get("duration") or 0), "thumb": f"/api/thumb/{vid}"}
+
+
+@guarded()
+async def api_playlists(request: Request, uid, chat_id, st):
+    if request.method == "POST":
+        body = await request.json()
+        name = str(body.get("name", "")).strip()[:60] or "My Playlist"
+        pid = await db.x("INSERT INTO playlists(uid,name,created) VALUES(?,?,?)", (uid, name, time.time()))
+        for t in (body.get("tracks") or [])[:300]:
+            await db.x("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)",
+                       (pid, json.dumps(_clean_track(t)), time.time()))
+        return JSONResponse({"id": pid})
+    await _liked_id(uid)
+    rows = await db.q("""SELECT p.id, p.name, COUNT(i.id) AS count,
+        (SELECT track FROM playlist_items WHERE playlist_id=p.id ORDER BY id LIMIT 1) AS first
+        FROM playlists p LEFT JOIN playlist_items i ON i.playlist_id=p.id WHERE p.uid=? GROUP BY p.id
+        ORDER BY (p.name=?) DESC, p.id DESC""", (uid, LIKED))
+    for r in rows:
+        f = json.loads(r.pop("first") or "null")
+        r["thumb"] = f["thumb"] if f else ""
+    return JSONResponse({"playlists": rows})
+
+
+@guarded()
+async def api_playlist(request: Request, uid, chat_id, st):
+    pid = int(request.path_params["pid"])
+    pl = await db.q1("SELECT * FROM playlists WHERE id=? AND uid=?", (pid, uid))
+    if not pl:
+        return err("Not found", 404)
+    if request.method == "DELETE":
+        if pl["name"] == LIKED:
+            return err("Can't delete Liked Songs")
+        await db.x("DELETE FROM playlist_items WHERE playlist_id=?", (pid,))
+        await db.x("DELETE FROM playlists WHERE id=?", (pid,))
+        return JSONResponse({"ok": True})
+    if request.method == "POST":
+        body = await request.json()
+        if "rename" in body:
+            await db.x("UPDATE playlists SET name=? WHERE id=?", (str(body["rename"])[:60], pid))
+        for t in (body.get("add") or [])[:300]:
+            await db.x("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)",
+                       (pid, json.dumps(_clean_track(t)), time.time()))
+        if body.get("remove"):
+            await db.x("DELETE FROM playlist_items WHERE id=? AND playlist_id=?", (int(body["remove"]), pid))
+        return JSONResponse({"ok": True})
+    items = await db.q("SELECT id, track FROM playlist_items WHERE playlist_id=? ORDER BY id", (pid,))
+    return JSONResponse({"id": pid, "name": pl["name"],
+                         "tracks": [{**json.loads(i["track"]), "item": i["id"]} for i in items]})
+
+
+@guarded()
+async def api_like(request: Request, uid, chat_id, st):
+    lid = await _liked_id(uid)
+    if request.method == "GET":
+        rows = await db.q("SELECT track FROM playlist_items WHERE playlist_id=?", (lid,))
+        return JSONResponse({"ids": [json.loads(r["track"])["id"] for r in rows]})
+    t = _clean_track((await request.json()).get("track") or {})
+    rows = await db.q("SELECT id, track FROM playlist_items WHERE playlist_id=?", (lid,))
+    for r in rows:
+        if json.loads(r["track"])["id"] == t["id"]:
+            await db.x("DELETE FROM playlist_items WHERE id=?", (r["id"],))
+            return JSONResponse({"liked": False})
+    await db.x("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)", (lid, json.dumps(t), time.time()))
+    return JSONResponse({"liked": True})
+
+
+# ---------------- admin: logs, reports, bans, schedules ----------------
+def _range(p) -> tuple[float, float]:
+    f = float(p.get("from") or 0)
+    t = float(p.get("to") or 0) or time.time() + 1
+    return f, t
+
+
+def _who(q: str) -> tuple[str, list]:
+    q = q.strip().lstrip("@")
+    if not q:
+        return "", []
+    if q.lstrip("-").isdigit():
+        return " AND s.uid=?", [int(q)]
+    return " AND (s.name LIKE ? OR s.username LIKE ?)", [f"%{q}%", f"%{q}%"]
+
+
+@guarded(need_admin=True)
+async def api_logs(request: Request, uid, chat_id, st):
+    p = request.query_params
+    f, t = _range(p)
+    w, args = _who(p.get("q", ""))
+    lim = min(int(p.get("limit") or 50), 200)
+    off = int(p.get("offset") or 0)
+    rows = await db.q(f"""SELECT s.id, s.uid, s.name, s.username, s.joined, COALESCE(s.left, s.last_seen) AS left,
+        s.open, s.mic_secs FROM sessions s WHERE s.chat_id=? AND s.joined BETWEEN ? AND ? {w}
+        ORDER BY s.joined DESC LIMIT ? OFFSET ?""", [chat_id, f, t, *args, lim, off])
+    room = ROOMS.get(chat_id)
+    for r in rows:
+        if r["open"] and room and r["uid"] in room.parts:
+            pp = room.parts[r["uid"]]
+            r["left"] = None
+            r["mic_secs"] = pp.mic_secs + ((time.time() - pp.mic_since) if pp.mic and pp.mic_since else 0)
+    return JSONResponse({"sessions": rows})
+
+
+@guarded(need_admin=True)
+async def api_logs_users(request: Request, uid, chat_id, st):
+    """Aggregated per user: joins, total time, mic on/off. Used for search + ranking."""
+    p = request.query_params
+    f, t = _range(p)
+    w, args = _who(p.get("q", ""))
+    order = {"time": "total DESC", "joins": "joins DESC", "mic": "mic DESC", "recent": "last DESC"}.get(p.get("sort", "time"), "total DESC")
+    rows = await db.q(f"""SELECT s.uid, MAX(s.name) AS name, MAX(s.username) AS username, COUNT(*) AS joins,
+        SUM((CASE WHEN s.open=1 THEN ? ELSE COALESCE(s.left, s.last_seen, s.joined) END) - s.joined) AS total,
+        SUM(s.mic_secs) AS mic,
+        MIN(s.joined) AS first, MAX(s.joined) AS last
+        FROM sessions s WHERE s.chat_id=? AND s.joined BETWEEN ? AND ? {w}
+        GROUP BY s.uid ORDER BY {order} LIMIT 100""", [time.time(), chat_id, f, t, *args])
+    room = ROOMS.get(chat_id)
+    for r in rows:
+        r["online"] = bool(room and r["uid"] in room.parts)
+        if r["online"]:
+            pp = room.parts[r["uid"]]
+            if pp.mic and pp.mic_since:
+                r["mic"] = (r["mic"] or 0) + (time.time() - pp.mic_since)
+        r["total"] = max(0, r["total"] or 0)
+        r["mic"] = min(r["mic"] or 0, r["total"])
+        r["mic_off"] = r["total"] - r["mic"]
+    return JSONResponse({"users": rows})
+
+
+@guarded(need_admin=True)
+async def api_reports(request: Request, uid, chat_id, st):
+    if request.method == "POST":
+        body = await request.json()
+        await db.x("UPDATE reports SET resolved=1 WHERE id=? AND chat_id=?", (int(body.get("id", 0)), chat_id))
+        return JSONResponse({"ok": True})
+    rows = await db.q("SELECT * FROM reports WHERE chat_id=? AND resolved=0 ORDER BY id DESC LIMIT 100", (chat_id,))
+    bans = await db.q("SELECT * FROM bans WHERE chat_id=? ORDER BY ts DESC", (chat_id,))
+    sch = await db.q("SELECT * FROM schedules WHERE chat_id=? AND sent=0 ORDER BY at", (chat_id,))
+    return JSONResponse({"reports": rows, "bans": bans, "schedules": sch})
+
+
+@guarded(need_admin=True)
+async def api_recording(request: Request, uid, chat_id, st):
+    form = await request.form(max_part_size=200 * 1024 * 1024)
+    f = form.get("file")
+    if not f:
+        return err("No file")
+    data = await f.read()
+    room = ROOMS.get(chat_id)
+    title = room.settings["title"] if room else "Voice chat"
+    name = f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{form.get('ext', 'webm')}"
+    to = await tg.send_recording(uid, chat_id, data, name, f"🎙 Recording — {title}")
+    if to is None:
+        return err("Couldn't send the recording. Start the bot in private (/start) and try again.")
+    return JSONResponse({"ok": True, "to": "dm" if to == uid else "group"})
+
+
+# ---------------- websocket ----------------
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    try:
+        uid, chat_id = auth.read_session(ws.query_params.get("s", ""))
+    except ValueError:
+        await ws.close(4001)
+        return
+    st = await tg.member_status(chat_id, uid, fresh=True)
+    if not st["member"] or await is_banned(chat_id, uid):
+        await ws.close(4003)
+        return
+    room = await get_room(chat_id)
+    if room.settings["locked"] and not st["admin"] and uid not in room.parts:
+        await ws.send_text(json.dumps({"t": "locked"}))
+        await ws.close(4004)
+        return
+    user = await db.q1("SELECT * FROM users WHERE uid=?", (uid,)) or {}
+    conn = Conn(ws, uid)
+    await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
+    try:
+        while True:
+            raw = await ws.receive_text()
+            t = time.time()
+            conn.hits.append(t)
+            if len(conn.hits) == conn.hits.maxlen and t - conn.hits[0] < 5:
+                continue  # flood protection
+            if len(raw) > 8000:
+                continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(msg, dict):
+                await room.handle(conn, msg)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        log.exception("ws")
+    finally:
+        conn.alive = False
+        await room.leave(conn)
+
+
+async def api_bye(request: Request):
+    """Sent by the app when it is closed, so the person leaves the voice chat right away."""
+    try:
+        uid, chat_id = auth.read_session(request.query_params.get("s", ""))
+    except ValueError:
+        return Response(status_code=204)
+    room = ROOMS.get(chat_id)
+    p = room.parts.get(uid) if room else None
+    if p:
+        for c in list(p.conns):
+            try:
+                await c.ws.close(1000)
+            except Exception:
+                pass
+            await room.leave(c)
+    return Response(status_code=204)
+
+
+# ---------------- static ----------------
+async def index(request: Request):
+    return FileResponse(os.path.join(WEB, "index.html"), headers={
+        "Cache-Control": "no-cache", "X-Robots-Tag": "noindex, nofollow", "Referrer-Policy": "no-referrer"})
+
+
+async def health(request: Request):
+    return JSONResponse({"ok": True})
+
+
+async def robots(request: Request):
+    return Response("User-agent: *\nDisallow: /\n", media_type="text/plain")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    tasks = [asyncio.create_task(tg.run_polling()), asyncio.create_task(tg.schedule_loop()),
+             asyncio.create_task(heartbeat_loop()), asyncio.create_task(pin.startup_reset()),
+             asyncio.create_task(pin.countdown_loop())]
+    log.info("LiveKit %s", "enabled" if lk.enabled() else "NOT configured (voice disabled)")
+    yield
+    for t in tasks:
+        t.cancel()
+
+
+routes = [
+    Route("/", index),
+    Route("/health", health),
+    Route("/robots.txt", robots),
+    Route("/api/auth", api_auth, methods=["POST"]),
+    Route("/api/lk", api_lk_token),
+    Route("/api/search", api_search),
+    Route("/api/stream/{vid}/{kind}", api_stream),
+    Route("/api/thumb/{vid}", api_thumb),
+    Route("/api/avatar/{eid}", api_avatar),
+    Route("/emoji/{name}", emoji),
+    Route("/api/formats/{vid}", api_formats),
+    Route("/api/lyrics/{vid}", api_lyrics),
+    Route("/api/history", api_history),
+    Route("/api/browse", api_browse),
+    Route("/api/browse/{sec}", api_browse_section),
+    Route("/api/playlists", api_playlists, methods=["GET", "POST"]),
+    Route("/api/playlists/{pid:int}", api_playlist, methods=["GET", "POST", "DELETE"]),
+    Route("/api/like", api_like, methods=["GET", "POST"]),
+    Route("/api/logs", api_logs),
+    Route("/api/logs/users", api_logs_users),
+    Route("/api/reports", api_reports, methods=["GET", "POST"]),
+    Route("/api/recording", api_recording, methods=["POST"]),
+    Route("/api/bye", api_bye, methods=["POST", "GET"]),
+    WebSocketRoute("/ws", ws_endpoint),
+    Mount("/static", StaticFiles(directory=WEB), name="static"),
+]
+app = Starlette(routes=routes, lifespan=lifespan)
+
+
+def run():
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=config.PORT, proxy_headers=True, forwarded_allow_ips="*",
+                ws_ping_interval=10, ws_ping_timeout=10)
+
+
+if __name__ == "__main__":
+    run()

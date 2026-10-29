@@ -603,7 +603,7 @@ class Room:
         cur = self.current
         if cur and auto and self.loop == "one":
             return await self._start({**cur})
-        if cur and self.loop == "all":
+        if cur and self.loop == "all" and all(q["id"] != cur["id"] for q in self.queue):
             self._qid += 1
             self.queue.append({**cur, "qid": self._qid})
         if self.queue:
@@ -650,17 +650,36 @@ class Room:
     async def on_music(self, p: Participant, cmd: str, msg: dict):
         admin = p.admin
         if cmd in ("add", "addMany"):
+            now_, next_ = bool(msg.get("now")), bool(msg.get("next"))
             if not self.can(p, "add"):
                 return await self.deny(p, "add")
-            if msg.get("next") and not self.can(p, "next"):
+            if now_ and not self.can(p, "playback"):
+                return await self.deny(p, "playback")
+            if next_ and not self.can(p, "next"):
                 return await self.deny(p, "next")
             tracks = msg.get("tracks") if cmd == "addMany" else [msg.get("track") or {}]
-            items = [it for t in (tracks or [])[:200] if (it := self._item(t, p))]
+            items, seen = [], set()
+            for t in (tracks or [])[:200]:
+                it = self._item(t, p)
+                if it and it["id"] not in seen:  # the same song twice in one batch
+                    seen.add(it["id"])
+                    items.append(it)
             if not items:
                 return
             if len([q for q in self.queue if q["byUid"] == p.uid]) + len(items) > 200 and not admin:
                 return await self.toast(p.uid, "Queue limit reached")
-            if msg.get("next"):
+            # No duplicates in the queue. "Play now" / "Play next" on a song that's already queued moves it instead.
+            queued = {q["id"] for q in self.queue}
+            if now_ or next_:
+                self.queue = [q for q in self.queue if q["id"] not in seen]
+            else:
+                dupes = [it for it in items if it["id"] in queued or (self.current and self.current["id"] == it["id"])]
+                items = [it for it in items if it not in dupes]
+                if not items:
+                    playing = self.current and self.current["id"] == dupes[0]["id"]
+                    return await self.toast(p.uid, "This song is playing now" if playing and len(dupes) == 1
+                                            else "Already in the queue")
+            if now_ or next_:
                 self.queue[0:0] = items
             else:
                 # people's songs go before the songs autoplay picked; autoplay carries on after them
@@ -668,10 +687,21 @@ class Room:
                 self.queue[at:at] = items
             if not self.current:
                 await self._start(self.queue.pop(0))
+            elif now_:
+                await self._next()
             else:
                 await self.push_music()
                 spawn(music.prefetch(self.queue[0]["id"]))
-            await self.toast(p.uid, f"Added {len(items)} songs" if len(items) > 1 else f"Added: {items[0]['title']}")
+            skipped = len(seen) - len(items)
+            if now_:
+                text = f"Playing: {items[0]['title']}"
+            elif next_:
+                text = f"Plays next: {items[0]['title']}" if len(items) == 1 else f"{len(items)} songs play next"
+            else:
+                text = f"Added {len(items)} songs" if len(items) > 1 else f"Added: {items[0]['title']}"
+            if skipped and not (now_ or next_):
+                text += f" ({skipped} already in the queue)"
+            await self.toast(p.uid, text)
             return
         if cmd == "fx":
             return await self.set_fx(p, msg.get("fx") or {})
@@ -745,7 +775,9 @@ class Room:
                     it["byUid"] = last.get("byUid", 0)
                     if self.current:
                         self._qid += 1
+                        self.queue = [q for q in self.queue if q["id"] != self.current["id"]]
                         self.queue.insert(0, {**self.current, "qid": self._qid})
+                    self.queue = [q for q in self.queue if q["id"] != it["id"]]
                     await self._start(it, from_prev=True)
         elif cmd == "stop":
             self.queue.clear()

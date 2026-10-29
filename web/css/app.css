@@ -899,3 +899,19 @@ body.composing #chat-pop { margin-bottom: 0; }
 #aura i { animation: none !important; }
 .sheet, .np, .br { will-change: auto; }
 .sheet.show, .np.show, .br.show { will-change: transform; }
+
+/* ============ round 6 ============ */
+/* song choices: Play now / Play next / Add to queue, each clearly different */
+.picks { display: grid; gap: 8px; margin: 0 0 14px; }
+.pick { display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 14px; text-align: left; background: var(--card2);
+  transition: transform .15s var(--spring); }
+.pick:active { transform: scale(.97); }
+.pick .ico { width: 24px; height: 24px; flex: none; }
+.pick b { display: block; font-size: 16px; }
+.pick small { display: block; font-size: 12.5px; color: var(--fg2); margin-top: 1px; }
+.pick.now { background: var(--accent); color: #fff; }
+.pick.now small { color: rgba(255, 255, 255, .8); }
+.pick.next .ico { color: var(--accent); }
+.pick.queue .ico { color: var(--tg-green); }
+.pick.locked { opacity: .45; }
+.np-card .ctl .muted-btn { color: #ffb340; animation: dotpulse 1.6s ease-in-out infinite; }

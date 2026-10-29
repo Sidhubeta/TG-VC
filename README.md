@@ -81,7 +81,10 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 - **Music:** YouTube search, links and playlists, synced for everyone, queue, repeat, shuffle, autoplay (only when on),
   vote skip, audio-only/video switch, audio and video quality (Auto adapts to the connection), lyrics,
   Liked Songs and playlists, history, "Made for you" picks from what each person listens to and likes.
-  The music keeps going for 10 minutes after the last person leaves, so minimizing Telegram doesn't rewind it
+  The music keeps going for 10 minutes after the last person leaves, so minimizing Telegram doesn't rewind it.
+  Tapping a song gives three clear choices: Play now, Play next, Add to queue. A song is never queued twice.
+  Audio and video stay in step with each other and with the room; a song that goes silent restarts by itself,
+  and if the phone blocks the sound the player shows a "sound off" button that turns it back on
 - **Sound:** Bass Boost, 8D, Concert Hall, Vocal, Slowed + Reverb, Nightcore, plus EQ, reverb and speed.
   Everyone hears the same effect in sync; only admins or the person who added the song can change it.
 - **Soundboard:** sounds everyone hears (admins can switch it off)

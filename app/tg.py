@@ -21,20 +21,29 @@ def client() -> httpx.AsyncClient:
     return _client
 
 
+class ApiError(RuntimeError):
+    """Telegram answered and said no (as opposed to a network problem)."""
+
+
+async def _post(method: str, **kw) -> dict:
+    for attempt in range(2):
+        r = await client().post(f"{API}/{method}", **kw)
+        data = r.json()
+        retry = (data.get("parameters") or {}).get("retry_after")
+        if not data.get("ok") and r.status_code == 429 and retry and retry <= 10 and attempt == 0:
+            await asyncio.sleep(retry)  # flood control: wait once, then retry
+            continue
+        if not data.get("ok"):
+            raise ApiError(f"{method}: {data.get('description')}")
+        return data["result"]
+
+
 async def call(method: str, **params):
-    r = await client().post(f"{API}/{method}", json=params)
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"{method}: {data.get('description')}")
-    return data["result"]
+    return await _post(method, json=params)
 
 
 async def call_multipart(method: str, data: dict, files: dict):
-    r = await client().post(f"{API}/{method}", data=data, files=files, timeout=60)
-    res = r.json()
-    if not res.get("ok"):
-        raise RuntimeError(f"{method}: {res.get('description')}")
-    return res["result"]
+    return await _post(method, data=data, files=files, timeout=60)
 
 
 async def group_link(chat_id: int) -> str:
@@ -92,12 +101,20 @@ async def member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
         m = await call("getChatMember", chat_id=chat_id, user_id=uid)
         st = m.get("status")
         res = {
-            "member": st in ("creator", "administrator", "member") or (st == "restricted" and m.get("is_member")),
+            "member": st in ("creator", "administrator", "member") or (st == "restricted" and bool(m.get("is_member"))),
             "admin": st in ("creator", "administrator"),
         }
-    except Exception as e:
-        log.warning("getChatMember failed %s %s: %s", chat_id, uid, e)
+    except ApiError as e:  # Telegram's answer: not a member / chat gone
+        log.info("getChatMember %s %s: %s", chat_id, uid, e)
         res = {"member": False, "admin": False}
+    except Exception as e:
+        # Network trouble is not an answer: keep the last known status instead of kicking people out.
+        log.warning("getChatMember failed %s %s: %s", chat_id, uid, e)
+        return hit[1] if hit else {"member": False, "admin": False}
+    if len(_member_cache) > 5000:
+        cutoff = time.time() - 120
+        for k in [k for k, v in _member_cache.items() if v[0] < cutoff]:
+            _member_cache.pop(k, None)
     _member_cache[key] = (time.time(), res)
     return res
 
@@ -153,7 +170,10 @@ async def _handle(upd: dict):
     if not msg or "text" not in msg:
         return
     chat = msg["chat"]
-    text = msg["text"].split()[0].lower()
+    words = msg["text"].split()
+    if not words or not words[0].startswith("/"):
+        return
+    text = words[0].lower()
     cmd = text.split("@")[0]
     if "@" in text and text.split("@")[1] != BOT_USERNAME.lower():
         return
@@ -178,6 +198,8 @@ async def _handle(upd: dict):
             log.warning("pin post failed: %s", e)
             await send_join_message(cid, f"🎙 <b>{_esc(chat.get('title', 'Voice Chat'))}</b>\nTap below to join the voice chat.")
     elif cmd == "/resetlink":
+        if not msg.get("from"):
+            return
         st = await member_status(cid, msg["from"]["id"], fresh=True)
         if not st["admin"]:
             return
@@ -188,7 +210,7 @@ async def _handle(upd: dict):
 
 
 def _esc(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 async def run_polling():
@@ -298,8 +320,10 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
             except Exception:
                 pass
         if data:
-            with open(path, "wb") as fh:
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as fh:
                 fh.write(data)
+            os.replace(tmp, path)  # atomic: a request never sees a half-written photo
             if os.path.exists(miss):
                 os.remove(miss)
             return path

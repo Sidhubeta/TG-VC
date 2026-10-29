@@ -1,5 +1,5 @@
 // Admin recording: mixes everyone's voice + the music on the admin's device, then the bot sends the file.
-import { S, api, h, on, send, toast } from './core.js';
+import { api, off, on, send, toast } from './core.js';
 import { musicTap } from './player.js';
 import { getCtx } from './sounds.js';
 import { audioTracks } from './voice.js';
@@ -7,6 +7,7 @@ import { audioTracks } from './voice.js';
 let rec = null;
 export const recorder = {
   async start() {
+    if (rec) return toast('Already recording');
     const ctx = getCtx();
     if (!ctx || !window.MediaRecorder) return toast('Recording is not supported on this device');
     const dest = ctx.createMediaStreamDestination();
@@ -19,12 +20,13 @@ export const recorder = {
     audioTracks().forEach(addTrack);
     const tap = musicTap();
     if (tap && tap.ctx === ctx) tap.node.connect(dest);
-    const off = on('voice:audio-track', ({ track }) => addTrack(track.mediaStreamTrack));
+    const onTrack = on('voice:audio-track', ({ track }) => addTrack(track.mediaStreamTrack));
     const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported?.(t)) || '';
     const mr = new MediaRecorder(dest.stream, type ? { mimeType: type, audioBitsPerSecond: 96000 } : undefined);
     const chunks = [];
     mr.ondataavailable = (e) => e.data.size && chunks.push(e.data);
     mr.onstop = async () => {
+      off('voice:audio-track', onTrack);
       if (tap) try { tap.node.disconnect(dest); } catch {}
       const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
       const ext = (mr.mimeType || '').includes('mp4') ? 'm4a' : (mr.mimeType || '').includes('ogg') ? 'ogg' : 'webm';
@@ -38,14 +40,13 @@ export const recorder = {
       } catch (e) { toast(e.message, 5000); }
     };
     mr.start(5000);
-    rec = { mr, off };
+    rec = { mr };
     send({ t: 'rec.start' });
     toast('Recording started');
   },
   stop() {
     if (!rec) return send({ t: 'rec.stop' });
-    rec.off && (rec.off = null);
-    rec.mr.stop();
+    try { rec.mr.stop(); } catch {}
     rec = null;
     send({ t: 'rec.stop' });
   },

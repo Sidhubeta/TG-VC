@@ -64,7 +64,15 @@ function unloadVideo() { if (video.dataset.src) { video.removeAttribute('src'); 
 
 audio.addEventListener('loadedmetadata', () => sync(true));
 audio.addEventListener('ended', () => { const c = cur(); if (c && !c.duration) send({ t: 'music.ended', qid: c.qid }); });
-audio.addEventListener('error', () => { if (cur()) { console.warn('audio error', audio.error); setTimeout(() => { if (cur() && audio.error) { audio.src = audioSrc(cur()); audio.load(); } }, 3000); } });
+// retry a failed stream a few times (with backoff), not forever every 3s
+let errQid = null, errCount = 0;
+audio.addEventListener('error', () => {
+  const t = cur(); if (!t || !audio.getAttribute('src')) return;
+  console.warn('audio error', audio.error);
+  if (errQid !== t.qid) { errQid = t.qid; errCount = 0; }
+  if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
+  setTimeout(() => { const c = cur(); if (c && c.qid === t.qid && audio.error) { audio.src = audioSrc(c); audio.load(); } }, 2000 * errCount);
+});
 video.addEventListener('waiting', () => {
   if (P.vq !== 'auto') return;
   const now = Date.now(); P.stalls = P.stalls.filter(x => now - x < 20000); P.stalls.push(now);
@@ -164,19 +172,21 @@ function buildGraph() {
     comp.connect(master).connect(c.destination);
     G = { c, bass, mid, treble, pan, lfoAmt, hrtf, dry, sp, wet, master, angle: 0 };
     applyFx();
-    spin();
   } catch (e) { console.warn('fx graph failed', e); }
 }
+// moves the 3D source around the head; only runs while Spatial 3D is on
+let spinning = false;
 function spin() {
+  if (spinning) return;
+  spinning = true;
   let last = performance.now();
   const step = (t) => {
-    const dt = (t - last) / 1000; last = t;
-    if (G && FX.mode === 'spatial') {
-      G.angle += dt * 0.35;
-      const x = Math.sin(G.angle) * 1.6, z = Math.cos(G.angle) * 1.6, y = Math.sin(G.angle * 0.5) * 0.4;
-      const hp = G.hrtf;
-      if (hp.positionX) { hp.positionX.value = x; hp.positionY.value = y; hp.positionZ.value = z; } else hp.setPosition(x, y, z);
-    }
+    if (!G || FX.mode !== 'spatial') { spinning = false; return; }
+    const dt = Math.min(0.1, (t - last) / 1000); last = t;
+    G.angle += dt * 0.35;
+    const x = Math.sin(G.angle) * 1.6, z = Math.cos(G.angle) * 1.6, y = Math.sin(G.angle * 0.5) * 0.4;
+    const hp = G.hrtf;
+    if (hp.positionX) { hp.positionX.value = x; hp.positionY.value = y; hp.positionZ.value = z; } else hp.setPosition(x, y, z);
     requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
@@ -206,6 +216,7 @@ function applyFx() {
   G.sp.gain.setTargetAtTime(FX.mode === 'spatial' ? 1.25 : 0, t, 0.1);
   G.lfoAmt.gain.setTargetAtTime(FX.mode === '8d' ? 0.95 : 0, t, 0.1);
   if (FX.mode !== '8d' && G.pan.pan) G.pan.pan.setTargetAtTime(0, t, 0.1);
+  if (FX.mode === 'spatial') spin();
   if (FX.rate === 1) sync(true);
 }
 function setVol(v) {
@@ -703,9 +714,11 @@ function songMenu(t) {
       actionRow('list-plus', 'Add to a playlist', () => { m.close(); addToPlaylist([t]); }),
       actionRow('heart', S.liked.has(t.id) ? 'Remove from Liked Songs' : 'Add to Liked Songs', async () => {
         m.close();
-        const r = await api('/api/like', { body: { track: t } });
-        r.liked ? S.liked.add(t.id) : S.liked.delete(t.id);
-        toast(r.liked ? 'Added to Liked Songs' : 'Removed from Liked Songs');
+        try {
+          const r = await api('/api/like', { body: { track: t } });
+          r.liked ? S.liked.add(t.id) : S.liked.delete(t.id);
+          toast(r.liked ? 'Added to Liked Songs' : 'Removed from Liked Songs');
+        } catch (e) { toast(e.message); }
       }))) });
 }
 function pressable(el, onTap, onHold) {
@@ -911,15 +924,18 @@ function renderSearchTab(sc) {
 }
 
 async function addToPlaylist(tracks) {
-  const pls = (await api('/api/playlists')).playlists;
+  let pls;
+  try { pls = (await api('/api/playlists')).playlists; } catch (e) { return toast(e.message); }
   const body = h('div', { class: 'list' },
     actionRow('plus', 'New playlist', async () => {
       s.close();
       const name = await prompt_('New playlist', 'Playlist name');
-      if (name) { await api('/api/playlists', { body: { name, tracks } }); toast(`Added to ${name}`); }
+      if (name) { try { await api('/api/playlists', { body: { name, tracks } }); toast(`Added to ${name}`); } catch (e) { toast(e.message); } }
     }, 'acc'),
     ...pls.map(p => actionRow(p.name === 'Liked Songs' ? 'heart' : 'music', p.name, async () => {
-      s.close(); await api('/api/playlists/' + p.id, { body: { add: tracks } }); toast(`Added to ${p.name}`);
+      s.close();
+      try { await api('/api/playlists/' + p.id, { body: { add: tracks } }); } catch (e) { return toast(e.message); }
+      toast(`Added to ${p.name}`);
       if (p.name === 'Liked Songs') tracks.forEach(t => S.liked.add(t.id));
     }, '', `${p.count} songs`)));
   const s = sheet({ title: 'Add to playlist', body });

@@ -30,6 +30,31 @@ def err(msg: str, code: int = 400):
     return JSONResponse({"error": msg}, status_code=code)
 
 
+def _vid(request: Request) -> str:
+    vid = request.path_params["vid"]
+    if not music.valid_id(vid):
+        raise Denied("Not found", 404)
+    return vid
+
+
+def _num(v, default: float = 0.0) -> float:
+    try:
+        f = float(v)
+        return f if f == f and abs(f) != float("inf") else default
+    except (TypeError, ValueError):
+        return default
+
+
+async def _json(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        raise Denied("Bad request", 400)
+    if not isinstance(body, dict):
+        raise Denied("Bad request", 400)
+    return body
+
+
 async def is_banned(chat_id: int, uid: int) -> bool:
     return bool(await db.q1("SELECT 1 FROM bans WHERE chat_id=? AND uid=?", (chat_id, uid)))
 
@@ -68,7 +93,10 @@ def guarded(need_admin: bool = False):
 
 # ---------------- auth ----------------
 async def api_auth(request: Request):
-    body = await request.json()
+    try:
+        body = await _json(request)
+    except Denied as d:
+        return err(d.msg, d.code)
     if config.DEV_MODE and body.get("dev"):
         uid = -abs(int(body.get("uid", 1)))
         user = {"id": uid, "first_name": body.get("name", f"Dev {abs(uid)}"), "username": f"dev{abs(uid)}"}
@@ -111,7 +139,7 @@ async def api_auth(request: Request):
         return err("The voice chat is locked by admins", 403)
     can_pub = st["admin"] or room.settings["new_can_speak"] or (uid in room.parts and room.can_speak(room.parts[uid]))
     out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"],
-           "group": await tg.chat_title(chat_id) if not config.DEV_MODE else "Dev Group",
+           "group": "Dev Group" if config.DEV_MODE and uid < 0 else await tg.chat_title(chat_id),
            "livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, name, can_pub)} if lk.enabled() else None}
     return JSONResponse(out)
 
@@ -154,7 +182,7 @@ async def api_stream(request: Request):
         return Response(d.msg, status_code=d.code)
     vid = request.path_params["vid"]
     kind = request.path_params["kind"]
-    if kind not in ("audio", "video") or len(vid) != 11:
+    if kind not in ("audio", "video") or not music.valid_id(vid):
         return Response(status_code=404)
     return await music.stream(request, vid, kind, request.query_params.get("c", "aac"),
                               request.query_params.get("q", "medium"))
@@ -197,8 +225,10 @@ async def emoji(request: Request):
             return Response(status_code=502)
         if r.status_code != 200:
             return Response(status_code=404, headers={"Cache-Control": "public, max-age=86400"})
-        with open(path, "wb") as fh:
+        tmp = f"{path}.{os.getpid()}.{id(r)}.tmp"
+        with open(tmp, "wb") as fh:
             fh.write(r.content)
+        os.replace(tmp, path)  # atomic, so parallel requests never serve a half-written file
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
@@ -207,20 +237,20 @@ async def api_thumb(request: Request):
         await session(request)
     except Denied as d:
         return Response(status_code=d.code)
-    return await music.thumb(request.path_params["vid"][:11])
+    return await music.thumb(request.path_params["vid"])
 
 
 @guarded()
 async def api_formats(request: Request, uid, chat_id, st):
-    info = await music.resolve(request.path_params["vid"][:11])
+    info = await music.resolve(_vid(request))
     return JSONResponse({"heights": music.video_heights(info)})
 
 
 @guarded()
 async def api_lyrics(request: Request, uid, chat_id, st):
     p = request.query_params
-    res = await music.lyrics(request.path_params["vid"][:11], p.get("title", ""), p.get("artist", ""),
-                             float(p.get("duration") or 0))
+    res = await music.lyrics(_vid(request), p.get("title", "")[:200], p.get("artist", "")[:120],
+                             _num(p.get("duration")))
     return JSONResponse(res)
 
 
@@ -247,7 +277,7 @@ async def api_browse_section(request: Request, uid, chat_id, st):
         rows = await db.q("SELECT vid, MAX(ts) AS ts FROM plays WHERE chat_id=? GROUP BY vid ORDER BY ts DESC LIMIT 30", (chat_id,))
         liked = await db.q("""SELECT i.track FROM playlist_items i JOIN playlists p ON p.id=i.playlist_id
                               WHERE p.uid=? AND p.name='Liked Songs' ORDER BY i.id DESC LIMIT 3""", (uid,))
-        seeds = [json.loads(l["track"])["id"] for l in liked][:1] + [r["vid"] for r in rows]
+        seeds = [json.loads(it["track"])["id"] for it in liked][:1] + [r["vid"] for r in rows]
         seeds = list(dict.fromkeys(seeds))
         if not seeds:
             return JSONResponse({"title": "For You", "tracks": (await music.collection("trending"))["tracks"][:20], "fallback": True})
@@ -267,21 +297,33 @@ async def _liked_id(uid: int) -> int:
     return r["id"] if r else await db.x("INSERT INTO playlists(uid,name,created) VALUES(?,?,?)", (uid, LIKED, time.time()))
 
 
-def _clean_track(t: dict) -> dict:
-    vid = str(t.get("id", ""))[:11]
+def _clean_track(t) -> dict | None:
+    if not isinstance(t, dict):
+        return None
+    vid = str(t.get("id", ""))
+    if not music.valid_id(vid):
+        return None
     return {"id": vid, "title": str(t.get("title", ""))[:200], "artist": str(t.get("artist", ""))[:120],
-            "duration": float(t.get("duration") or 0), "thumb": f"/api/thumb/{vid}"}
+            "duration": _num(t.get("duration")), "thumb": f"/api/thumb/{vid}"}
+
+
+async def _add_items(pid: int, tracks) -> None:
+    if not isinstance(tracks, list):
+        return
+    now = time.time()
+    await db.xmany("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)",
+                   [(pid, json.dumps(c), now) for t in tracks[:300] if (c := _clean_track(t))])
 
 
 @guarded()
 async def api_playlists(request: Request, uid, chat_id, st):
     if request.method == "POST":
-        body = await request.json()
+        body = await _json(request)
         name = str(body.get("name", "")).strip()[:60] or "My Playlist"
+        if name == LIKED:
+            name = "My Liked Songs"
         pid = await db.x("INSERT INTO playlists(uid,name,created) VALUES(?,?,?)", (uid, name, time.time()))
-        for t in (body.get("tracks") or [])[:300]:
-            await db.x("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)",
-                       (pid, json.dumps(_clean_track(t)), time.time()))
+        await _add_items(pid, body.get("tracks"))
         return JSONResponse({"id": pid})
     await _liked_id(uid)
     rows = await db.q("""SELECT p.id, p.name, COUNT(i.id) AS count,
@@ -307,14 +349,16 @@ async def api_playlist(request: Request, uid, chat_id, st):
         await db.x("DELETE FROM playlists WHERE id=?", (pid,))
         return JSONResponse({"ok": True})
     if request.method == "POST":
-        body = await request.json()
+        body = await _json(request)
         if "rename" in body:
-            await db.x("UPDATE playlists SET name=? WHERE id=?", (str(body["rename"])[:60], pid))
-        for t in (body.get("add") or [])[:300]:
-            await db.x("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)",
-                       (pid, json.dumps(_clean_track(t)), time.time()))
+            new = str(body["rename"]).strip()[:60]
+            # renaming Liked Songs (or to it) would break the likes list
+            if not new or pl["name"] == LIKED or new == LIKED:
+                return err("Can't use that name")
+            await db.x("UPDATE playlists SET name=? WHERE id=?", (new, pid))
+        await _add_items(pid, body.get("add"))
         if body.get("remove"):
-            await db.x("DELETE FROM playlist_items WHERE id=? AND playlist_id=?", (int(body["remove"]), pid))
+            await db.x("DELETE FROM playlist_items WHERE id=? AND playlist_id=?", (int(_num(body["remove"])), pid))
         return JSONResponse({"ok": True})
     items = await db.q("SELECT id, track FROM playlist_items WHERE playlist_id=? ORDER BY id", (pid,))
     return JSONResponse({"id": pid, "name": pl["name"],
@@ -325,22 +369,23 @@ async def api_playlist(request: Request, uid, chat_id, st):
 async def api_like(request: Request, uid, chat_id, st):
     lid = await _liked_id(uid)
     if request.method == "GET":
-        rows = await db.q("SELECT track FROM playlist_items WHERE playlist_id=?", (lid,))
-        return JSONResponse({"ids": [json.loads(r["track"])["id"] for r in rows]})
-    t = _clean_track((await request.json()).get("track") or {})
-    rows = await db.q("SELECT id, track FROM playlist_items WHERE playlist_id=?", (lid,))
-    for r in rows:
-        if json.loads(r["track"])["id"] == t["id"]:
-            await db.x("DELETE FROM playlist_items WHERE id=?", (r["id"],))
-            return JSONResponse({"liked": False})
+        rows = await db.q("SELECT json_extract(track,'$.id') AS vid FROM playlist_items WHERE playlist_id=?", (lid,))
+        return JSONResponse({"ids": [r["vid"] for r in rows if r["vid"]]})
+    t = _clean_track((await _json(request)).get("track"))
+    if not t:
+        return err("Bad track")
+    hit = await db.q1("SELECT id FROM playlist_items WHERE playlist_id=? AND json_extract(track,'$.id')=?", (lid, t["id"]))
+    if hit:
+        await db.x("DELETE FROM playlist_items WHERE playlist_id=? AND json_extract(track,'$.id')=?", (lid, t["id"]))
+        return JSONResponse({"liked": False})
     await db.x("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)", (lid, json.dumps(t), time.time()))
     return JSONResponse({"liked": True})
 
 
 # ---------------- admin: logs, reports, bans, schedules ----------------
 def _range(p) -> tuple[float, float]:
-    f = float(p.get("from") or 0)
-    t = float(p.get("to") or 0) or time.time() + 1
+    f = _num(p.get("from"))
+    t = _num(p.get("to")) or time.time() + 1
     return f, t
 
 
@@ -358,8 +403,8 @@ async def api_logs(request: Request, uid, chat_id, st):
     p = request.query_params
     f, t = _range(p)
     w, args = _who(p.get("q", ""))
-    lim = min(int(p.get("limit") or 50), 200)
-    off = int(p.get("offset") or 0)
+    lim = max(1, min(int(_num(p.get("limit"), 50) or 50), 200))
+    off = max(0, int(_num(p.get("offset"))))
     rows = await db.q(f"""SELECT s.id, s.uid, s.name, s.username, s.joined, COALESCE(s.left, s.last_seen) AS left,
         s.open, s.mic_secs FROM sessions s WHERE s.chat_id=? AND s.joined BETWEEN ? AND ? {w}
         ORDER BY s.joined DESC LIMIT ? OFFSET ?""", [chat_id, f, t, *args, lim, off])
@@ -401,8 +446,8 @@ async def api_logs_users(request: Request, uid, chat_id, st):
 @guarded(need_admin=True)
 async def api_reports(request: Request, uid, chat_id, st):
     if request.method == "POST":
-        body = await request.json()
-        await db.x("UPDATE reports SET resolved=1 WHERE id=? AND chat_id=?", (int(body.get("id", 0)), chat_id))
+        body = await _json(request)
+        await db.x("UPDATE reports SET resolved=1 WHERE id=? AND chat_id=?", (int(_num(body.get("id"))), chat_id))
         return JSONResponse({"ok": True})
     rows = await db.q("SELECT * FROM reports WHERE chat_id=? AND resolved=0 ORDER BY id DESC LIMIT 100", (chat_id,))
     bans = await db.q("SELECT * FROM bans WHERE chat_id=? ORDER BY ts DESC", (chat_id,))
@@ -410,16 +455,26 @@ async def api_reports(request: Request, uid, chat_id, st):
     return JSONResponse({"reports": rows, "bans": bans, "schedules": sch})
 
 
+REC_MAX = 50 * 1024 * 1024  # Telegram bots can't upload files bigger than 50 MB
+
+
 @guarded(need_admin=True)
 async def api_recording(request: Request, uid, chat_id, st):
-    form = await request.form(max_part_size=200 * 1024 * 1024)
+    if int(request.headers.get("content-length") or 0) > REC_MAX + 1024 * 1024:
+        return err("The recording is too big for Telegram (max 50 MB). Record shorter parts.", 413)
+    form = await request.form(max_part_size=REC_MAX + 1024 * 1024)
     f = form.get("file")
-    if not f:
+    if not f or isinstance(f, str):
         return err("No file")
     data = await f.read()
+    if len(data) > REC_MAX:
+        return err("The recording is too big for Telegram (max 50 MB). Record shorter parts.", 413)
+    ext = str(form.get("ext") or "webm")
+    if ext not in ("webm", "m4a", "ogg", "mp4"):
+        ext = "webm"
     room = ROOMS.get(chat_id)
-    title = room.settings["title"] if room else "Voice chat"
-    name = f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{form.get('ext', 'webm')}"
+    title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", room.settings["title"] if room else "Voice chat").strip() or "Voice chat"
+    name = f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{ext}"
     to = await tg.send_recording(uid, chat_id, data, name, f"🎙 Recording — {title}")
     if to is None:
         return err("Couldn't send the recording. Start the bot in private (/start) and try again.")
@@ -445,8 +500,8 @@ async def ws_endpoint(ws: WebSocket):
         return
     user = await db.q1("SELECT * FROM users WHERE uid=?", (uid,)) or {}
     conn = Conn(ws, uid)
-    await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
     try:
+        await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
         while True:
             raw = await ws.receive_text()
             t = time.time()
@@ -511,6 +566,10 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    for c in (music._http, tg._client, lk._client):
+        if c is not None:
+            await c.aclose()
 
 
 routes = [

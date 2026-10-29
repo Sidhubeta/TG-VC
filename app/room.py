@@ -23,6 +23,22 @@ def now() -> float:
     return time.time()
 
 
+_bg: set[asyncio.Task] = set()
+
+
+def spawn(coro) -> asyncio.Task:
+    """Fire-and-forget task that can't be garbage-collected mid-run and logs its errors."""
+    t = asyncio.create_task(coro)
+    _bg.add(t)
+
+    def done(task: asyncio.Task):
+        _bg.discard(task)
+        if not task.cancelled() and task.exception():
+            log.warning("background task failed: %r", task.exception())
+    t.add_done_callback(done)
+    return t
+
+
 class Participant:
     def __init__(self, uid: int, user: dict, admin: bool):
         self.uid = uid
@@ -85,6 +101,7 @@ class Room:
         self.autoplay = False
         self.votes: set[int] = set()
         self.recent: deque[str] = deque(maxlen=60)
+        self.history: deque[dict] = deque(maxlen=50)  # played tracks, for "previous"
         self._timer: asyncio.Task | None = None
         self._qid = 0
         self._lock = asyncio.Lock()
@@ -180,7 +197,7 @@ class Room:
             if p.flags:
                 await self.broadcast({"t": "alert", "uid": uid, "name": p.name, "flags": p.flags}, admins_only=True)
                 if "Joined during a join flood" in p.flags:
-                    asyncio.create_task(tg.alert_admins(self.chat_id, "flood",
+                    spawn(tg.alert_admins(self.chat_id, "flood",
                         f"⚠️ Many people are joining the voice chat at once ({len(self.parts)} now). Check the Safety tab."))
 
     async def leave(self, conn: Conn):
@@ -188,13 +205,16 @@ class Room:
         if not p:
             return
         p.conns.discard(conn)
-        if p.conns:
+        if p.conns or self.parts.get(conn.uid) is not p:
             return
-        self._mic_flush(p)
-        await db.x("UPDATE sessions SET left=?, last_seen=?, mic_secs=?, open=0 WHERE id=?",
-                   (now(), now(), p.mic_secs, p.session_id))
+        # Remove from the room before any await, so a quick rejoin creates a fresh participant
+        # instead of being dropped by this (late) leave.
         self.parts.pop(p.uid, None)
         self.votes.discard(p.uid)
+        self._mic_flush(p)
+        t = now()
+        await db.x("UPDATE sessions SET left=?, last_seen=?, mic_secs=?, open=0 WHERE id=?",
+                   (t, t, p.mic_secs, p.session_id))
         if self.rec["on"] and self.rec["by"] == p.uid:
             self.rec = {"on": False, "by": None, "since": 0}
         await self.broadcast({"t": "p.leave", "uid": p.uid})
@@ -227,12 +247,24 @@ class Room:
             p.flags.append("No username")
 
     async def heartbeat(self):
-        for p in list(self.parts.values()):
+        parts = list(self.parts.values())
+        if not parts:
+            return
+        t = now()
+        for p in parts:
             self._mic_flush(p)
-            await db.x("UPDATE sessions SET last_seen=?, mic_secs=? WHERE id=?", (now(), p.mic_secs, p.session_id))
+        await db.xmany("UPDATE sessions SET last_seen=?, mic_secs=? WHERE id=?",
+                       [(t, p.mic_secs, p.session_id) for p in parts])
         # people who left (or were removed from) the Telegram group lose access within a minute
-        for p in list(self.parts.values()):
-            st = await tg.member_status(self.chat_id, p.uid, fresh=True)
+        sem = asyncio.Semaphore(8)
+
+        async def check(p: Participant):
+            async with sem:
+                return p, await tg.member_status(self.chat_id, p.uid, fresh=True)
+
+        for p, st in await asyncio.gather(*(check(p) for p in parts)):
+            if self.parts.get(p.uid) is not p:
+                continue
             if not st["member"]:
                 await self.kick(p.uid, "You left the group, so you were removed from its voice chat.")
             elif st["admin"] != p.admin:
@@ -368,12 +400,13 @@ class Room:
         reason = str(msg.get("reason", ""))[:300]
         await db.x("INSERT INTO reports(chat_id,uid,name,by_uid,by_name,reason,ts) VALUES(?,?,?,?,?,?,?)",
                    (self.chat_id, target.uid, target.name, p.uid, p.name, reason, now()))
-        flag = f"Reported by {p.name}" + (f": {reason}" if reason else "")
+        flag = (f"Reported by {p.name}" + (f": {reason}" if reason else ""))[:120]
         if flag not in target.flags:
-            target.flags.append(flag[:120])
+            target.flags.append(flag)
+            del target.flags[:-10]  # keep the latest few
         await self.bcast_part(target)
         await self.broadcast({"t": "alert", "uid": target.uid, "name": target.name, "flags": [flag]}, admins_only=True)
-        asyncio.create_task(tg.alert_admins(self.chat_id, f"report:{target.uid}",
+        spawn(tg.alert_admins(self.chat_id, f"report:{target.uid}",
             f"🚩 <b>{tg._esc(p.name)}</b> reported <b>{tg._esc(target.name)}</b>" + (f": {tg._esc(reason)}" if reason else "")))
         await self.toast(p.uid, "Reported to admins")
 
@@ -384,7 +417,9 @@ class Room:
         return self.pos
 
     def _cancel_timer(self):
-        if self._timer and not self._timer.done():
+        # Never cancel the task we are running in: when the end-of-track timer itself starts the next
+        # song, cancelling it would abort the rest of _start() and the new state would reach only some people.
+        if self._timer and not self._timer.done() and self._timer is not asyncio.current_task():
             self._timer.cancel()
         self._timer = None
 
@@ -404,7 +439,7 @@ class Room:
                 if self.current and self.current["qid"] == qid and self.status == "playing":
                     await self._next(auto=True)
 
-        self._timer = asyncio.create_task(fire())
+        self._timer = spawn(fire())
 
     def _item(self, t: dict, p: Participant | None, by: str | None = None) -> dict | None:
         vid = str(t.get("id", ""))
@@ -415,7 +450,10 @@ class Room:
                 "artist": str(t.get("artist", ""))[:120], "duration": float(t.get("duration") or 0),
                 "thumb": f"/api/thumb/{vid}", "by": by or (p.name if p else ""), "byUid": p.uid if p else 0}
 
-    async def _start(self, item: dict | None):
+    async def _start(self, item: dict | None, from_prev: bool = False):
+        cur = self.current
+        if cur and not from_prev and (not item or item["id"] != cur["id"]):
+            self.history.append(cur)
         self.current = item
         self.votes.clear()
         self.pos = 0.0
@@ -423,14 +461,14 @@ class Room:
         if item:
             self.status = "playing"
             self.recent.append(item["id"])
-            asyncio.create_task(music.prefetch(item["id"]))
+            spawn(music.prefetch(item["id"]))
             if self.queue:
-                asyncio.create_task(music.prefetch(self.queue[0]["id"]))
+                spawn(music.prefetch(self.queue[0]["id"]))
             await db.x("INSERT INTO plays(chat_id,vid,title,artist,duration,by_uid,by_name,ts) VALUES(?,?,?,?,?,?,?,?)",
                        (self.chat_id, item["id"], item["title"], item["artist"], item["duration"], item["byUid"],
                         item["by"], now()))
             if not item["duration"]:
-                asyncio.create_task(self._fill_duration(item))
+                spawn(self._fill_duration(item))
         else:
             self.status = "stopped"
         self._arm_timer()
@@ -458,7 +496,7 @@ class Room:
             return await self._start(self.queue.pop(0))
         if self.autoplay and cur:
             await self._start(None)
-            asyncio.create_task(self._autoplay_fill(cur["id"]))
+            spawn(self._autoplay_fill(cur["id"]))
             return
         await self._start(None)
 
@@ -469,7 +507,9 @@ class Room:
             log.info("autoplay failed: %s", e)
             return
         rel = [r for r in rel if r["id"] not in self.recent and (not r["duration"] or r["duration"] < 900)]
-        random.shuffle(rel[:8])
+        top = rel[:8]
+        random.shuffle(top)  # (shuffling a slice in place would shuffle a throwaway copy)
+        rel = top + rel[8:]
         async with self._lock:
             if not self.autoplay or self.current:
                 return
@@ -500,7 +540,7 @@ class Room:
                 await self._start(self.queue.pop(0))
             else:
                 await self.push_music()
-                asyncio.create_task(music.prefetch(self.queue[0]["id"]))
+                spawn(music.prefetch(self.queue[0]["id"]))
             await self.toast(p.uid, f"Added {len(items)} songs" if len(items) > 1 else f"Added: {items[0]['title']}")
             return
         if cmd == "voteskip":
@@ -549,16 +589,17 @@ class Room:
                 self.pos, self.upd = 0.0, now()
                 self._arm_timer()
                 await self.push_music()
-            else:
-                rows = await db.q("SELECT * FROM plays WHERE chat_id=? ORDER BY id DESC LIMIT 2", (self.chat_id,))
-                if len(rows) == 2:
-                    r = rows[1]
+            elif self.history:
+                # walk back through what was played (the old version re-read the plays table and just
+                # bounced between the last two songs)
+                last = self.history.pop()
+                it = self._item(last, None, by=last.get("by"))
+                if it:
+                    it["byUid"] = last.get("byUid", 0)
                     if self.current:
                         self._qid += 1
                         self.queue.insert(0, {**self.current, "qid": self._qid})
-                    it = self._item({"id": r["vid"], "title": r["title"], "artist": r["artist"],
-                                     "duration": r["duration"]}, p)
-                    await self._start(it)
+                    await self._start(it, from_prev=True)
         elif cmd == "stop":
             self.queue.clear()
             await self._start(None)
@@ -591,7 +632,7 @@ class Room:
             if self.autoplay and not self.current and not self.queue:
                 last = self.recent[-1] if self.recent else None
                 if last:
-                    asyncio.create_task(self._autoplay_fill(last))
+                    spawn(self._autoplay_fill(last))
         elif cmd == "ended":
             # client hint for tracks with unknown duration
             if self.current and self.current["qid"] == msg.get("qid") and not self.current.get("duration"):
@@ -616,7 +657,8 @@ class Room:
             return await self.toast(p.uid, "Can't do that to another admin")
         if t == "admin.mute":
             target.force_muted = True
-            await self.set_mic(target, False) if target.mic else None
+            if target.mic:
+                await self.set_mic(target, False)
             await lk.set_publish(self.chat_id, target.uid, False)
             await self.bcast_part(target)
             await self.toast(target.uid, "An admin muted you")
@@ -639,7 +681,11 @@ class Room:
             await self.toast(target.uid, "You can speak now — tap the mic" if role == "speaker" else "You are now a listener")
         elif t in ("admin.kick", "admin.ban"):
             uid = target.uid if target else int(msg.get("uid", 0))
-            name = target.name if target else str(msg.get("name", ""))
+            name = target.name if target else str(msg.get("name", ""))[:64]
+            if not uid or uid == p.uid:
+                return
+            if not target and (await tg.member_status(self.chat_id, uid))["admin"]:
+                return await self.toast(p.uid, "Can't do that to another admin")
             if t == "admin.ban":
                 await db.x("INSERT OR REPLACE INTO bans(chat_id,uid,name,by_uid,ts) VALUES(?,?,?,?,?)",
                            (self.chat_id, uid, name, p.uid, now()))
@@ -715,12 +761,20 @@ async def get_room(chat_id: int) -> Room:
     if r:
         return r
     g = await db.get_group(chat_id)
-    r = ROOMS.setdefault(chat_id, Room(chat_id, g))
     rows = await db.q("SELECT * FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 60", (chat_id,))
+    plays = await db.q("SELECT vid, title, artist, duration, by_uid, by_name FROM plays WHERE chat_id=? "
+                       "ORDER BY id DESC LIMIT 20", (chat_id,))
+    if chat_id in ROOMS:  # another request built it while we were reading the database
+        return ROOMS[chat_id]
+    r = Room(chat_id, g)
     for m in reversed(rows):
         r.chat.append({"id": m["id"], "uid": m["uid"], "name": m["name"], "photo": f"/api/avatar/{m['uid']}", "text": m["text"],
                        "reply": json.loads(m["reply"]) if m["reply"] else None,
                        "reactions": json.loads(m["reactions"] or "{}"), "ts": m["ts"]})
+    for pl in reversed(plays):
+        r.history.append({"id": pl["vid"], "title": pl["title"] or "", "artist": pl["artist"] or "",
+                          "duration": pl["duration"] or 0, "by": pl["by_name"] or "", "byUid": pl["by_uid"] or 0})
+    ROOMS[chat_id] = r
     return r
 
 

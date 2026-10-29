@@ -5,7 +5,9 @@ The photo shows up to 3 participants' profile pictures, so the small thumbnail i
 bar looks like Telegram's own voice chat bar.
 """
 import asyncio
+import functools
 import io
+import json
 import logging
 import os
 import time
@@ -24,6 +26,7 @@ _edit_lock: dict[int, asyncio.Lock] = {}
 FONT_DIRS = ["/usr/share/fonts/opentype/inter", "/usr/share/fonts/truetype/inter", "/usr/share/fonts/truetype/dejavu"]
 
 
+@functools.lru_cache(maxsize=16)
 def _font(size: int, bold: bool = True):
     names = (["Inter-Bold.otf", "Inter-SemiBold.otf", "InterDisplay-Bold.otf"] if bold else ["Inter-Medium.otf", "Inter-Regular.otf"]) + \
             (["DejaVuSans-Bold.ttf"] if bold else ["DejaVuSans.ttf"])
@@ -77,28 +80,54 @@ def _mic_icon(size: int) -> Image.Image:
     return im
 
 
-async def render(chat_id: int, people: list[dict], count: int, sub: str) -> bytes:
-    """people: up to 3 dicts with uid, name. Returns JPEG bytes."""
+@functools.lru_cache(maxsize=2)
+def _background(live: bool) -> Image.Image:
+    """Gradient + blurred glow. Same for every render, so it is built once (the blur is the slow part)."""
     bg = Image.new("RGB", (W, H), (18, 24, 31))
     d = ImageDraw.Draw(bg)
     for y in range(H):  # soft blue glow from the top
         k = y / H
         d.line([(0, y), (W, y)], fill=(int(30 - 12 * k), int(52 - 28 * k), int(84 - 53 * k)))
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([W / 2 - 330, 40, W / 2 + 330, 520], fill=(77, 162, 241, 70) if count else (77, 162, 241, 35))
-    bg = Image.alpha_composite(bg.convert("RGBA"), glow.filter(ImageFilter.GaussianBlur(90)))
+    ImageDraw.Draw(glow).ellipse([W / 2 - 330, 40, W / 2 + 330, 520], fill=(77, 162, 241, 70) if live else (77, 162, 241, 35))
+    return Image.alpha_composite(bg.convert("RGBA"), glow.filter(ImageFilter.GaussianBlur(90)))
 
+
+async def render(chat_id: int, people: list[dict], count: int, sub: str) -> bytes:
+    """people: up to 3 dicts with uid, name. Returns JPEG bytes."""
+    paths = []
+    for p in people[:3]:
+        try:
+            path = await tg.avatar_path(p["uid"], p.get("photo_url") or "") if (p["uid"] > 0 or p.get("group")) else None
+        except Exception:
+            path = None
+        if config.DEV_MODE and not path:
+            dev = os.path.join(tg.AV_DIR, f"{p['uid']}.jpg")
+            path = dev if os.path.exists(dev) else None
+        paths.append(path)
+    # Pillow work is CPU-bound: run it off the event loop so voice/chat never stall while the image is drawn.
+    return await asyncio.to_thread(_render_sync, people[:3], paths, count, sub)
+
+
+def _avatar_src(path: str | None, p: dict, size: int) -> Image.Image:
+    if path:
+        try:
+            with Image.open(path) as im:
+                im.load()
+                return im.copy()
+        except Exception:
+            pass
+    return _initial_avatar(p.get("name", ""), p["uid"], size)
+
+
+def _render_sync(people: list[dict], paths: list, count: int, sub: str) -> bytes:
+    bg = _background(bool(count)).copy()
     size, ring = 210, 12
     cy = 250
     if people:
         tiles = []
-        for p in people[:3]:
-            path = await tg.avatar_path(p["uid"], p.get("photo_url") or "") if p["uid"] > 0 else None
-            if config.DEV_MODE and not path:
-                dev = os.path.join(tg.AV_DIR, f"{p['uid']}.jpg")
-                path = dev if os.path.exists(dev) else None
-            src = Image.open(path) if path else _initial_avatar(p.get("name", ""), p["uid"], size)
-            tiles.append(_circle(src, size, ring, (18, 24, 31, 255)))
+        for p, path in zip(people, paths):
+            tiles.append(_circle(_avatar_src(path, p, size), size, ring, (18, 24, 31, 255)))
         step = int(size * 0.68)
         total = size + ring * 2 + step * (len(tiles) - 1)
         x0 = (W - total) // 2
@@ -134,7 +163,7 @@ async def _state(chat_id: int) -> tuple[list[dict], int, str]:
     people = []
     for p in parts[:3]:
         if p.as_group:
-            people.append({"uid": chat_id, "name": r.group_title})
+            people.append({"uid": chat_id, "name": r.group_title, "group": True})
         else:
             u = await db.q1("SELECT photo FROM users WHERE uid=?", (p.uid,))
             people.append({"uid": p.uid, "name": p.name, "photo_url": (u or {}).get("photo", "")})
@@ -172,7 +201,7 @@ async def post(chat_id: int, thread_id: int | None = None, repin_only: bool = Fa
     people, n, sub = await _state(chat_id)
     img = await render(chat_id, people, n, sub)
     data = {"chat_id": str(chat_id), "caption": caption_for(n, sub), "parse_mode": "HTML",
-            "disable_notification": "true", "reply_markup": __import__("json").dumps(await _keyboard(chat_id))}
+            "disable_notification": "true", "reply_markup": json.dumps(await _keyboard(chat_id))}
     if thread_id:
         data["message_thread_id"] = str(thread_id)
     msg = await tg.call_multipart("sendPhoto", data, {"photo": ("voicechat.jpg", img, "image/jpeg")})
@@ -198,7 +227,6 @@ async def refresh(chat_id: int, force: bool = False):
     lock = _edit_lock.setdefault(chat_id, asyncio.Lock())
     async with lock:
         img = await render(chat_id, people, n, sub)
-        import json
         media = {"type": "photo", "media": "attach://photo", "caption": caption_for(n, sub), "parse_mode": "HTML"}
         try:
             await tg.call_multipart("editMessageMedia", {"chat_id": str(chat_id), "message_id": str(mid), "media": json.dumps(media),
@@ -247,5 +275,9 @@ async def countdown_loop():
     """Keep 'Starts in …' fresh for scheduled chats."""
     while True:
         await asyncio.sleep(60)
-        for g in await db.q("SELECT DISTINCT s.chat_id FROM schedules s JOIN groups g ON g.chat_id=s.chat_id WHERE s.sent=0 AND g.pin_msg IS NOT NULL"):
-            schedule(g["chat_id"], 0)
+        try:
+            for g in await db.q("SELECT DISTINCT s.chat_id FROM schedules s JOIN groups g ON g.chat_id=s.chat_id "
+                                "WHERE s.sent=0 AND g.pin_msg IS NOT NULL"):
+                schedule(g["chat_id"], 0)
+        except Exception:
+            log.exception("countdown loop")

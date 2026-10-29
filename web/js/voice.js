@@ -25,6 +25,8 @@ async function connect() {
   if (connecting) return;
   connecting = true;
   emit('voice', { state: 'connecting' });
+  const old = room; room = null;
+  if (old) { try { await old.disconnect(); } catch {} old.removeAllListeners?.(); }
   try {
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
@@ -42,13 +44,29 @@ async function connect() {
     V.ready = false;
     emit('voice', { state: 'error' });
     toast('Voice connection failed — retrying…');
-    setTimeout(retry, 4000);
+    scheduleRetry(4000);
   } finally { connecting = false; }
 }
 
+let retryTimer = null, stopped = false;
+function scheduleRetry(ms) {
+  if (stopped) return;
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(retry, ms);
+}
 async function retry() {
+  if (stopped) return;
   try { const r = await api('/api/lk'); info = r.livekit; } catch {}
   if (info) connect();
+}
+function resetLocal() {
+  // after a drop nothing is published any more: tell the room our mic/camera are off
+  const was = V.mic || V.cam || V.screen;
+  if (V.mic) send({ t: 'mic', on: false });
+  if (V.cam) send({ t: 'video', on: false });
+  if (V.screen) send({ t: 'screen', on: false });
+  V.mic = V.cam = V.screen = false;
+  if (was) emit('voice:local');
 }
 
 function wire(r) {
@@ -91,18 +109,43 @@ function wire(r) {
     }
   });
   r.on(E.Disconnected, (reason) => {
+    if (r !== room) return; // an old room we already replaced
     V.ready = false;
+    resetLocal();
+    const R = LK.DisconnectReason || {};
+    if (reason === R.CLIENT_INITIATED) return;
+    if (reason === R.PARTICIPANT_REMOVED || reason === R.DUPLICATE_IDENTITY) {
+      // removed by an admin, or this account joined from another device: don't fight it
+      emit('voice', { state: 'off' });
+      if (reason === R.DUPLICATE_IDENTITY) toast('You joined the voice chat on another device');
+      return;
+    }
     emit('voice', { state: 'connecting' });
-    if (reason !== LK.DisconnectReason?.CLIENT_INITIATED && reason !== LK.DisconnectReason?.PARTICIPANT_REMOVED) setTimeout(retry, 1500);
-    else if (reason === LK.DisconnectReason?.PARTICIPANT_REMOVED) emit('voice', { state: 'off' });
+    scheduleRetry(1500);
   });
-  // audio levels for speaking rings (animated)
-  const tick = () => {
-    if (!room) return;
-    const all = [room.localParticipant, ...room.remoteParticipants.values()];
-    for (const p of all) V.levels.set(Number(p.identity), p.isSpeaking ? p.audioLevel : 0);
-    emit('voice:levels', V.levels);
+  startLevels();
+}
+
+// audio levels for speaking rings. One loop for the whole page (it used to start a new one on every
+// reconnect), ~20 fps and only emitting when something changed, so idle rooms cost nothing.
+let levelsOn = false, lastTick = 0, lastSum = -1;
+function startLevels() {
+  if (levelsOn) return;
+  levelsOn = true;
+  const tick = (t) => {
     requestAnimationFrame(tick);
+    if (!room || t - lastTick < 50 || document.hidden) return;
+    lastTick = t;
+    let sum = 0;
+    const seen = new Set();
+    for (const p of [room.localParticipant, ...room.remoteParticipants.values()]) {
+      const uid = Number(p.identity), l = p.isSpeaking ? p.audioLevel : 0;
+      seen.add(uid); V.levels.set(uid, l); sum += l;
+    }
+    for (const uid of V.levels.keys()) if (!seen.has(uid)) V.levels.delete(uid);
+    if (sum === 0 && lastSum === 0) return;
+    lastSum = sum;
+    emit('voice:levels', V.levels);
   };
   requestAnimationFrame(tick);
 }
@@ -171,7 +214,11 @@ export function toggleMuteForMe(uid) {
   return mutedForMe.has(uid);
 }
 
-export async function leaveVoice() { try { await room?.disconnect(); } catch {} room = null; V.ready = false; }
+export async function leaveVoice() {
+  stopped = true; clearTimeout(retryTimer);
+  const r = room; room = null; V.ready = false;
+  try { await r?.disconnect(); } catch {}
+}
 
 // for the recorder
 export function audioTracks() {

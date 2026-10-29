@@ -36,15 +36,19 @@ CREATE TABLE IF NOT EXISTS plays(
 CREATE INDEX IF NOT EXISTS ix_plays_chat ON plays(chat_id, ts);
 CREATE TABLE IF NOT EXISTS playlists(
   id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, name TEXT, created REAL);
+CREATE INDEX IF NOT EXISTS ix_pl_uid ON playlists(uid);
 CREATE TABLE IF NOT EXISTS playlist_items(
   id INTEGER PRIMARY KEY AUTOINCREMENT, playlist_id INTEGER, track TEXT, added REAL);
+CREATE INDEX IF NOT EXISTS ix_pli_pl ON playlist_items(playlist_id, id);
 CREATE TABLE IF NOT EXISTS bans(
   chat_id INTEGER, uid INTEGER, name TEXT, by_uid INTEGER, ts REAL, PRIMARY KEY(chat_id, uid));
 CREATE TABLE IF NOT EXISTS reports(
   id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, uid INTEGER, name TEXT,
   by_uid INTEGER, by_name TEXT, reason TEXT, ts REAL, resolved INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_rep_chat ON reports(chat_id, resolved);
 CREATE TABLE IF NOT EXISTS schedules(
   id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, title TEXT, at REAL, by_uid INTEGER, sent INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_sched ON schedules(sent, at);
 """
 _conn.executescript(SCHEMA)
 for _sql in ("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''",
@@ -54,12 +58,6 @@ for _sql in ("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''",
         _conn.execute(_sql)
     except sqlite3.OperationalError:
         pass
-
-
-def _run(sql, args=(), many=False):
-    with _lock:
-        cur = _conn.executemany(sql, args) if many else _conn.execute(sql, args)
-        return cur
 
 
 def q_sync(sql, args=()):
@@ -84,6 +82,24 @@ def x_sync(sql, args=()):
 
 async def x(sql, args=()):
     return await asyncio.to_thread(x_sync, sql, args)
+
+
+def xmany_sync(sql, rows):
+    with _lock:
+        _conn.execute("BEGIN")
+        try:
+            _conn.executemany(sql, rows)
+            _conn.execute("COMMIT")
+        except Exception:
+            _conn.execute("ROLLBACK")
+            raise
+
+
+async def xmany(sql, rows):
+    """Many writes in one transaction and one thread hop (much faster than a loop of x())."""
+    rows = list(rows)
+    if rows:
+        await asyncio.to_thread(xmany_sync, sql, rows)
 
 
 # --- helpers -------------------------------------------------------------

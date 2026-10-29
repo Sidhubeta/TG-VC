@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import logging
 import os
 import re
@@ -200,8 +201,12 @@ async def api_avatar(request: Request):
         eid = int(request.path_params["eid"])
     except ValueError:
         return Response(status_code=404)
-    # only people/groups relevant to this room
-    if eid != chat_id and not await db.q1("SELECT 1 FROM sessions WHERE chat_id=? AND uid=? LIMIT 1", (chat_id, eid)):
+    # only people/groups relevant to this room: the group, people who joined its voice chat, members the bot
+    # has seen in the group, and its admins (the invite list shows all of these)
+    if eid != chat_id and not (
+            await db.q1("SELECT 1 FROM sessions WHERE chat_id=? AND uid=? LIMIT 1", (chat_id, eid))
+            or await db.q1("SELECT 1 FROM members WHERE chat_id=? AND uid=?", (chat_id, eid))
+            or any(a["uid"] == eid and not a["anonymous"] for a in await tg.admin_list(chat_id))):
         return Response(status_code=404)
     u = await db.q1("SELECT photo FROM users WHERE uid=?", (eid,)) if eid > 0 else None
     path = await tg.avatar_path(eid, (u or {}).get("photo") or "")
@@ -277,14 +282,22 @@ async def api_browse(request: Request, uid, chat_id, st):
 async def api_browse_section(request: Request, uid, chat_id, st):
     sec = request.path_params["sec"]
     if sec == "foryou":
-        rows = await db.q("SELECT vid, MAX(ts) AS ts FROM plays WHERE chat_id=? GROUP BY vid ORDER BY ts DESC LIMIT 30", (chat_id,))
+        # built from what *this person* listens to and likes (not just what the room played)
+        mine = await db.q("""SELECT vid, COUNT(*) AS n, MAX(ts) AS last FROM listens WHERE uid=? AND ts > ?
+                             GROUP BY vid ORDER BY n DESC, last DESC LIMIT 20""", (uid, time.time() - 30 * 86400))
+        recent = await db.q("SELECT vid FROM listens WHERE uid=? ORDER BY id DESC LIMIT 15", (uid,))
         liked = await db.q("""SELECT i.track FROM playlist_items i JOIN playlists p ON p.id=i.playlist_id
-                              WHERE p.uid=? AND p.name='Liked Songs' ORDER BY i.id DESC LIMIT 3""", (uid,))
-        seeds = [json.loads(it["track"])["id"] for it in liked][:1] + [r["vid"] for r in rows]
-        seeds = list(dict.fromkeys(seeds))
+                              WHERE p.uid=? AND p.name='Liked Songs' ORDER BY i.id DESC LIMIT 10""", (uid,))
+        liked_ids = [json.loads(it["track"])["id"] for it in liked]
+        seeds = [r["vid"] for r in mine[:2]] + random.sample(liked_ids, min(1, len(liked_ids)))
+        if len(seeds) < 3:  # new listener: fall back to what the room plays
+            rows = await db.q("SELECT vid, MAX(ts) AS ts FROM plays WHERE chat_id=? GROUP BY vid ORDER BY ts DESC LIMIT 5", (chat_id,))
+            seeds += [r["vid"] for r in rows]
+        seeds = list(dict.fromkeys(seeds))[:3]
         if not seeds:
-            return JSONResponse({"title": "For You", "tracks": (await music.collection("trending"))["tracks"][:20], "fallback": True})
-        return JSONResponse({"title": "For You", "tracks": await music.recommend(seeds, {r["vid"] for r in rows[:10]})})
+            return JSONResponse({"title": "Made for you", "tracks": (await music.collection("trending"))["tracks"][:20], "fallback": True})
+        exclude = {r["vid"] for r in recent} | set(liked_ids[:5])
+        return JSONResponse({"title": "Made for you", "tracks": await music.recommend(seeds, exclude), "personal": bool(mine or liked_ids)})
     try:
         return JSONResponse(await music.collection(sec))
     except KeyError:
@@ -543,7 +556,7 @@ async def api_invite(request: Request, uid, chat_id, st):
             _invite_last.pop(k, None)
     me = room.parts.get(uid)
     by = room.group_title if me and me.as_group else (me.name if me else "Someone")
-    via = await tg.invite(chat_id, target, person["name"], by)
+    via = await tg.invite(chat_id, target, person["name"], by, len(room.parts))
     if not via:
         _invite_last.pop(("to", chat_id, target), None)
         return err("Couldn't send the invite")

@@ -3,7 +3,8 @@ import { getMusicVolume, openNP, openSearch, pip, pipSupported, prompt_, refresh
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
-  screenSupported, setCam, setMic, setNoise, setRoomVolume, setScreen, setVolume, startVoice, toggleMuteForMe, unblockAudio, useDevice,
+  allowDeviceList, noiseStatus, screenSupported, setCam, setMic, setNoise, setRoomVolume, setScreen, setVolume, startVoice, toggleMuteForMe,
+  unblockAudio, useDevice,
 } from './voice.js';
 import { recorder } from './recorder.js';
 import { startEmoji } from './emoji.js';
@@ -83,7 +84,6 @@ on('ws:init', (m) => {
     started = true;
     startVoice(S.lk);
     bindDock();
-    bindChatbar();
   }
   renderHeader(); renderGrid(true); renderDock();
 });
@@ -102,11 +102,10 @@ function renderHeader() {
   $('#r-rec').hidden = !S.room.rec?.on;
   $('#r-lock').hidden = !s.locked;
   const d = $('#r-desc'); d.hidden = !s.description; d.textContent = s.description || '';
-  $('#b-admin').querySelector('use').setAttribute('href', S.admin ? '#i-shield' : '#i-more');
 }
 on('ws:room', (m) => { S.room = m.room; renderHeader(); renderDock(); refreshMusic(); emit('room:changed'); });
 $('#b-search').onclick = () => openSearch('home');
-$('#b-admin').onclick = () => (S.admin ? openAdmin() : openMore());
+$('#b-admin').onclick = () => openMore();
 
 // ======================= participants =======================
 const tiles = new Map();
@@ -118,6 +117,7 @@ function sortParts() {
 }
 function statusOf(p) {
   if (V.speaking.has(p.uid) && p.mic) return ['speaking', 'speaking'];
+  if (netOf(p.uid) === 'poor' || netOf(p.uid) === 'lost') return ['weak internet — may lag', 'warn'];
   if (p.hand) return ['wants to speak', 'blue'];
   if (p.forceMuted) return ['muted by admin', 'red'];
   if (isMutedForMe(p.uid)) return ['muted for you', 'red'];
@@ -129,14 +129,22 @@ function tileFor(p) {
   let t = tiles.get(p.uid);
   if (!t) {
     t = h('button', { class: 'prow', onclick: () => openParticipant(p.uid) });
+    t._new = true;
     tiles.set(p.uid, t);
   }
   const live = p.mic && p.canSpeak;
   const speaking = V.speaking.has(p.uid) && p.mic;
-  t.className = 'prow' + (live ? ' live' : '') + (p.forceMuted ? ' forced' : '') + (speaking ? ' speaking' : '');
+  const net = netOf(p.uid);
+  const weak = net === 'poor' || net === 'lost';
+  t.className = 'prow' + (t._new ? ' new' : '') + (live ? ' live' : '') + (p.forceMuted ? ' forced' : '') + (speaking ? ' speaking' : '');
+  t._new = false;
   const key = `${p.name}|${p.photo}`;
   if (t._key !== key) { t._key = key; t._av = avatarEl(p); }
   const [st, cls] = statusOf(p);
+  // rebuilding a row costs layout + emoji scanning; only do it when something visible changed
+  const sig = [st, cls, live, p.hand, p.admin, p.asGroup, p.flags?.length, S.admin, t._key, weak].join('|');
+  if (t._sig === sig) return t;
+  t._sig = sig;
   t.replaceChildren(
     h('div', { class: 'pav' }, h('span', { class: 'wave' }), h('span', { class: 'wave w2' }), t._av, p.hand ? h('span', { class: 'hand' }, '✋') : null),
     h('div', { class: 'pmeta' },
@@ -144,6 +152,7 @@ function tileFor(p) {
         p.admin && !p.asGroup ? h('span', { class: 'tag' }, 'admin') : null,
         S.admin && p.flags?.length ? h('span', { class: 'tag warn', title: p.flags.join('\n') }, 'check') : null),
       h('div', { class: 'psub ' + cls }, st)),
+    weak ? h('span', { class: 'pnet', title: 'Weak internet' }, icon('signal')) : null,
     h('span', { class: 'pmic' }, icon(live ? 'mic' : 'mic-off')));
   t.setAttribute('aria-label', `${p.name}, ${st}`);
   return t;
@@ -180,12 +189,28 @@ on('ws:p.upd', (m) => {
 on('ws:hand', (m) => { if (S.admin && m.uid !== S.uid) toast(`✋ ${m.name} wants to speak`); });
 on('ws:alert', (m) => { if (S.admin) { toast(`⚠️ ${m.name}: ${m.flags[0]}`, 4000); bumpAdminBadge(); } });
 on('voice:speaking', () => { for (const p of S.parts.values()) tileFor(p); renderDock(); });
+const lastLvl = new Map();
+const setLvl = (key, el, v) => { if (lastLvl.get(key) !== v) { lastLvl.set(key, v); el.style.setProperty('--lvl', v); } };
 on('voice:levels', (lv) => {
   for (const [uid, l] of lv) {
-    const t = tiles.get(uid); if (t) t.style.setProperty('--lvl', Math.min(1, l * 2.2).toFixed(3));
+    const t = tiles.get(uid); if (t) setLvl(uid, t, Math.min(1, l * 2.2).toFixed(2));
   }
-  const me = lv.get(S.uid) || 0;
-  $('#b-mic').style.setProperty('--lvl', Math.min(1, me * 2.4).toFixed(3));
+  setLvl('me', $('#b-mic'), Math.min(1, (lv.get(S.uid) || 0) * 2.4).toFixed(2));
+});
+
+// ---- connection quality: everyone sees who has weak internet; you get a banner for your own ----
+const net = new Map();
+const netOf = (uid) => net.get(uid);
+on('voice:quality', ({ uid, q }) => {
+  const was = net.get(uid);
+  net.set(uid, q);
+  const p = S.parts.get(uid); if (p) tileFor(p);
+  if (uid === S.uid) {
+    const w = $('#net-warn'), bad = q === 'poor' || q === 'lost';
+    w.hidden = !bad;
+    if (bad) w.textContent = q === 'lost' ? '📶 Your internet dropped — reconnecting…' : '📶 Your internet is weak, so voice and music may lag';
+    if (bad && was !== q) haptic('warning');
+  }
 });
 
 // participant action sheet
@@ -264,6 +289,9 @@ function renderDock() {
   else if (p.forceMuted) { mic.classList.add('forced'); text = 'Muted by admin'; }
   else if (!p.canSpeak) { mic.classList.add('hand'); if (p.hand) mic.classList.add('raised'); ic = 'hand'; text = p.hand ? 'Hand raised' : 'Raise hand'; }
   else if (V.mic) { mic.classList.add('on'); ic = 'mic'; text = 'You’re Live'; }
+  const sig = mic.className + ic + text + V.cam;
+  if (mic._sig === sig) return; // called on every speaker change: don't rebuild (it restarted the animation)
+  mic._sig = sig;
   mic.replaceChildren(h('span', { class: 'b2' }), h('span', { class: 'b1' }), h('span', { class: 'blob' }), icon(ic));
   lbl.textContent = text;
   mic.setAttribute('aria-label', text);
@@ -286,7 +314,7 @@ function bindDock() {
   };
   $('#b-cam').onclick = openCamera;
   $('#b-speaker').onclick = openAudio;
-  $('#b-more').onclick = openMore;
+  $('#b-chat').onclick = openChat;
   $('#b-leave').onclick = async () => {
     if (!(await confirmBox('Leave the voice chat?', 'Leave', true))) return;
     if (V.mic) await setMic(false);
@@ -312,13 +340,24 @@ function openCamera() {
   const s = sheet({ title: V.cam ? 'Camera' : 'Turn on camera', body });
 }
 
-// ---- audio: speaker / Bluetooth, mic, volumes, noise isolation ----
-const isBt = (label) => /bluetooth|airpods|buds|headset|hands-?free|\bbt\b/i.test(label);
-function devLabel(d, i, kind) {
-  if (d.deviceId === 'default') return kind === 'audioinput' ? 'Phone default' : 'Phone default';
-  if (d.deviceId === 'communications') return 'Call device';
-  return d.label || (kind === 'audioinput' ? `Microphone ${i + 1}` : `Speaker ${i + 1}`);
+// ---- audio: where the sound plays (speaker / ear speaker / Bluetooth / earphones), volumes, noise isolation ----
+// On Android, Chrome lists the phone's call routes as microphones ("Speakerphone", "Headset earpiece",
+// "Bluetooth headset", "Wired headset"…). Picking one switches the whole call to that route, like the
+// speaker button in a normal call. iPhones don't expose this to apps in Telegram: there, Control Center does it.
+const ROUTES = [
+  [/speakerphone|speaker phone|loudspeaker/i, 'Phone speaker', 'Handsfree, loud', 'speaker'],
+  [/earpiece|receiver|ear speaker/i, 'Ear speaker', 'Hold the phone to your ear', 'phone'],
+  [/bluetooth|airpods|buds|\bbt\b/i, 'Bluetooth', null, 'bt'],
+  [/usb/i, 'USB headset', null, 'headphones'],
+  [/wired|headphone|headset|earphone/i, 'Earphones', 'Wired earphones / headset', 'headphones'],
+];
+function routeOf(d) {
+  if (d.deviceId === 'default') return ['Automatic', 'Phone picks the best one', 'sparkle'];
+  if (d.deviceId === 'communications') return null;
+  for (const [re, name, sub, ic] of ROUTES) if (re.test(d.label)) return [name, sub, ic];
+  return null;
 }
+const isApplePhone = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && 'ontouchend' in document);
 function volRow(ic, label, value, set) {
   const r = h('input', { type: 'range', min: 0, max: 1, step: 0.02, value, 'aria-label': label, style: { color: 'var(--accent)', flex: 1 } });
   const paint = () => r.style.setProperty('--v', (r.value * 100) + '%');
@@ -329,35 +368,49 @@ function volRow(ic, label, value, set) {
 function openAudio() {
   haptic('light');
   const body = h('div');
+  const choice = (kind, d, [name, sub, ic], curId) => h('button', {
+    class: 'row route' + (d.deviceId === curId ? ' on' : ''),
+    onclick: async () => { haptic('select'); if (await useDevice(kind, d.deviceId)) { toast(`Sound: ${name}`); render(); } },
+  }, icon(ic), h('span', { class: 'lab' }, name, sub ? h('small', null, sub) : null), d.deviceId === curId ? icon('check') : null);
   const render = async () => {
-    const [outs, ins] = await Promise.all([canPickOutput() ? listDevices('audiooutput') : [], listDevices('audioinput')]);
-    const pick = (kind, list) => {
-      const curId = currentDevice(kind) || 'default';
-      return h('div', { class: 'list' }, ...list.map((d, i) => {
-        const label = devLabel(d, i, kind);
-        return h('button', { class: 'row', onclick: async () => { haptic('select'); if (await useDevice(kind, d.deviceId)) { toast(`Using ${label}`); render(); } } },
-          icon(isBt(label) ? 'bt' : kind === 'audioinput' ? 'mic' : 'speaker'), h('span', { class: 'lab' }, label),
-          d.deviceId === curId ? icon('check') : null);
-      }));
-    };
+    const [ins, outs] = await Promise.all([listDevices('audioinput'), canPickOutput() ? listDevices('audiooutput') : []]);
+    const named = ins.some(d => d.label);
+    const routes = ins.map(d => [d, routeOf(d)]).filter(([, r]) => r);
+    const hasRoutes = routes.some(([d]) => d.deviceId !== 'default');
+    const curIn = currentDevice('audioinput') || 'default', curOut = currentDevice('audiooutput') || 'default';
+    let speaker;
+    if (hasRoutes) {
+      speaker = h('div', null, h('div', { class: 'list' }, ...routes.map(([d, r]) => choice('audioinput', d, r, curIn))),
+        !V.mic ? h('p', { class: 'muted note' }, 'Ear speaker and Bluetooth calling switch fully once your mic is on.') : null);
+    } else if (outs.length > 1) {
+      speaker = h('div', { class: 'list' }, ...outs.map((d, i) => choice('audiooutput', d, [d.deviceId === 'default' ? 'Automatic' : d.label || `Speaker ${i + 1}`, null, /bluetooth|airpods|buds/i.test(d.label) ? 'bt' : 'speaker'], curOut)));
+    } else if (!named && !isApplePhone) {
+      speaker = h('div', null, h('p', { class: 'muted note' }, 'Allow the microphone once so your phone can list its speakers, earpiece and Bluetooth devices.'),
+        h('button', { class: 'btn sm block', onclick: async () => { await allowDeviceList(); render(); } }, 'Show sound devices'));
+    } else {
+      speaker = h('p', { class: 'muted note' }, isApplePhone
+        ? 'On iPhone, choose the iPhone speaker, AirPods or Bluetooth from Control Center (long-press the music card, then the AirPlay icon).'
+        : 'Your phone picks the speaker itself: connect Bluetooth or earphones and the sound moves there.');
+    }
+    const mics = ins.filter(d => !routeOf(d) && d.deviceId !== 'communications');
     body.replaceChildren(
-      h('div', { class: 'grp-h' }, 'Speaker'),
-      outs.length > 1 ? pick('audiooutput', outs)
-        : h('p', { class: 'muted note' }, 'Your phone chooses the speaker itself: connect Bluetooth or earphones and the sound moves there. Choosing a Bluetooth microphone below also moves the sound to it.'),
-      h('div', { class: 'grp-h' }, 'Microphone'),
-      ins.length > 1 ? pick('audioinput', ins) : h('p', { class: 'muted note' }, 'Only one microphone found.'),
+      h('div', { class: 'grp-h' }, 'Play sound through'),
+      speaker,
+      mics.length > 1 ? h('div', { class: 'grp-h' }, 'Microphone') : null,
+      mics.length > 1 ? h('div', { class: 'list' }, ...mics.map((d, i) => choice('audioinput', d, [d.label || `Microphone ${i + 1}`, null, 'mic'], curIn))) : null,
       h('div', { class: 'grp-h' }, 'Volume'),
       h('div', { class: 'list' },
         volRow('group', 'Voices', getRoomVolume(), setRoomVolume),
         volRow('music', 'Music', getMusicVolume(), (v) => { unlockAudio(); setMusicVolume(v); })),
-      h('p', { class: 'muted note' }, 'During a call, the phone’s volume buttons change the call volume, which Android never lets go fully silent. Use these sliders to make voices or music quieter.'),
+      h('p', { class: 'muted note' }, 'During a call the volume buttons change the call volume, which Android never lets go fully silent. Use these sliders to make voices or music quieter.'),
       h('div', { class: 'list' },
-        switchRow('Noise isolation', 'Removes background noise from your microphone', V.noise, (v) => { setNoise(v); toast(v ? 'Noise isolation on' : 'Noise isolation off'); }),
+        switchRow('Noise isolation', noiseStatus(), V.noise, (v) => { setNoise(v).then(render); }),
         switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
   };
   const onDev = () => render();
   on('voice:devices', onDev);
-  sheet({ title: 'Audio', body, onClose: () => off('voice:devices', onDev) });
+  on('voice:noise', onDev);
+  sheet({ title: 'Audio', body, onClose: () => { off('voice:devices', onDev); off('voice:noise', onDev); } });
   render();
 }
 
@@ -365,12 +418,14 @@ function openAudio() {
 function openMore() {
   const p = me();
   const body = h('div',
+    S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Manage voice chat', () => { s.close(); openAdmin(); }, 'acc',
+      adminAlerts ? `${adminAlerts} new alert${adminAlerts > 1 ? 's' : ''}` : 'Settings, logs, safety, recording')) : null,
     h('div', { class: 'list' },
       p && !p.canSpeak ? actionRow('hand', p.hand ? 'Lower hand' : 'Raise hand', () => { send({ t: 'hand', up: !p.hand }); s.close(); }) : null,
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
       actionRow('music', 'Music player', () => { s.close(); openNP(); }),
       actionRow('search', 'Browse music', () => { s.close(); openSearch('home'); }),
-      actionRow('speaker', 'Speaker, mic & volume', () => { s.close(); openAudio(); }),
+      actionRow('chat', 'Chat', () => { s.close(); openChat(); }),
       S.room.settings?.soundboard ? actionRow('sound', 'Soundboard', () => { s.close(); openBoard(); }) : null,
       screenSupported() && p?.canSpeak ? actionRow('screen', V.screen ? 'Stop sharing screen' : 'Share screen', () => { s.close(); setScreen(!V.screen); }) : null),
     h('div', { class: 'list' },
@@ -432,36 +487,17 @@ async function openInvite() {
 }
 
 // ======================= chat (like Telegram's voice chat) =======================
-// Messages pop up over the room for a few seconds, then disappear; the history button shows everything
-// sent since you joined. Floating reactions fly up over the room.
+// Messages pop up over the room for a few seconds, then disappear. The Message button opens the chat:
+// everything sent since you joined, a reactions row, and the message box. Reactions fly up over the room.
 const REACTS = ['👍', '❤️', '😂', '🔥', '😮', '😢', '👏', '🎉'];
 const FLY = ['👍', '❤️', '🔥', '😂', '😍', '🤩', '👏', '🎉', '😮', '😢', '🙏', '💯', '🥳', '😎', '🤣', '💔'];
 const nameColor = (uid) => `hsl(${(Math.abs(uid) * 47) % 360} 70% 62%)`;
-let historySheet = null, replyTo = null;
+let chatSheet = null, replyTo = null;
 
-function bindChatbar() {
-  const input = $('#cb-input'), sendBtn = $('#b-send'), reactBtn = $('#b-react');
-  const toggle = () => { const has = !!input.value.trim(); sendBtn.hidden = !has; reactBtn.hidden = has; };
-  const go = () => {
-    const text = input.value.trim(); if (!text) return;
-    send({ t: 'chat', text }); input.value = ''; toggle(); haptic('light');
-  };
-  input.addEventListener('input', toggle);
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
-  sendBtn.onclick = () => { go(); input.focus(); };
-  $('#b-history').onclick = openHistory;
-  const bar = $('#react-bar');
-  bar.replaceChildren(...FLY.map(e => h('button', { 'aria-label': 'React ' + e, onclick: () => { haptic('light'); send({ t: 'fly', emoji: e }); } }, e)));
-  const showBar = (open) => { bar.hidden = !open; reactBtn.classList.toggle('on', open); document.body.classList.toggle('reacting', open); };
-  reactBtn.onclick = (e) => { e.stopPropagation(); showBar(bar.hidden); };
-  document.addEventListener('pointerdown', (e) => {
-    if (!bar.hidden && !bar.contains(e.target) && !reactBtn.contains(e.target)) showBar(false);
-  });
-}
 function showPop(m) {
-  if (historySheet) return;
+  if (chatSheet) return;
   const box = $('#chat-pop');
-  const el = h('button', { class: 'cpop', onclick: openHistory },
+  const el = h('button', { class: 'cpop', onclick: openChat },
     avatarEl({ uid: m.uid, name: m.name, photo: m.photo }, 'ma'),
     h('span', { class: 'cbub' }, h('b', { style: { color: nameColor(m.uid) } }, m.name), h('span', null, m.text)));
   box.append(el);
@@ -470,8 +506,8 @@ function showPop(m) {
 }
 on('ws:fly', (m) => {
   const layer = $('#fly-layer');
-  if (layer.children.length > 24) return;
-  const el = h('div', { class: 'fly', style: { left: `${8 + Math.random() * 70}%`, '--dx': `${Math.round(Math.random() * 60 - 30)}px` } },
+  if (layer.children.length > 20 || document.hidden) return;
+  const el = h('div', { class: 'fly', style: { left: `${10 + Math.random() * 70}%`, '--dx': `${Math.round(Math.random() * 60 - 30)}px` } },
     h('span', null, m.emoji), h('small', null, m.name));
   layer.append(el);
   setTimeout(() => el.remove(), 3200);
@@ -505,34 +541,37 @@ function msgMenu(m) {
 }
 function setReply(m) {
   replyTo = m;
-  const bar = historySheet?.el.querySelector('.reply-bar');
+  const bar = chatSheet?.el.querySelector('.reply-bar');
   if (!bar) return;
   bar.hidden = !m;
   if (m) bar.replaceChildren(h('div', { class: 'rb' }, h('b', null, m.name), h('span', null, m.text)), h('button', { class: 'close-x', 'aria-label': 'Cancel reply', onclick: () => setReply(null) }, icon('close')));
-  historySheet.el.querySelector('textarea').focus();
+  chatSheet.el.querySelector('textarea').focus();
 }
-function openHistory() {
+function openChat() {
   S.unread = 0; updateChatBadge();
   $('#chat-pop').replaceChildren();
   const list = h('div', { class: 'chat-list' }, ...S.msgs.map(msgEl));
   if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, 'No messages since you joined. Say hi 👋'));
-  const ta = h('textarea', { rows: 1, placeholder: 'Message', maxlength: 1000, 'aria-label': 'Message' });
+  const ta = h('textarea', { rows: 1, placeholder: 'Message', maxlength: 1000, 'aria-label': 'Message', enterkeyhint: 'send' });
   const sendIt = () => {
     const text = ta.value.trim(); if (!text) return;
     send({ t: 'chat', text, reply: replyTo?.id || null });
     ta.value = ''; ta.style.height = ''; setReply(null); haptic('light');
   };
   ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(120, ta.scrollHeight) + 'px'; });
-  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); sendIt(); } });
-  historySheet = sheet({ title: 'Chat', body: list, tall: true, onClose: () => { historySheet = null; replyTo = null; } });
-  historySheet.el.append(h('div', { class: 'reply-bar', hidden: true }), h('div', { class: 'composer' }, ta, h('button', { class: 'send', 'aria-label': 'Send', onclick: sendIt }, icon('send'))));
-  setTimeout(() => (historySheet && (historySheet.body.scrollTop = historySheet.body.scrollHeight)), 50);
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendIt(); } });
+  const flyRow = h('div', { class: 'fly-row', role: 'toolbar', 'aria-label': 'Reactions' },
+    ...FLY.map(e => h('button', { 'aria-label': 'React ' + e, onclick: () => { haptic('light'); send({ t: 'fly', emoji: e }); } }, e)));
+  chatSheet = sheet({ title: 'Chat', body: list, tall: true, onClose: () => { chatSheet = null; replyTo = null; } });
+  chatSheet.el.append(flyRow, h('div', { class: 'reply-bar', hidden: true }),
+    h('div', { class: 'composer' }, ta, h('button', { class: 'send', 'aria-label': 'Send', onclick: sendIt }, icon('send'))));
+  setTimeout(() => (chatSheet && (chatSheet.body.scrollTop = chatSheet.body.scrollHeight)), 50);
 }
 function updateChatBadge() { const b = $('#chat-badge'); b.hidden = !S.unread; b.textContent = S.unread > 99 ? '99+' : S.unread; }
 on('ws:chat', ({ m }) => {
   S.msgs.push(m); if (S.msgs.length > 200) S.msgs.shift();
-  if (historySheet) {
-    const body = historySheet.body;
+  if (chatSheet) {
+    const body = chatSheet.body;
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
     body.querySelector('.empty-note')?.remove();
     body.querySelector('.chat-list').append(msgEl(m));
@@ -544,17 +583,18 @@ on('ws:chat', ({ m }) => {
 });
 on('ws:react', ({ id, reactions }) => {
   const m = S.msgs.find(x => x.id === id); if (!m) return; m.reactions = reactions;
-  const el = historySheet?.body.querySelector(`.msg[data-id="${id}"]`);
+  const el = chatSheet?.body.querySelector(`.msg[data-id="${id}"]`);
   if (el) el.replaceWith(msgEl(m));
 });
 on('ws:chat.del', ({ id }) => {
   S.msgs = S.msgs.filter(x => x.id !== id);
-  historySheet?.body.querySelector(`.msg[data-id="${id}"]`)?.remove();
+  chatSheet?.body.querySelector(`.msg[data-id="${id}"]`)?.remove();
 });
 
 // ======================= admin =======================
 let adminAlerts = 0;
 function bumpAdminBadge() { adminAlerts++; const b = $('#admin-badge'); b.hidden = false; b.textContent = adminAlerts; }
+// (the badge sits on the More button; it clears when the admin opens Manage)
 function openAdmin(tab = 'room') {
   adminAlerts = 0; $('#admin-badge').hidden = true;
   const tabs = h('div', { class: 'seg', style: { marginBottom: '6px' } });

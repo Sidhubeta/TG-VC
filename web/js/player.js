@@ -1,5 +1,5 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
-import { $, S, actionRow, api, avatarEl, confirmBox, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, toast } from './core.js';
+import { $, S, actionRow, api, avatarEl, confirmBox, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
 
 // ======================= engine =======================
@@ -17,7 +17,7 @@ const P = {
   aq: store.get('aq', 'medium'),             // low | medium | high
   vq: store.get('vq', 'auto'),               // auto | 144..1080
   vol: store.get('vol', 1),
-  localPaused: false, loadedQid: null, blocked: false, heights: [], autoH: 480, stalls: [],
+  localPaused: false, loadedQid: null, blocked: false, heights: [], autoH: 480, maxH: 480, stalls: [], stableSince: 0,
 };
 // Effects are shared: the server holds them and everyone hears the same thing, in sync.
 const FX_NONE = { preset: 'normal', bass: 0, mid: 0, treble: 0, reverb: 0, rate: 1, mode: 'none' };
@@ -39,10 +39,13 @@ function videoHeight() {
   if (P.vq !== 'auto') return Number(P.vq);
   return P.autoH;
 }
+const STEPS = [144, 240, 360, 480, 720, 1080];
 function pickAutoH() {
   const c = navigator.connection;
   const dl = c?.downlink || 5;
-  P.autoH = c?.saveData ? 240 : dl >= 8 ? 720 : dl >= 3 ? 480 : dl >= 1.2 ? 360 : 240;
+  P.maxH = c?.saveData ? 240 : dl >= 8 ? 720 : dl >= 3 ? 480 : dl >= 1.2 ? 360 : 240;
+  P.autoH = Math.min(P.maxH, 480); // start modest so the video appears fast, then step up if it plays smoothly
+  P.stalls = []; P.stableSince = Date.now();
 }
 pickAutoH();
 
@@ -55,14 +58,22 @@ function load(t) {
   if (P.mode === 'video') loadVideo(t);
   else unloadVideo();
 }
+let lastVideoLoad = 0;
 function loadVideo(t) {
   t = t || cur(); if (!t) return;
   const src = media(`/api/stream/${t.id}/video?q=${videoHeight()}`);
   if (video.dataset.src === src) return;
   video.dataset.src = src;
+  video.poster = media(t.thumb); // show the artwork while the video loads instead of a black box
   video.src = src;
   video.load();
+  lastVideoLoad = Date.now();
+  setVideoLoading(true);
 }
+function setVideoLoading(on) { video.parentNode?.classList.toggle('loading', on); }
+video.addEventListener('waiting', () => setVideoLoading(true));
+video.addEventListener('playing', () => setVideoLoading(false));
+video.addEventListener('canplay', () => setVideoLoading(false));
 function unloadVideo() { if (video.dataset.src) { video.removeAttribute('src'); delete video.dataset.src; video.load(); } }
 
 audio.addEventListener('loadedmetadata', () => sync(true));
@@ -76,17 +87,29 @@ audio.addEventListener('error', () => {
   if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
   setTimeout(() => { const c = cur(); if (c && c.qid === t.qid && audio.error) { audio.src = audioSrc(c); audio.load(); } }, 2000 * errCount);
 });
+// Auto quality. Only real stalls count: "waiting" also fires after every load and every sync seek, and
+// counting those made Auto drop a step every few seconds until it got stuck at 144p.
 video.addEventListener('waiting', () => {
-  if (P.vq !== 'auto') return;
-  const now = Date.now(); P.stalls = P.stalls.filter(x => now - x < 20000); P.stalls.push(now);
-  if (P.stalls.length >= 3 && P.autoH > 144) {
-    const steps = [1080, 720, 480, 360, 240, 144];
-    P.autoH = steps[Math.min(steps.length - 1, steps.indexOf(P.autoH) + 1)] || 240;
-    P.stalls = [];
-    toast(`Video lowered to ${P.autoH}p for smoother playback`);
-    const t = cur(); if (t) { delete video.dataset.src; loadVideo(t); }
+  if (P.vq !== 'auto' || audio.paused) return;
+  const now = Date.now();
+  if (now - lastVideoLoad < 8000 || now - lastVideoSeek < 4000) return;
+  P.stalls = P.stalls.filter(x => now - x < 30000); P.stalls.push(now);
+  P.stableSince = now;
+  const i = STEPS.indexOf(P.autoH);
+  if (P.stalls.length >= 3 && i > 1) { // never drop below 240p on its own
+    setAutoH(STEPS[i - 1], `Video lowered to ${STEPS[i - 1]}p for smoother playback`);
   }
 });
+function setAutoH(hgt, msg) {
+  P.autoH = hgt; P.stalls = []; P.stableSince = Date.now();
+  if (msg) toast(msg);
+  const t = cur(); if (t && video.dataset.src) { delete video.dataset.src; loadVideo(t); }
+}
+function maybeStepUp() {
+  // after 90s without a stall, try one step better (up to what the connection allows)
+  if (P.vq !== 'auto' || !video.dataset.src || video.paused || P.autoH >= P.maxH) return;
+  if (Date.now() - P.stableSince > 90000) setAutoH(STEPS[STEPS.indexOf(P.autoH) + 1]);
+}
 video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused) video.play().catch(() => {}); });
 
 let lastVideoSeek = 0;
@@ -112,6 +135,13 @@ function sync(force = false) {
   }
   if (want && audio.paused) audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
   else if (!want && !audio.paused) audio.pause();
+  // The music runs through our effects (Web Audio). Phones suspend that after a call interruption, locking
+  // the screen or switching apps, and the song kept "playing" silently until it was paused and resumed.
+  if (want && G && G.c.state !== 'running') {
+    G.c.resume().then(() => setBlocked(false), () => {});
+    if (G.c.state !== 'running') setBlocked(true);
+  }
+  maybeStepUp();
   // the video follows the audio, but never chases it while it's still loading (that made it loop one second)
   if (video.dataset.src && video.readyState >= 1) {
     if (video.playbackRate !== r) video.playbackRate = r;
@@ -122,12 +152,19 @@ function sync(force = false) {
   }
 }
 setInterval(sync, 700);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(true); });
+// coming back to the app: jump to where the room is now (not where it was when you left)
+const back = () => { G?.c.resume().catch(() => {}); sync(true); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) back(); });
+window.addEventListener('focus', back);
+try { tg?.onEvent?.('activated', back); } catch {}
 
+let hintAt = 0;
 function setBlocked(b) {
   if (P.blocked === b) return;
   P.blocked = b;
   emit('music:blocked', b);
+  // no "Tap to listen" button any more; a short hint once in a while is enough (any tap fixes it)
+  if (b && cur() && Date.now() - hintAt > 30000) { hintAt = Date.now(); toast('🔈 Tap anywhere to hear the music'); }
 }
 export const musicBlocked = () => P.blocked;
 export function unlockAudio() {
@@ -195,16 +232,16 @@ const PRESETS = {
   slowed: { label: 'Slowed + Reverb', e: '🌙', v: { bass: 3, mid: 0, treble: -1, reverb: 0.42, rate: 0.85, mode: 'none' } },
   nightcore: { label: 'Nightcore', e: '⚡', v: { bass: 1, mid: 0, treble: 2, reverb: 0, rate: 1.25, mode: 'none' } },
 };
-function applyFx() {
+function applyFx(f = fx()) {
   if (!G) return;
-  const f = fx(), t = G.c.currentTime;
-  G.bass.gain.setTargetAtTime(f.bass, t, 0.05);
-  G.mid.gain.setTargetAtTime(f.mid, t, 0.05);
-  G.treble.gain.setTargetAtTime(f.treble, t, 0.05);
-  G.wet.gain.setTargetAtTime(f.reverb * 1.4, t, 0.1);
-  G.dry.gain.setTargetAtTime(1 - f.reverb * 0.35, t, 0.1);
-  G.lfoAmt.gain.setTargetAtTime(f.mode === '8d' ? 0.95 : 0, t, 0.1);
-  if (f.mode !== '8d' && G.pan.pan) G.pan.pan.setTargetAtTime(0, t, 0.1);
+  const t = G.c.currentTime;
+  G.bass.gain.setTargetAtTime(f.bass, t, 0.02);
+  G.mid.gain.setTargetAtTime(f.mid, t, 0.02);
+  G.treble.gain.setTargetAtTime(f.treble, t, 0.02);
+  G.wet.gain.setTargetAtTime(f.reverb * 1.4, t, 0.04);
+  G.dry.gain.setTargetAtTime(1 - f.reverb * 0.35, t, 0.04);
+  G.lfoAmt.gain.setTargetAtTime(f.mode === '8d' ? 0.95 : 0, t, 0.04);
+  if (f.mode !== '8d' && G.pan.pan) G.pan.pan.setTargetAtTime(0, t, 0.04);
 }
 function setVol(v) {
   P.vol = v; store.set('vol', v);
@@ -303,7 +340,7 @@ function canAdd() { return S.admin || !S.room.settings?.music_admin_only; }
 // ---- music video: one <video> element that lives in the player, in the room card, or full screen ----
 let FV = null;
 function videoBox(cls) {
-  const box = h('div', { class: cls, onclick: (e) => e.stopPropagation() }, video,
+  const box = h('div', { class: cls + (video.readyState < 3 ? ' loading' : ''), onclick: (e) => e.stopPropagation() }, video, h('span', { class: 'vspin' }),
     h('button', { class: 'round vbtn', 'aria-label': 'Full screen', onclick: (e) => { e.stopPropagation(); openVideoFull(); } }, icon('expand')),
     pipSupported(video) ? h('button', { class: 'round vbtn pip', 'aria-label': 'Picture in picture', onclick: (e) => { e.stopPropagation(); pip(video); } }, icon('pip')) : null);
   if (P.mode === 'video') loadVideo();
@@ -637,7 +674,8 @@ function openFx() {
   unlockAudio();
   const body = h('div');
   let draft = { ...fx() }, tmr = null;
-  const push = () => { clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 120); };
+  // you hear your change at once (EQ / reverb / 8D); the server then applies it for everyone, speed included
+  const push = () => { applyFx(draft); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
   const slider = (key, label, min, max, step, fmt, allowed) => {
     const out = h('output', null, fmt(draft[key]));
     const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label, disabled: !allowed });
@@ -655,7 +693,8 @@ function openFx() {
     body.replaceChildren(
       allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'Only admins or the person who added this song can change the sound.'),
       h('div', { class: 'fx-grid' }, ...Object.entries(PRESETS).map(([k, p]) =>
-        h('button', { class: 'fx' + (draft.preset === k ? ' on' : ''), disabled: !allowed, onclick: () => { draft = { ...p.v, preset: k }; send({ t: 'music.fx', fx: draft }); haptic('select'); } }, h('span', null, p.e), p.label))),
+        h('button', { class: 'fx' + (draft.preset === k ? ' on' : ''), disabled: !allowed, onclick: (e) => { draft = { ...p.v, preset: k }; applyFx(draft); send({ t: 'music.fx', fx: draft }); haptic('select');
+          body.querySelectorAll('.fx').forEach(b => b.classList.toggle('on', b === e.currentTarget)); } }, h('span', null, p.e), p.label))),
       slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
       slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
       slider('treble', 'Treble', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
@@ -800,7 +839,7 @@ async function renderHome(sc) {
   if (!BR.open || BR.tab !== 'home' || BR.view) return;
   const wrap = h('div');
   sc.append(wrap);
-  carouselSection(wrap, 'Made for this room', async () => (await cachedApi('/api/browse/foryou')).tracks, () => openCollection('foryou'));
+  carouselSection(wrap, 'Made for you', async () => (await cachedApi('/api/browse/foryou')).tracks, () => openCollection('foryou'));
   if (base.recent.length) {
     wrap.append(sectionHead('Recently played'), h('div', { class: 'carousel' }, ...base.recent.map(songCard)));
   }
@@ -839,8 +878,8 @@ async function renderCollection(sc, id) {
   if (BR.view !== id) return;
   const c = data.c || ['#fa2d48', '#a8183a'];
   hero.style.background = `linear-gradient(180deg, ${c[0]}, ${c[1]} 70%, transparent)`;
-  hero.querySelector('h1').textContent = id === 'foryou' ? 'Made for this room' : data.title;
-  hero.querySelector('p').textContent = id === 'foryou' ? (data.fallback ? 'Play a few songs and this fills up with picks for your room' : 'Based on what this room plays and likes') : `${data.tracks.length} songs`;
+  hero.querySelector('h1').textContent = id === 'foryou' ? 'Made for you' : data.title;
+  hero.querySelector('p').textContent = id === 'foryou' ? (data.fallback ? 'Listen to a few songs and this fills up with picks for you' : data.personal ? 'Based on what you listen to and like' : 'Based on what this room plays') : `${data.tracks.length} songs`;
   if (canAdd() && data.tracks.length) {
     hero.append(h('div', { class: 'col-btns' },
       h('button', { class: 'btn', onclick: () => { send({ t: 'music.addMany', tracks: data.tracks }); haptic('success'); } }, icon('plus'), 'Add all'),

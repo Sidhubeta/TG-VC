@@ -126,6 +126,8 @@ function wire(r) {
   r.on(E.AudioPlaybackStatusChanged, () => emit('voice:blocked', !r.canPlaybackAudio));
   r.on(E.ParticipantConnected, applyVolume);
   r.on(E.MediaDevicesChanged, () => emit('voice:devices'));
+  // excellent / good / poor / lost, for every participant (LiveKit measures it for everyone)
+  r.on(E.ConnectionQualityChanged, (q, p) => emit('voice:quality', { uid: p === r.localParticipant ? S.uid : uidOf(p), q }));
   r.on(E.ParticipantPermissionsChanged, (prev, p) => {
     if (p === r.localParticipant && !p.permissions?.canPublish) {
       V.mic = V.cam = V.screen = false;
@@ -176,7 +178,6 @@ function startLevels() {
 
 export async function unblockAudio() {
   try { if (room && !room.canPlaybackAudio) await room.startAudio(); } catch {}
-  if (ns?.ctx.state === 'suspended') ns.ctx.resume().catch(() => {});
   if (!room || room.canPlaybackAudio) emit('voice:blocked', false);
 }
 export const audioBlocked = () => !!room && !room.canPlaybackAudio;
@@ -193,40 +194,53 @@ export async function refreshPermissions() {
 // ---------------- noise isolation (RNNoise, runs on the phone) ----------------
 // Removes fans, traffic, keyboard and room noise from your mic before it is sent. If the phone can't run it
 // (no AudioWorklet / WebAssembly), the browser's own noise suppression is still on.
-let ns = null, nsWarned = false;
+let ns = null, nsC = null, nsState = 'idle'; // idle | active | failed | off
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function nsCtx() {
+  // Created right inside the mic tap: an audio context made later (after awaits) can stay "suspended",
+  // which silently stopped noise isolation from working.
+  if (!nsC) nsC = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000, latencyHint: 'interactive' });
+  if (nsC.state !== 'running') nsC.resume().catch(() => {});
+  return nsC;
+}
 async function nsSetup() {
+  const ctx = nsCtx();
   if (!ns) {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000, latencyHint: 'interactive' });
     const base = '/static/vendor/nsuppress/';
     const mod = await import(base + 'index.js');
     const [wasm] = await Promise.all([
       mod.loadRnnoise({ url: base + 'rnnoise.wasm', simdUrl: base + 'rnnoise_simd.wasm' }),
       ctx.audioWorklet.addModule(base + 'rnnoiseWorklet.js'),
+      ctx.audioWorklet.addModule('/static/js/gate-worklet.js'),
     ]);
     ns = { ctx, mod, wasm };
   }
-  if (ns.ctx.state === 'suspended') ns.ctx.resume().catch(() => {});
+  if (ctx.state !== 'running') await Promise.race([ctx.resume(), sleep(1500)]);
+  if (ctx.state !== 'running') throw new Error('audio context not running');
   return ns;
 }
 function rnnoiseProcessor() {
-  let src = null, node = null;
+  let src = null, node = null, gate = null;
   const proc = {
     name: 'rnnoise',
     async init({ track, audioContext }) {
       src = audioContext.createMediaStreamSource(new MediaStream([track]));
       node = new ns.mod.RnnoiseWorkletNode(audioContext, { maxChannels: 1, wasmBinary: ns.wasm });
+      // RNNoise cleans speech; the soft gate turns down the hiss it leaves while you're not talking
+      gate = new AudioWorkletNode(audioContext, 'vc-soft-gate');
       const dest = audioContext.createMediaStreamDestination();
-      src.connect(node).connect(dest);
+      src.connect(node).connect(gate).connect(dest);
       proc.processedTrack = dest.stream.getAudioTracks()[0];
     },
     async restart(opts) { await proc.destroy(); await proc.init(opts); },
     async destroy() {
-      try { src?.disconnect(); node?.disconnect(); node?.destroy(); } catch {}
-      src = node = null;
+      try { src?.disconnect(); node?.disconnect(); gate?.disconnect(); node?.destroy(); } catch {}
+      src = node = gate = null;
     },
   };
   return proc;
 }
+function setNsState(st) { if (nsState !== st) { nsState = st; emit('voice:noise', st); } }
 async function applyNoise() {
   const track = room?.localParticipant.getTrackPublication(LK.Track.Source.Microphone)?.audioTrack;
   if (!track) return;
@@ -236,22 +250,40 @@ async function applyNoise() {
       const { ctx } = await nsSetup();
       await track.setAudioContext(ctx);
       await track.setProcessor(rnnoiseProcessor());
+      setNsState('active');
     } else if (!V.noise && active) {
       await track.stopProcessor();
-    }
+      setNsState('off');
+    } else if (V.noise && active) setNsState('active');
   } catch (e) {
     console.warn('noise isolation unavailable', e);
-    if (!nsWarned) { nsWarned = true; toast('Noise isolation isn’t supported on this phone — using standard noise reduction'); }
+    try { if (track.getProcessor?.()) await track.stopProcessor(); } catch {} // never leave the mic silent
+    if (nsState !== 'failed') toast('Noise isolation isn’t supported on this phone — using standard noise reduction');
+    setNsState('failed');
   }
+}
+export function noiseStatus() {
+  if (!V.noise) return 'Off';
+  if (nsState === 'failed') return 'Not supported on this phone — using standard noise reduction';
+  if (nsState === 'active' && V.mic) return 'On — removing background noise from your mic';
+  return 'Removes background noise when your mic is on';
 }
 export async function setNoise(on) {
   V.noise = on;
   store.set('noise', on);
+  if (on && nsState === 'failed') nsState = 'idle';
+  if (on) nsCtx();
   await applyNoise();
+  emit('voice:noise', nsState);
 }
+// keep the processing context running after the phone was locked / Telegram was minimized
+const wake = () => { if (nsC && nsC.state !== 'running' && nsState === 'active') nsC.resume().catch(() => {}); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+document.addEventListener('pointerdown', wake, { capture: true, passive: true });
 
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }
+  if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
     if (on) await refreshPermissions();
     await room.localParticipant.setMicrophoneEnabled(on);
@@ -341,6 +373,11 @@ export async function listDevices(kind) {
   try {
     return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === kind && d.deviceId);
   } catch { return []; }
+}
+// device names are hidden until the microphone was allowed once
+export async function allowDeviceList() {
+  try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach(t => t.stop()); }
+  catch { toast('Allow the microphone to see your sound devices'); }
 }
 export const canPickOutput = () => typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
 export const currentDevice = (kind) => store.get('dev:' + kind, '');

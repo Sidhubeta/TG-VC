@@ -723,27 +723,9 @@ body { letter-spacing: -.005em; }
 .vtile .fs.pip { right: 44px; }
 
 /* ============ room chat (Telegram voice chat style) ============ */
-.chatbar { position: relative; z-index: 3; display: flex; align-items: center; gap: 6px; margin: 4px 12px 0; }
-#cb-input { flex: 1; min-width: 0; height: 40px; border: 0; border-radius: 20px; padding: 0 16px; background: var(--card2); font-size: 16px; outline: none; }
-#cb-input:focus { box-shadow: 0 0 0 1.5px var(--accent) inset; }
-.cb-btn { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; background: var(--card2); color: var(--fg2); flex: none; position: relative;
-  transition: transform .2s var(--spring), background .2s, color .2s; }
-.cb-btn:active { transform: scale(.88); }
-.cb-btn .ico { width: 21px; height: 21px; }
-.cb-btn.on, .cb-btn.send { background: var(--accent); color: #fff; }
-.cb-btn .badge { top: -3px; right: -3px; }
-#react-bar { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); display: flex; gap: 2px; overflow-x: auto; padding: 6px;
-  border-radius: 24px; background: rgba(29, 37, 48, .97); box-shadow: 0 8px 30px rgba(0, 0, 0, .4); scrollbar-width: none; animation: tin .3s var(--spring) both; }
-#react-bar::-webkit-scrollbar { display: none; }
-#react-bar button { flex: none; width: 42px; height: 42px; border-radius: 50%; font-size: 26px; transition: transform .2s var(--spring); }
-#react-bar button:active { transform: scale(1.35); }
-#react-bar img.emj { width: 28px; height: 28px; }
-
 /* messages pop up over the room for a few seconds */
 /* a zero-height box right above the chat bar; bottom-aligned popups overflow upwards over the room */
 #chat-pop { position: relative; height: 0; z-index: 4; display: flex; flex-direction: column; justify-content: flex-end; pointer-events: none; }
-#chat-pop, #fly-layer { transition: transform .25s var(--ease); }
-body.reacting #chat-pop, body.reacting #fly-layer { transform: translateY(-62px); } /* stay above the open reaction picker */
 .cpop { position: relative; align-self: flex-start; display: flex; align-items: flex-end; gap: 8px; max-width: calc(100% - 80px); margin: 0 12px 6px;
   padding: 6px 12px 7px 6px; border-radius: 18px; background: rgba(29, 37, 48, .94); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
   box-shadow: 0 6px 20px rgba(0, 0, 0, .35); text-align: left; animation: popin .35s var(--spring) both; transform-origin: left bottom; pointer-events: auto; flex: none; }
@@ -757,7 +739,7 @@ body.reacting #chat-pop, body.reacting #fly-layer { transform: translateY(-62px)
 .cpop .cbub span { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* floating reactions */
-#fly-layer { position: relative; height: 0; z-index: 5; pointer-events: none; }
+#fly-layer { position: fixed; left: 0; right: 0; bottom: calc(150px + var(--safe-b)); height: 0; z-index: 49; pointer-events: none; } /* above sheets too */
 .fly { position: absolute; bottom: 0; display: grid; justify-items: center; font-size: 36px; line-height: 1; animation: flyup 3.1s cubic-bezier(.2, .7, .3, 1) forwards; }
 .fly small { font-size: 10.5px; font-weight: 600; color: #fff; max-width: 90px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   background: rgba(0, 0, 0, .35); padding: 1px 6px; border-radius: 8px; margin-top: 2px; }
@@ -800,3 +782,61 @@ video.mirror { transform: scaleX(-1); }
 .invite-row .pav .ico { color: var(--tg-blue); }
 .slider-row.ro { opacity: .45; }
 .fx:disabled { opacity: .45; }
+
+/* =====================================================================
+   Performance: everything below replaces effects that made phones (especially iPhones) lag.
+   - big blurred blobs were re-filtered every frame -> soft radial gradients moved with transform only
+   - backdrop blur on sheets / toasts / bubbles -> solid backgrounds (they were ~95% opaque anyway)
+   - border-radius "morph" and height keyframes repaint/relayout every frame -> transform/opacity only
+   ===================================================================== */
+*, *::before, *::after { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+#aura { filter: none; opacity: .5; contain: strict; }
+#aura i { background: radial-gradient(circle, var(--c1) 0, transparent 68%) !important; will-change: transform; transition: none; }
+#aura i:nth-child(2) { background: radial-gradient(circle, var(--c2) 0, transparent 68%) !important; }
+#aura i:nth-child(3) { background: radial-gradient(circle, var(--c3) 0, transparent 68%) !important; }
+.np .bg { contain: strict; }
+.np .bg i { filter: none !important; will-change: transform; background: radial-gradient(circle, var(--c2) 0, transparent 66%) !important; opacity: .9; }
+.np .bg i:nth-child(2) { background: radial-gradient(circle, var(--c3) 0, transparent 66%) !important; }
+.np .bg i:nth-child(3) { background: radial-gradient(circle, var(--c1) 0, transparent 66%) !important; }
+/* speaking rings: plain circles scaled by the voice level (smooth, composited) */
+.prow .pav .wave { animation: none; filter: none; border-radius: 50%; will-change: transform; transition: opacity .2s, transform .12s linear; }
+.mic .b1, .mic .b2 { animation: none !important; border-radius: 50%; will-change: transform; transition: transform .12s linear, opacity .3s; }
+/* equalizer bars: scale instead of animating height */
+.eq i { height: 100%; transform-origin: bottom; animation-name: eqs; }
+@keyframes eqs { 0%, 100% { transform: scaleY(.3); } 50% { transform: scaleY(1); } }
+body:not(.playing) .eq i { animation: none; transform: scaleY(.3); height: 100%; }
+/* live dot: opacity pulse instead of an animated shadow */
+.live-dot { animation: dotpulse 2s ease-in-out infinite; box-shadow: none; }
+@keyframes dotpulse { 50% { opacity: .45; } }
+.prow { animation: none; }
+.prow.new { animation: rowin .35s var(--ease) both; }
+.sheet, .np, .br { will-change: transform; }
+@media (prefers-reduced-motion: reduce) { #aura i, .np .bg i { animation: none !important; } }
+
+/* ============ round 3 ============ */
+/* full screen: a landscape video on an upright phone is turned sideways to fill the screen */
+.fullview.rot video { position: absolute; left: 50%; top: 50%; width: var(--fh); height: var(--fw); max-width: none;
+  transform: translate(-50%, -50%) rotate(90deg); }
+.fullview.rot video.mirror { transform: translate(-50%, -50%) rotate(90deg) scaleX(-1); }
+.fullview .fv-bar { transition: opacity .25s; }
+/* video loading spinner over the artwork */
+.vspin { position: absolute; left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%; z-index: 1;
+  border: 3px solid rgba(255, 255, 255, .25); border-top-color: #fff; animation: spin .8s linear infinite; display: none; pointer-events: none; }
+.loading > .vspin { display: block; }
+.card-vid .vid, .np-vid .vid { object-fit: contain; }
+/* reactions row in the chat sheet */
+.fly-row { display: flex; gap: 2px; overflow-x: auto; padding: 6px 10px 2px; border-top: 1px solid var(--line); scrollbar-width: none; flex: none; }
+.fly-row::-webkit-scrollbar { display: none; }
+.fly-row button { flex: none; width: 42px; height: 42px; border-radius: 50%; font-size: 26px; transition: transform .2s var(--spring); }
+.fly-row button:active { transform: scale(1.3); background: var(--glass); }
+.fly-row img.emj { width: 28px; height: 28px; }
+/* weak internet */
+#net-warn { margin: 0 12px 6px; padding: 9px 14px; border-radius: 12px; background: rgba(255, 159, 10, .14); color: #ffb340;
+  font-size: 13.5px; font-weight: 500; text-align: center; animation: tin .35s var(--spring) both; }
+.prow .psub.warn { color: #ffb340; }
+.prow .pnet { width: 22px; height: 22px; display: grid; place-items: center; color: #ffb340; flex: none; }
+.prow .pnet .ico { width: 18px; height: 18px; }
+/* sound route choices */
+.row.route.on .lab { color: var(--accent); font-weight: 600; }
+.row.route .ico:last-child { color: var(--accent); }
+.row.route.on > .ico:first-child { color: var(--accent); }

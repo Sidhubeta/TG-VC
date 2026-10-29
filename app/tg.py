@@ -118,40 +118,32 @@ async def forget_member(chat_id: int, uid: int):
     await db.x("DELETE FROM members WHERE chat_id=? AND uid=?", (chat_id, uid))
 
 
-async def invite(chat_id: int, uid: int, name: str, by_name: str) -> str | None:
+async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0) -> str | None:
     """DM the person a Join button; if they never started the bot, mention them in the group instead."""
     url = await group_link(chat_id)
     title = await chat_title(chat_id)
+    now_line = (f"\n🎙 {live} {'person is' if live == 1 else 'people are'} in the voice chat now" if live else "")
     try:
         await call("sendMessage", chat_id=uid, parse_mode="HTML",
-                   text=f"🎧 <b>{_esc(by_name)}</b> invited you to the voice chat in <b>{_esc(title)}</b>",
+                   text=f"👋 <b>{_esc(by_name)}</b> invited you to join the voice chat in <b>{_esc(title)}</b>{now_line}",
                    reply_markup=join_button(url))
         return "dm"
     except Exception:
         pass
     g = await db.get_group(chat_id)
     params = {"chat_id": chat_id, "parse_mode": "HTML", "reply_markup": join_button(url),
-              "text": f'🎧 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you to the voice chat'}
+              "text": f'👋 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you '
+                      f'to join the voice chat{now_line}'}
     if g.get("pin_thread"):
         params["message_thread_id"] = g["pin_thread"]
     try:
-        m = await call("sendMessage", **params)
+        await call("sendMessage", **params)
     except Exception as e:
         log.info("invite failed: %s", e)
         return None
-
-    async def cleanup():  # don't leave invite messages lying around in the group
-        await asyncio.sleep(600)
-        try:
-            await call("deleteMessage", chat_id=chat_id, message_id=m["message_id"])
-        except Exception:
-            pass
-    _cleanup_tasks.add(t := asyncio.create_task(cleanup()))
-    t.add_done_callback(_cleanup_tasks.discard)
     return "group"
 
 
-_cleanup_tasks: set[asyncio.Task] = set()
 
 
 async def alert_admins(chat_id: int, kind: str, text: str, every: int = 120):

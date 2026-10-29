@@ -116,7 +116,6 @@ function sortParts() {
     (b.uid === S.uid) - (a.uid === S.uid) || (!!b.hand - !!a.hand) || (b.mic - a.mic) || (b.canSpeak - a.canSpeak) || (a.joined - b.joined));
 }
 function statusOf(p) {
-  if (V.speaking.has(p.uid) && p.mic) return ['speaking', 'speaking'];
   if (netOf(p.uid) === 'poor' || netOf(p.uid) === 'lost') return ['weak internet — may lag', 'warn'];
   if (p.hand) return ['wants to speak', 'blue'];
   if (p.forceMuted) return ['muted by admin', 'red'];
@@ -146,7 +145,7 @@ function tileFor(p) {
   if (t._sig === sig) return t;
   t._sig = sig;
   t.replaceChildren(
-    h('div', { class: 'pav' }, h('span', { class: 'wave' }), h('span', { class: 'wave w2' }), t._av, p.hand ? h('span', { class: 'hand' }, '✋') : null),
+    h('div', { class: 'pav' }, t._av, p.hand ? h('span', { class: 'hand' }, '✋') : null),
     h('div', { class: 'pmeta' },
       h('div', { class: 'pname' }, h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, p.name), p.uid === S.uid ? h('span', { class: 'you' }, '(you)') : null,
         p.admin && !p.asGroup ? h('span', { class: 'tag' }, 'admin') : null,
@@ -166,7 +165,7 @@ function renderGrid(full = false) {
 }
 on('ws:p.join', (m) => {
   S.parts.set(m.p.uid, m.p); renderGrid(); renderHeader();
-  if (S.room.settings?.join_sound !== false && store.get('joinSound', true)) joinSound();
+  if (!document.hidden && S.room.settings?.join_sound !== false && store.get('joinSound', true)) joinSound();
 });
 on('ws:p.leave', (m) => {
   const t = tiles.get(m.uid);
@@ -174,7 +173,7 @@ on('ws:p.leave', (m) => {
   if (t) { t.classList.add('out'); setTimeout(() => { tiles.delete(m.uid); renderGrid(); }, 280); }
   renderHeader();
   removeVideo(m.uid);
-  if (S.room.settings?.join_sound !== false && store.get('joinSound', true)) leaveSound();
+  if (!document.hidden && S.room.settings?.join_sound !== false && store.get('joinSound', true)) leaveSound();
 });
 on('ws:p.upd', (m) => {
   const prev = S.parts.get(m.p.uid);
@@ -189,15 +188,6 @@ on('ws:p.upd', (m) => {
 on('ws:hand', (m) => { if (S.admin && m.uid !== S.uid) toast(`✋ ${m.name} wants to speak`); });
 on('ws:alert', (m) => { if (S.admin) { toast(`⚠️ ${m.name}: ${m.flags[0]}`, 4000); bumpAdminBadge(); } });
 on('voice:speaking', () => { for (const p of S.parts.values()) tileFor(p); renderDock(); });
-const lastLvl = new Map();
-const setLvl = (key, el, v) => { if (lastLvl.get(key) !== v) { lastLvl.set(key, v); el.style.setProperty('--lvl', v); } };
-on('voice:levels', (lv) => {
-  for (const [uid, l] of lv) {
-    const t = tiles.get(uid); if (t) setLvl(uid, t, Math.min(1, l * 2.2).toFixed(2));
-  }
-  setLvl('me', $('#b-mic'), Math.min(1, (lv.get(S.uid) || 0) * 2.4).toFixed(2));
-});
-
 // ---- connection quality: everyone sees who has weak internet; you get a banner for your own ----
 const net = new Map();
 const netOf = (uid) => net.get(uid);
@@ -314,7 +304,7 @@ function bindDock() {
   };
   $('#b-cam').onclick = openCamera;
   $('#b-speaker').onclick = openAudio;
-  $('#b-chat').onclick = openChat;
+  $('#b-chat').onclick = () => openChat();
   $('#b-leave').onclick = async () => {
     if (!(await confirmBox('Leave the voice chat?', 'Leave', true))) return;
     if (V.mic) await setMic(false);
@@ -425,7 +415,7 @@ function openMore() {
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
       actionRow('music', 'Music player', () => { s.close(); openNP(); }),
       actionRow('search', 'Browse music', () => { s.close(); openSearch('home'); }),
-      actionRow('chat', 'Chat', () => { s.close(); openChat(); }),
+      S.admin ? actionRow('history', 'Recent messages', () => { s.close(); openHistory(); }, '', 'Last 48 hours · only admins see this') : null,
       S.room.settings?.soundboard ? actionRow('sound', 'Soundboard', () => { s.close(); openBoard(); }) : null,
       screenSupported() && p?.canSpeak ? actionRow('screen', V.screen ? 'Stop sharing screen' : 'Share screen', () => { s.close(); setScreen(!V.screen); }) : null),
     h('div', { class: 'list' },
@@ -487,19 +477,71 @@ async function openInvite() {
 }
 
 // ======================= chat (like Telegram's voice chat) =======================
-// Messages pop up over the room for a few seconds, then disappear. The Message button opens the chat:
-// everything sent since you joined, a reactions row, and the message box. Reactions fly up over the room.
+// Tap Message: a message box slides up over the room (no separate screen). Messages pop up for a few seconds
+// and disappear. Tap a message to reply. Only admins can read back recent messages (kept 48 hours).
 const REACTS = ['👍', '❤️', '😂', '🔥', '😮', '😢', '👏', '🎉'];
 const FLY = ['👍', '❤️', '🔥', '😂', '😍', '🤩', '👏', '🎉', '😮', '😢', '🙏', '💯', '🥳', '😎', '🤣', '💔'];
 const nameColor = (uid) => `hsl(${(Math.abs(uid) * 47) % 360} 70% 62%)`;
-let chatSheet = null, replyTo = null;
+let historySheet = null, replyTo = null, composerBound = false, swallowClick = false;
+
+function openChat(reply = null) {
+  const box = $('#composer'), input = $('#cmp-input');
+  if (!composerBound) bindComposer();
+  if (!box.hidden && !reply) return closeComposer();
+  box.hidden = false;
+  document.body.classList.add('composing');
+  $('#cmp-history').hidden = !S.admin;
+  setReply(reply);
+  input.focus();
+  haptic('light');
+}
+function closeComposer() {
+  const box = $('#composer');
+  box.hidden = true;
+  $('#cmp-react').hidden = true;
+  $('#cmp-emoji').classList.remove('on');
+  document.body.classList.remove('composing');
+  setReply(null);
+  $('#cmp-input').blur();
+}
+function bindComposer() {
+  composerBound = true;
+  const box = $('#composer'), input = $('#cmp-input'), picker = $('#cmp-react');
+  const go = () => {
+    const text = input.value.trim(); if (!text) return;
+    send({ t: 'chat', text, reply: replyTo?.id || null });
+    input.value = ''; setReply(null); haptic('light');
+  };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  $('#cmp-send').onclick = () => { go(); input.focus(); };
+  $('#cmp-history').onclick = () => { closeComposer(); openHistory(); };
+  picker.replaceChildren(...FLY.map(e => h('button', { 'aria-label': 'React ' + e, onclick: () => { haptic('light'); send({ t: 'fly', emoji: e }); } }, e)));
+  $('#cmp-emoji').onclick = () => { picker.hidden = !picker.hidden; $('#cmp-emoji').classList.toggle('on', !picker.hidden); };
+  // tap anywhere else (not the box, a popup or the Message button) closes it, like Telegram
+  document.addEventListener('pointerdown', (e) => {
+    if (box.hidden || box.contains(e.target) || e.target.closest('#b-chat, .cpop')) return;
+    if (input.value.trim()) return;
+    closeComposer();
+    swallowClick = true; // this tap only closes the box; it shouldn't also open whatever is underneath
+    setTimeout(() => { swallowClick = false; }, 500);
+  }, true);
+  document.addEventListener('click', (e) => { if (swallowClick) { swallowClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
+}
+function setReply(m) {
+  replyTo = m;
+  const bar = $('#cmp-reply');
+  bar.hidden = !m;
+  if (m) bar.replaceChildren(h('div', { class: 'rb' }, h('b', null, 'Reply to ' + m.name), h('span', null, m.text)),
+    h('button', { class: 'close-x', 'aria-label': 'Cancel reply', onclick: () => setReply(null) }, icon('close')));
+}
 
 function showPop(m) {
-  if (chatSheet) return;
+  if (document.hidden) return;
   const box = $('#chat-pop');
-  const el = h('button', { class: 'cpop', onclick: openChat },
+  const el = h('button', { class: 'cpop', onclick: () => { el.remove(); openChat(m); } },
     avatarEl({ uid: m.uid, name: m.name, photo: m.photo }, 'ma'),
-    h('span', { class: 'cbub' }, h('b', { style: { color: nameColor(m.uid) } }, m.name), h('span', null, m.text)));
+    h('span', { class: 'cbub' }, h('b', { style: { color: nameColor(m.uid) } }, m.name),
+      m.reply ? h('i', { class: 'crq' }, '↩ ' + m.reply.name) : null, h('span', null, m.text)));
   box.append(el);
   while (box.children.length > 3) box.firstChild.remove();
   setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 400); }, 12000);
@@ -513,6 +555,7 @@ on('ws:fly', (m) => {
   setTimeout(() => el.remove(), 3200);
 });
 
+// ---- recent messages (admins only, last 48 hours) ----
 function msgEl(m) {
   const mine = m.uid === S.uid;
   return h('div', { class: 'msg' + (mine ? ' mine' : ''), 'data-id': m.id, onclick: () => msgMenu(m) },
@@ -521,7 +564,7 @@ function msgEl(m) {
       mine ? null : h('div', { class: 'who', style: { color: nameColor(m.uid) } }, m.name),
       m.reply ? h('div', { class: 'rq' }, h('b', null, m.reply.name), h('span', null, m.reply.text)) : null,
       h('span', { class: 'txt' }, m.text),
-      h('span', { class: 'tm' }, new Date(m.ts * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })),
+      h('span', { class: 'tm' }, fmtDate(m.ts)),
       reactsEl(m)));
 }
 function reactsEl(m) {
@@ -534,61 +577,38 @@ function msgMenu(m) {
   const body = h('div',
     h('div', { class: 'react-pick' }, ...REACTS.map(e => h('button', { onclick: () => { send({ t: 'react', id: m.id, emoji: e }); s.close(); } }, e))),
     h('div', { class: 'list' },
-      actionRow('reply', 'Reply', () => { s.close(); setReply(m); }),
+      actionRow('reply', 'Reply', () => { s.close(); historySheet?.close(); openChat(m); }),
       actionRow('copy', 'Copy text', () => { s.close(); copyText(m.text); }),
       S.admin || m.uid === S.uid ? actionRow('trash', 'Delete', () => { send({ t: 'chat.del', id: m.id }); s.close(); }, 'red') : null));
   const s = sheet({ title: m.name, body });
 }
-function setReply(m) {
-  replyTo = m;
-  const bar = chatSheet?.el.querySelector('.reply-bar');
-  if (!bar) return;
-  bar.hidden = !m;
-  if (m) bar.replaceChildren(h('div', { class: 'rb' }, h('b', null, m.name), h('span', null, m.text)), h('button', { class: 'close-x', 'aria-label': 'Cancel reply', onclick: () => setReply(null) }, icon('close')));
-  chatSheet.el.querySelector('textarea').focus();
-}
-function openChat() {
-  S.unread = 0; updateChatBadge();
-  $('#chat-pop').replaceChildren();
+function openHistory() {
+  if (!S.admin) return;
   const list = h('div', { class: 'chat-list' }, ...S.msgs.map(msgEl));
-  if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, 'No messages since you joined. Say hi 👋'));
-  const ta = h('textarea', { rows: 1, placeholder: 'Message', maxlength: 1000, 'aria-label': 'Message', enterkeyhint: 'send' });
-  const sendIt = () => {
-    const text = ta.value.trim(); if (!text) return;
-    send({ t: 'chat', text, reply: replyTo?.id || null });
-    ta.value = ''; ta.style.height = ''; setReply(null); haptic('light');
-  };
-  ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(120, ta.scrollHeight) + 'px'; });
-  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendIt(); } });
-  const flyRow = h('div', { class: 'fly-row', role: 'toolbar', 'aria-label': 'Reactions' },
-    ...FLY.map(e => h('button', { 'aria-label': 'React ' + e, onclick: () => { haptic('light'); send({ t: 'fly', emoji: e }); } }, e)));
-  chatSheet = sheet({ title: 'Chat', body: list, tall: true, onClose: () => { chatSheet = null; replyTo = null; } });
-  chatSheet.el.append(flyRow, h('div', { class: 'reply-bar', hidden: true }),
-    h('div', { class: 'composer' }, ta, h('button', { class: 'send', 'aria-label': 'Send', onclick: sendIt }, icon('send'))));
-  setTimeout(() => (chatSheet && (chatSheet.body.scrollTop = chatSheet.body.scrollHeight)), 50);
+  if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, 'No messages in the last 48 hours.'));
+  const body = h('div', null, h('p', { class: 'muted note' }, 'Only admins see this. Messages are kept for 48 hours. Tap one to reply.'), list);
+  historySheet = sheet({ title: 'Recent messages', body, tall: true, onClose: () => { historySheet = null; } });
+  setTimeout(() => (historySheet && (historySheet.body.scrollTop = historySheet.body.scrollHeight)), 50);
 }
-function updateChatBadge() { const b = $('#chat-badge'); b.hidden = !S.unread; b.textContent = S.unread > 99 ? '99+' : S.unread; }
 on('ws:chat', ({ m }) => {
-  S.msgs.push(m); if (S.msgs.length > 200) S.msgs.shift();
-  if (chatSheet) {
-    const body = chatSheet.body;
+  if (S.admin) { S.msgs.push(m); if (S.msgs.length > 300) S.msgs.shift(); }
+  if (historySheet) {
+    const body = historySheet.body;
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
     body.querySelector('.empty-note')?.remove();
     body.querySelector('.chat-list').append(msgEl(m));
     if (atBottom || m.uid === S.uid) body.scrollTo({ top: body.scrollHeight, behavior: 'smooth' });
-  } else {
-    showPop(m);
-    if (m.uid !== S.uid) { S.unread++; updateChatBadge(); }
   }
+  showPop(m);
 });
 on('ws:react', ({ id, reactions }) => {
   const m = S.msgs.find(x => x.id === id); if (!m) return; m.reactions = reactions;
-  const el = chatSheet?.body.querySelector(`.msg[data-id="${id}"]`);
+  const el = historySheet?.body.querySelector(`.msg[data-id="${id}"]`);
   if (el) el.replaceWith(msgEl(m));
 });
 on('ws:chat.del', ({ id }) => {
   S.msgs = S.msgs.filter(x => x.id !== id);
-  chatSheet?.body.querySelector(`.msg[data-id="${id}"]`)?.remove();
+  historySheet?.body.querySelector(`.msg[data-id="${id}"]`)?.remove();
 });
 
 // ======================= admin =======================

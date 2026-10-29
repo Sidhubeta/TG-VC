@@ -266,19 +266,27 @@ export function copyText(text) {
 // Telegram's in-app browser often ignores element.requestFullscreen(), so the video is moved into a
 // full-window overlay. A landscape video on a phone held upright is turned sideways to fill the screen,
 // and the controls hide themselves (tap to show them again).
-export function fullView(el, { label = '', onClose = null } = {}) {
+export function fullView(el, { label = '', onClose = null, rotate = null } = {}) {
   const home = el.parentNode, next = el.nextSibling;
   let closed = false, hideT = null;
-  const ov = h('div', { class: 'fullview', role: 'dialog', 'aria-label': 'Full screen video' },
-    h('div', { class: 'fv-bar' }, label ? h('span', { class: 'fv-lbl' }, label) : h('span'),
-      h('button', { class: 'fv-close', 'aria-label': 'Exit full screen', onclick: (e) => { e.stopPropagation(); close(); } }, icon('close'))));
-  ov.prepend(el);
+  // rotate: true = turn sideways (landscape), false = upright, null = decide from the video's shape
+  let turn = rotate;
+  // video + controls live in one box that is turned as a whole, so the buttons are upright when the phone is sideways
+  const inner = h('div', { class: 'fv-inner' });
+  const ov = h('div', { class: 'fullview', role: 'dialog', 'aria-label': 'Full screen video' }, inner);
+  inner.append(h('div', { class: 'fv-bar' }, label ? h('span', { class: 'fv-lbl' }, label) : h('span'),
+      h('span', { class: 'fv-btns' },
+        h('button', { class: 'fv-close', 'aria-label': 'Rotate', onclick: (e) => { e.stopPropagation(); turn = !ov.classList.contains('rot'); fit(); autoHide(); } }, icon('rotate')),
+        h('button', { class: 'fv-close', 'aria-label': 'Exit full screen', onclick: (e) => { e.stopPropagation(); close(); } }, icon('close')))));
+  inner.prepend(el);
   document.body.append(ov);
   const fit = () => {
     ov.style.setProperty('--fw', innerWidth + 'px');
     ov.style.setProperty('--fh', innerHeight + 'px');
-    const wide = el.videoWidth > el.videoHeight * 1.1;
-    ov.classList.toggle('rot', wide && innerHeight > innerWidth && !document.fullscreenElement);
+    const wide = turn ?? (el.videoWidth > el.videoHeight * 1.1);
+    // Telegram doesn't let a mini app rotate the screen, so a landscape picture is turned with CSS instead
+    // (this used to switch off whenever the browser granted real fullscreen, so nothing rotated)
+    ov.classList.toggle('rot', !!wide && innerHeight > innerWidth);
   };
   const autoHide = () => { clearTimeout(hideT); ov.classList.remove('ui-off'); hideT = setTimeout(() => ov.classList.add('ui-off'), 2500); };
   fit(); autoHide();

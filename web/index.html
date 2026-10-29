@@ -78,6 +78,8 @@
     <symbol id="i-bt" viewBox="0 0 24 24"><path d="m7 7 10 10-5 4V3l5 4L7 17"/></symbol>
     <symbol id="i-signal" viewBox="0 0 24 24"><path d="M4 20v-3M9 20v-6M14 20V10M19 20V5"/><path d="m15 4 6 6m0-6-6 6" stroke-width="2.2"/></symbol>
     <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M10.5 5.5h3M11 18.5h2"/></symbol>
+    <symbol id="i-rotate" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="11" rx="2.5"/><path d="M8 4.5h5a4 4 0 0 1 4 4M15 6.5l2 2 2-2"/></symbol>
+    <symbol id="i-shrink" viewBox="0 0 24 24"><path d="M9.5 3.5V9.5H3.5M14.5 20.5v-6h6M9.5 9.5 3 3M14.5 14.5 21 21"/></symbol>
   </defs>
 </svg>
 
@@ -104,9 +106,19 @@
   </div>
   <div id="net-warn" hidden></div>
   <div id="chat-pop" aria-live="polite"></div>
+  <div id="composer" hidden>
+    <div id="cmp-reply" hidden></div>
+    <div id="cmp-react" hidden></div>
+    <div class="cmp-row">
+      <button class="cb-btn" id="cmp-emoji" aria-label="Reactions"><svg class="ico"><use href="#i-smile"/></svg></button>
+      <input id="cmp-input" type="text" maxlength="1000" placeholder="Message" enterkeyhint="send" autocomplete="off" aria-label="Message">
+      <button class="cb-btn" id="cmp-history" aria-label="Recent messages" hidden><svg class="ico"><use href="#i-history"/></svg></button>
+      <button class="cb-btn send" id="cmp-send" aria-label="Send"><svg class="ico"><use href="#i-send"/></svg></button>
+    </div>
+  </div>
   <nav class="dock">
     <button class="dk" id="b-cam"><span class="c"><svg class="ico"><use href="#i-video-off"/></svg></span><span>Video</span></button>
-    <button class="dk" id="b-chat"><span class="c"><svg class="ico"><use href="#i-chat"/></svg></span><span>Message</span><span class="badge" id="chat-badge" hidden></span></button>
+    <button class="dk" id="b-chat"><span class="c"><svg class="ico"><use href="#i-chat"/></svg></span><span>Message</span></button>
     <div class="mic-wrap"><button class="mic wait" id="b-mic" aria-label="Microphone"><span class="halo"></span><span class="blob"></span><svg class="ico"><use href="#i-mic-off"/></svg></button><div class="mic-lbl" id="mic-lbl">Connecting</div></div>
     <button class="dk" id="b-speaker"><span class="c"><svg class="ico"><use href="#i-speaker"/></svg></span><span>Audio</span></button>
     <button class="dk red" id="b-leave"><span class="c"><svg class="ico"><use href="#i-leave"/></svg></span><span>Leave</span></button>

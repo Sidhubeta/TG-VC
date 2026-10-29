@@ -18,6 +18,7 @@ REACTIONS = {"👍", "❤️", "😂", "🔥", "😮", "😢", "👏", "🎉"}
 # floating reactions over the room (like Telegram's live reactions)
 FLY = {"👍", "❤️", "🔥", "😂", "😍", "🤩", "👏", "🎉", "😮", "😢", "🙏", "💯", "🥳", "😎", "🤣", "💔"}
 FX_PRESETS = {"normal", "bass", "8d", "hall", "vocal", "slowed", "nightcore", "custom"}
+CHAT_KEEP = 48 * 3600  # recent messages are kept 48 hours, and only admins can read them back
 EMPTY_GRACE = 600  # keep the music running this long after the last person leaves (minimized apps reconnect)
 FX_DEFAULT = {"preset": "normal", "bass": 0, "mid": 0, "treble": 0, "reverb": 0.0, "rate": 1.0, "mode": "none"}
 DEFAULT_SETTINGS = {"title": "", "description": "", "locked": False, "new_can_speak": True,
@@ -70,19 +71,61 @@ class Participant:
 
 
 class Conn:
+    """One app connection. Messages go through its own queue and writer, so a person on a slow network only
+    delays their own updates; broadcasts used to wait on each socket in turn, slowing the whole room down."""
+    MAX_QUEUE = 400
+
     def __init__(self, ws: WebSocket, uid: int):
         self.ws = ws
         self.uid = uid
         self.hits: deque[float] = deque(maxlen=40)
         self.alive = True
+        self.q: asyncio.Queue[str] = asyncio.Queue()
+        self._writer = asyncio.create_task(self._write())
 
     async def send(self, msg: dict):
         if not self.alive:
             return
+        if self.q.qsize() >= self.MAX_QUEUE:
+            # This phone can't keep up. Drop the connection; the app reconnects and gets a fresh state.
+            self.alive = False
+            spawn(self._drop())
+            return
+        self.q.put_nowait(json.dumps(msg, ensure_ascii=False))
+
+    async def _write(self):
         try:
-            await self.ws.send_text(json.dumps(msg, ensure_ascii=False))
+            while True:
+                text = await self.q.get()
+                await self.ws.send_text(text)
+                self.q.task_done()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             self.alive = False
+
+    async def _drop(self):
+        try:
+            await self.ws.close(1013)
+        except Exception:
+            pass
+
+    async def close(self, code: int = 1000):
+        """Send what's queued (e.g. "you were removed"), then close."""
+        if self.alive:
+            try:
+                await asyncio.wait_for(self.q.join(), 1.5)
+            except Exception:
+                pass
+        self.alive = False
+        try:
+            await self.ws.close(code)
+        except Exception:
+            pass
+
+    def stop(self):
+        self.alive = False
+        self._writer.cancel()
 
 
 class Room:
@@ -93,7 +136,7 @@ class Room:
             self.settings["title"] = group.get("title") or "Voice Chat"
         self.group_title = group.get("title") or "Group"
         self.parts: dict[int, Participant] = {}
-        self.chat: deque[dict] = deque(maxlen=80)
+        self.chat: deque[dict] = deque(maxlen=300)
         self.join_times: deque[float] = deque(maxlen=50)
         self.user_joins: dict[int, deque] = {}
         self.rec = {"on": False, "by": None, "since": 0, "name": ""}
@@ -195,10 +238,11 @@ class Room:
             self._idle.cancel()
             self._idle = None
         everyone = [self.pub(q, admin) for q in self.parts.values()]
-        # chat is like Telegram's voice chat: you only see messages sent since you joined
-        since = p.joined - 1
+        # Like Telegram's voice chat, messages just pop up and disappear. Admins can read back the last 48 hours.
+        since = now() - CHAT_KEEP
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
-                         "music": self.music_state(), "chat": [m for m in self.chat if m["ts"] >= since], "admin": admin,
+                         "music": self.music_state(), "chat": [m for m in self.chat if m["ts"] >= since] if admin else [],
+                         "admin": admin,
                          "group": self.group_title})
         if first:
             a, n = {"t": "p.join", "p": self.pub(p, True)}, {"t": "p.join", "p": self.pub(p, False)}
@@ -271,6 +315,9 @@ class Room:
             p.flags.append("No username")
 
     async def heartbeat(self):
+        cutoff = now() - CHAT_KEEP
+        while self.chat and self.chat[0]["ts"] < cutoff:
+            self.chat.popleft()
         parts = list(self.parts.values())
         if not parts:
             return
@@ -301,10 +348,7 @@ class Room:
             return
         await self.send_to(uid, {"t": "kicked", "ban": False, "reason": reason})
         for c in list(p.conns):
-            try:
-                await c.ws.close(4003)
-            except Exception:
-                pass
+            await c.close(4003)
         await lk.remove(self.chat_id, uid)
 
     # ---------------- message router -----------------
@@ -763,10 +807,7 @@ class Room:
             if target:
                 await self.send_to(uid, {"t": "kicked", "ban": t == "admin.ban"})
                 for c in list(target.conns):
-                    try:
-                        await c.ws.close(4003)
-                    except Exception:
-                        pass
+                    await c.close(4003)
                 await lk.remove(self.chat_id, uid)
             await self.toast(p.uid, f"{'Banned' if t == 'admin.ban' else 'Removed'} {name}")
         elif t == "admin.unban":
@@ -840,7 +881,7 @@ async def get_room(chat_id: int) -> Room:
     if r:
         return r
     g = await db.get_group(chat_id)
-    rows = await db.q("SELECT * FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 60", (chat_id,))
+    rows = await db.q("SELECT * FROM messages WHERE chat_id=? AND ts>? ORDER BY id DESC LIMIT 300", (chat_id, now() - CHAT_KEEP))
     plays = await db.q("SELECT vid, title, artist, duration, by_uid, by_name FROM plays WHERE chat_id=? "
                        "ORDER BY id DESC LIMIT 20", (chat_id,))
     if chat_id in ROOMS:  # another request built it while we were reading the database
@@ -860,6 +901,10 @@ async def get_room(chat_id: int) -> Room:
 async def heartbeat_loop():
     while True:
         await asyncio.sleep(60)
+        try:
+            await db.x("DELETE FROM messages WHERE ts<?", (now() - CHAT_KEEP,))
+        except Exception:
+            log.exception("chat cleanup")
         for r in list(ROOMS.values()):
             try:
                 await r.heartbeat()

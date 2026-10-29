@@ -49,6 +49,9 @@ CREATE INDEX IF NOT EXISTS ix_rep_chat ON reports(chat_id, resolved);
 CREATE TABLE IF NOT EXISTS schedules(
   id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, title TEXT, at REAL, by_uid INTEGER, sent INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS ix_sched ON schedules(sent, at);
+CREATE TABLE IF NOT EXISTS listens(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, vid TEXT, title TEXT, artist TEXT, ts REAL);
+CREATE INDEX IF NOT EXISTS ix_listens_uid ON listens(uid, ts);
 CREATE TABLE IF NOT EXISTS members(
   chat_id INTEGER, uid INTEGER, name TEXT, username TEXT, seen REAL, PRIMARY KEY(chat_id, uid));
 """

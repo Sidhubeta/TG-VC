@@ -264,30 +264,48 @@ export function copyText(text) {
 
 // ---------- full-screen viewer for videos ----------
 // Telegram's in-app browser often ignores element.requestFullscreen(), so the video is moved into a
-// full-window overlay (and real fullscreen is requested on top when the browser allows it).
+// full-window overlay. A landscape video on a phone held upright is turned sideways to fill the screen,
+// and the controls hide themselves (tap to show them again).
 export function fullView(el, { label = '', onClose = null } = {}) {
   const home = el.parentNode, next = el.nextSibling;
-  let closed = false;
+  let closed = false, hideT = null;
   const ov = h('div', { class: 'fullview', role: 'dialog', 'aria-label': 'Full screen video' },
     h('div', { class: 'fv-bar' }, label ? h('span', { class: 'fv-lbl' }, label) : h('span'),
       h('button', { class: 'fv-close', 'aria-label': 'Exit full screen', onclick: (e) => { e.stopPropagation(); close(); } }, icon('close'))));
   ov.prepend(el);
   document.body.append(ov);
-  ov.addEventListener('click', () => ov.classList.toggle('ui-off'));
+  const fit = () => {
+    ov.style.setProperty('--fw', innerWidth + 'px');
+    ov.style.setProperty('--fh', innerHeight + 'px');
+    const wide = el.videoWidth > el.videoHeight * 1.1;
+    ov.classList.toggle('rot', wide && innerHeight > innerWidth && !document.fullscreenElement);
+  };
+  const autoHide = () => { clearTimeout(hideT); ov.classList.remove('ui-off'); hideT = setTimeout(() => ov.classList.add('ui-off'), 2500); };
+  fit(); autoHide();
+  el.addEventListener('loadedmetadata', fit);
+  el.addEventListener('resize', fit);
+  addEventListener('resize', fit);
+  ov.addEventListener('click', () => (ov.classList.contains('ui-off') ? autoHide() : (clearTimeout(hideT), ov.classList.add('ui-off'))));
   const unBack = pushBack(close);
-  const onFs = () => { if (!document.fullscreenElement && !document.webkitFullscreenElement) close(); };
+  const onFs = () => { fit(); if (!document.fullscreenElement && !document.webkitFullscreenElement && ov._fs) close(); };
   try {
     const req = ov.requestFullscreen || ov.webkitRequestFullscreen;
-    const p = req?.call(ov);
+    const p = req?.call(ov, { navigationUI: 'hide' });
     if (p?.then) p.then(() => {
+      ov._fs = true;
       document.addEventListener('fullscreenchange', onFs);
       if (el.videoWidth > el.videoHeight) screen.orientation?.lock?.('landscape').catch(() => {});
+      fit();
     }, () => {});
   } catch {}
   el.play?.().catch(() => {});
   function close() {
     if (closed) return; closed = true;
+    clearTimeout(hideT);
     unBack();
+    el.removeEventListener('loadedmetadata', fit);
+    el.removeEventListener('resize', fit);
+    removeEventListener('resize', fit);
     document.removeEventListener('fullscreenchange', onFs);
     try { screen.orientation?.unlock?.(); } catch {}
     try { if (document.fullscreenElement) document.exitFullscreen(); } catch {}

@@ -18,6 +18,7 @@ REACTIONS = {"👍", "❤️", "😂", "🔥", "😮", "😢", "👏", "🎉"}
 # floating reactions over the room (like Telegram's live reactions)
 FLY = {"👍", "❤️", "🔥", "😂", "😍", "🤩", "👏", "🎉", "😮", "😢", "🙏", "💯", "🥳", "😎", "🤣", "💔"}
 FX_PRESETS = {"normal", "bass", "8d", "hall", "vocal", "slowed", "nightcore", "custom"}
+EMPTY_GRACE = 600  # keep the music running this long after the last person leaves (minimized apps reconnect)
 FX_DEFAULT = {"preset": "normal", "bass": 0, "mid": 0, "treble": 0, "reverb": 0.0, "rate": 1.0, "mode": "none"}
 DEFAULT_SETTINGS = {"title": "", "description": "", "locked": False, "new_can_speak": True,
                     "music_admin_only": False, "soundboard": True, "join_sound": True}
@@ -113,6 +114,7 @@ class Room:
         self._timer: asyncio.Task | None = None
         self._qid = 0
         self._lock = asyncio.Lock()
+        self._idle: asyncio.Task | None = None
         # admin decisions survive leaving and rejoining: {uid: {"force_muted": bool, "role": str}}
         self.sticky: dict[int, dict] = {}
 
@@ -189,6 +191,9 @@ class Room:
                 (self.chat_id, uid, p.name, p.username, p.joined, p.joined))
         p.admin = admin
         p.conns.add(conn)
+        if self._idle:
+            self._idle.cancel()
+            self._idle = None
         everyone = [self.pub(q, admin) for q in self.parts.values()]
         # chat is like Telegram's voice chat: you only see messages sent since you joined
         since = p.joined - 1
@@ -230,13 +235,22 @@ class Room:
         await self.broadcast({"t": "p.leave", "uid": p.uid})
         await self.broadcast({"t": "room", "room": self.room_state()})
         pin.schedule(self.chat_id)
-        if not self.parts:
-            # nobody left: pause music so it does not run with an empty room
-            if self.status == "playing":
-                self.pos = self.cur_pos()
-                self.upd = now()
-                self.status = "paused"
-                self._cancel_timer()
+        if not self.parts and not self._idle:
+            # Nobody left. Don't pause straight away: a phone that minimizes Telegram drops its connection
+            # for a moment, and pausing made the song jump back to where it was when they come back.
+            self._idle = spawn(self._pause_when_idle())
+
+    async def _pause_when_idle(self):
+        try:
+            await asyncio.sleep(EMPTY_GRACE)
+            async with self._lock:
+                if not self.parts and self.status == "playing":
+                    self.pos = self.cur_pos()
+                    self.upd = now()
+                    self.status = "paused"
+                    self._cancel_timer()
+        finally:
+            self._idle = None
 
     def _mic_flush(self, p: Participant):
         if p.mic and p.mic_since:
@@ -489,9 +503,13 @@ class Room:
             spawn(music.prefetch(item["id"]))
             if self.queue:
                 spawn(music.prefetch(self.queue[0]["id"]))
+            t = now()
             await db.x("INSERT INTO plays(chat_id,vid,title,artist,duration,by_uid,by_name,ts) VALUES(?,?,?,?,?,?,?,?)",
                        (self.chat_id, item["id"], item["title"], item["artist"], item["duration"], item["byUid"],
-                        item["by"], now()))
+                        item["by"], t))
+            # what each person listens to, for their own "Made for you" recommendations
+            await db.xmany("INSERT INTO listens(uid,vid,title,artist,ts) VALUES(?,?,?,?,?)",
+                           [(uid, item["id"], item["title"], item["artist"], t) for uid in self.parts])
             if not item["duration"]:
                 spawn(self._fill_duration(item))
         else:

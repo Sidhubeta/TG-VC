@@ -76,6 +76,8 @@
     <symbol id="i-user-plus" viewBox="0 0 24 24"><circle cx="9.5" cy="8" r="4"/><path d="M2.5 20.5a7 7 0 0 1 14 0M19 8v6M16 11h6"/></symbol>
     <symbol id="i-wave" viewBox="0 0 24 24"><path d="M3 12h2M7 8v8M11 4v16M15 7v10M19 10v4M21 12h0"/></symbol>
     <symbol id="i-bt" viewBox="0 0 24 24"><path d="m7 7 10 10-5 4V3l5 4L7 17"/></symbol>
+    <symbol id="i-signal" viewBox="0 0 24 24"><path d="M4 20v-3M9 20v-6M14 20V10M19 20V5"/><path d="m15 4 6 6m0-6-6 6" stroke-width="2.2"/></symbol>
+    <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M10.5 5.5h3M11 18.5h2"/></symbol>
   </defs>
 </svg>
 
@@ -86,7 +88,7 @@
 
 <main id="room" hidden>
   <header class="top">
-    <button class="icon-btn" id="b-admin" aria-label="Menu"><svg class="ico"><use href="#i-more"/></svg><span class="badge" id="admin-badge" hidden></span></button>
+    <button class="icon-btn" id="b-admin" aria-label="More"><svg class="ico"><use href="#i-more"/></svg><span class="badge" id="admin-badge" hidden></span></button>
     <div class="t">
       <h1 id="r-title">Voice Chat</h1>
       <div class="sub"><span class="live-dot"></span><span id="r-count">0 listening</span><span id="r-rec" class="rec" hidden>REC</span><span id="r-lock" hidden>🔒</span></div>
@@ -100,18 +102,11 @@
     <div class="list-h"><span id="lh-count">Participants</span></div>
     <div class="plist" id="grid"></div>
   </div>
+  <div id="net-warn" hidden></div>
   <div id="chat-pop" aria-live="polite"></div>
-  <div id="fly-layer" aria-hidden="true"></div>
-  <div class="chatbar">
-    <button class="cb-btn" id="b-history" aria-label="Chat history"><svg class="ico"><use href="#i-chat"/></svg><span class="badge" id="chat-badge" hidden></span></button>
-    <input id="cb-input" type="text" maxlength="1000" placeholder="Message" enterkeyhint="send" autocomplete="off" aria-label="Message">
-    <button class="cb-btn" id="b-react" aria-label="Reactions"><svg class="ico"><use href="#i-smile"/></svg></button>
-    <button class="cb-btn send" id="b-send" aria-label="Send" hidden><svg class="ico"><use href="#i-send"/></svg></button>
-    <div id="react-bar" hidden></div>
-  </div>
   <nav class="dock">
     <button class="dk" id="b-cam"><span class="c"><svg class="ico"><use href="#i-video-off"/></svg></span><span>Video</span></button>
-    <button class="dk" id="b-more"><span class="c"><svg class="ico"><use href="#i-more"/></svg></span><span>More</span></button>
+    <button class="dk" id="b-chat"><span class="c"><svg class="ico"><use href="#i-chat"/></svg></span><span>Message</span><span class="badge" id="chat-badge" hidden></span></button>
     <div class="mic-wrap"><button class="mic wait" id="b-mic" aria-label="Microphone"><span class="halo"></span><span class="blob"></span><svg class="ico"><use href="#i-mic-off"/></svg></button><div class="mic-lbl" id="mic-lbl">Connecting</div></div>
     <button class="dk" id="b-speaker"><span class="c"><svg class="ico"><use href="#i-speaker"/></svg></span><span>Audio</span></button>
     <button class="dk red" id="b-leave"><span class="c"><svg class="ico"><use href="#i-leave"/></svg></span><span>Leave</span></button>
@@ -119,6 +114,7 @@
 </main>
 
 <div id="toasts"></div>
+<div id="fly-layer" aria-hidden="true"></div>
 <script type="module" src="/static/js/app.js"></script>
 </body>
 </html>

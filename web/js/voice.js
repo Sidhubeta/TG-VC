@@ -49,6 +49,8 @@ async function connect() {
     wire(room);
     await room.connect(info.url, info.token, { autoSubscribe: true });
     V.ready = true;
+    if (failN) toast('Voice connected');
+    failN = 0;
     emit('voice', { state: 'ready' });
     emit('voice:session', 'joined');
     if (!room.canPlaybackAudio) emit('voice:blocked', true);
@@ -57,12 +59,13 @@ async function connect() {
     console.error(e);
     V.ready = false;
     emit('voice', { state: 'error' });
-    toast('Voice connection failed — retrying…');
-    scheduleRetry(4000);
+    // said once, not every 4 seconds while the voice server is down; the wait grows too
+    if (!failN++) toast('Voice connection failed — retrying…');
+    scheduleRetry(Math.min(30000, 4000 * 2 ** Math.min(failN - 1, 3)));
   } finally { connecting = false; }
 }
 
-let retryTimer = null, stopped = false;
+let retryTimer = null, stopped = false, failN = 0;
 function scheduleRetry(ms) {
   if (stopped) return;
   clearTimeout(retryTimer);
@@ -295,7 +298,16 @@ export async function setMic(on) {
     return true;
   } catch (e) {
     console.error(e);
-    toast(on ? 'Allow microphone access in Telegram settings to speak' : 'Could not mute');
+    if (!on) {
+      // Turning the mic off can't really fail for us: when an admin took the right to speak away, LiveKit has
+      // already stopped it and throws here. It's off either way ("Could not mute" was wrong).
+      V.mic = false;
+      send({ t: 'mic', on: false });
+      iosSession(false);
+      emit('voice:session', 'play');
+      return true;
+    }
+    toast('Allow microphone access in Telegram settings to speak');
     return false;
   }
 }

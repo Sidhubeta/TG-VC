@@ -15,9 +15,23 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import auth, badges, config, db, lk, members, music, pin, tg
-from .room import Conn, ROOMS, get_room, heartbeat_loop
+from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+
+class _HideSession(logging.Filter):
+    """Song, avatar and socket links carry the session (?s=…) — anyone reading the logs could have used it."""
+    def filter(self, record):
+        if record.args and isinstance(record.args, tuple):
+            record.args = tuple(re.sub(r"([?&]s=)[^&\s\"]+", r"\1…", a) if isinstance(a, str) else a for a in record.args)
+        if isinstance(record.msg, str) and "s=" in record.msg:
+            record.msg = re.sub(r"([?&]s=)[^&\s\"]+", r"\1…", record.msg)
+        return True
+
+
+for _name in ("uvicorn.access", "uvicorn.error"):
+    logging.getLogger(_name).addFilter(_HideSession())
 log = logging.getLogger("main")
 # httpx logs every request URL at INFO, and Telegram URLs contain the bot token: keep it out of the logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -139,7 +153,9 @@ async def api_auth(request: Request):
     old = await db.q1("SELECT bio, updated FROM users WHERE uid=?", (uid,))
     bio = (old or {}).get("bio") or ""
     if uid > 0 and (not old or time.time() - (old.get("updated") or 0) > 1800):
-        bio = await tg.fetch_bio(uid)
+        fresh = await tg.fetch_bio(uid)
+        if fresh is not None:  # (None: Telegram didn't answer — keep the bio we have instead of wiping it)
+            bio = fresh
     if config.DEV_MODE and uid < 0:
         bio = ["Music lover 🎧", "", "Living one song at a time", "", "Punjab ⇄ Toronto", ""][abs(uid) % 6]
     await db.x("INSERT OR REPLACE INTO users(uid,name,username,photo,bio,updated) VALUES(?,?,?,?,?,?)",
@@ -147,7 +163,7 @@ async def api_auth(request: Request):
     room = await get_room(chat_id)
     if room.settings["locked"] and not st["admin"] and uid not in room.parts:
         return err("The voice chat is locked by admins", 403)
-    can_pub = st["admin"] or room.settings["new_can_speak"] or (uid in room.parts and room.can_speak(room.parts[uid]))
+    can_pub = room.may_publish(uid, st["admin"])
     out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"], "bot": tg.BOT_USERNAME,
            "group": "Dev Group" if config.DEV_MODE and uid < 0 else await tg.chat_title(chat_id),
            "livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, name, can_pub)} if lk.enabled() else None}
@@ -163,9 +179,8 @@ async def api_lk_token(request: Request):
     if not lk.enabled():
         return JSONResponse({"livekit": None})
     room = await get_room(chat_id)
-    p = room.parts.get(uid)
     u = await db.q1("SELECT name FROM users WHERE uid=?", (uid,))
-    can = room.can_speak(p) if p else (st["admin"] or room.settings["new_can_speak"])
+    can = room.may_publish(uid, st["admin"])
     return JSONResponse({"livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, (u or {}).get("name", "User"), can)}})
 
 
@@ -747,6 +762,7 @@ async def ws_endpoint(ws: WebSocket):
         return
     user = await db.q1("SELECT * FROM users WHERE uid=?", (uid,)) or {}
     conn = Conn(ws, uid)
+    conn.cid = ws.query_params.get("c", "")[:40]
     try:
         await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
         while True:
@@ -755,7 +771,7 @@ async def ws_endpoint(ws: WebSocket):
             conn.hits.append(t)
             if len(conn.hits) == conn.hits.maxlen and t - conn.hits[0] < 5:
                 continue  # flood protection
-            if len(raw) > 8000:
+            if len(raw) > 200_000:  # ("Add all" on a long playlist is a big message: 8000 cut it off at ~45 songs)
                 continue
             try:
                 msg = json.loads(raw)
@@ -780,10 +796,14 @@ async def api_bye(request: Request):
         return Response(status_code=204)
     room = ROOMS.get(chat_id)
     p = room.parts.get(uid) if room else None
+    cid = request.query_params.get("c", "")
     if p:
-        for c in list(p.conns):
+        # only the app that closed: the same person on another phone stays (old apps send no id: all of them)
+        for c in [c for c in p.conns if not cid or getattr(c, "cid", "") == cid]:
             await c.close(1000)
-            await room.leave(c)
+            await room.leave(c, at_once=True)
+        if not p.conns and room.parts.get(uid) is p and not cid:
+            await room._gone(p)
     return Response(status_code=204)
 
 
@@ -805,13 +825,15 @@ async def robots(request: Request):
 async def lifespan(app):
     tasks = [asyncio.create_task(tg.run_polling()), asyncio.create_task(tg.schedule_loop()),
              asyncio.create_task(heartbeat_loop()), asyncio.create_task(pin.startup_reset()),
-             asyncio.create_task(pin.countdown_loop())]
+             asyncio.create_task(pin.countdown_loop()), asyncio.create_task(bg_tick_loop())]
     log.info("LiveKit %s", "enabled" if lk.enabled() else "NOT configured (voice disabled)")
     yield
+    for r in list(ROOMS.values()):  # a deploy or restart: keep the queue and the song for when it's back
+        await r.save_now()
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    for c in (music._http, tg._client, lk._client):
+    for c in (music._http, music._sthttp, tg._client, lk._client):
         if c is not None:
             await c.aclose()
 

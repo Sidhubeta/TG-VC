@@ -123,20 +123,28 @@ export async function api(path, opts = {}) {
 
 // ---------- WebSocket ----------
 let ws = null, wsTimer = null, retryTimer = null, retry = 0, closedByUs = false, asGroup = false;
+// this app's own id: closing it ends only this connection, not the same person's app on another phone
+export const CID = Math.random().toString(36).slice(2, 12);
 const outbox = [];
 export function send(msg) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
-  else if (outbox.length < 20) outbox.push(msg);
+  else if (outbox.length < 20) outbox.push({ msg, at: Date.now() });
 }
+// What was tapped while offline is sent on reconnect only if it's still recent. A skip / seek / vote pressed
+// minutes ago used to skip the song for everyone the moment the network came back.
+const STALE = (m) => /^(music\.|admin\.|rec\.)|^(mic|video|screen|hand|sound|fly|caps|bg)$/.test(m.t || '');
 export function connectWS(opts = {}) {
   if (opts.asGroup != null) asGroup = opts.asGroup;
   clearTimeout(retryTimer); retryTimer = null;
   closedByUs = false;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?s=${encodeURIComponent(S.session)}${asGroup ? '&asg=1' : ''}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?s=${encodeURIComponent(S.session)}&c=${CID}${asGroup ? '&asg=1' : ''}`);
   ws.onopen = () => {
     retry = 0;
-    while (outbox.length) ws.send(JSON.stringify(outbox.shift()));
+    while (outbox.length) {
+      const { msg, at } = outbox.shift();
+      if (Date.now() - at < (STALE(msg) ? 8000 : 120000)) ws.send(JSON.stringify(msg));
+    }
     syncClock(true);
     clearInterval(wsTimer);
     wsTimer = setInterval(syncClock, 30000);
@@ -146,6 +154,9 @@ export function connectWS(opts = {}) {
     try { m = JSON.parse(e.data); } catch { return; }
     if (m.t === 'pong') return onPong(m);
     if (m.now && m.t === 'init' && !clock.length) S.offset = m.now - Date.now() / 1000; // rough, until the pings answer
+    // the server hands out fresh sessions (on connect and every hour): one from 12 hours ago would expire
+    if (m.t === 'init' && m.session) S.session = m.session;
+    if (m.t === 'session' && m.s) { S.session = m.s; return; }
     emit('ws:' + m.t, m);
   };
   const sock = ws;

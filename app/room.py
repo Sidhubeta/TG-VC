@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 import time
@@ -9,7 +10,7 @@ from collections import deque
 
 from starlette.websockets import WebSocket
 
-from . import badges, db, lk, music, pin, tg
+from . import auth, badges, db, lk, music, pin, tg
 
 log = logging.getLogger("room")
 ROOMS: dict[int, "Room"] = {}
@@ -41,6 +42,12 @@ DENY = {"add": "add songs", "next": "play songs next", "vote": "vote to skip", "
         "stop": "stop the music"}
 CHAT_KEEP = 48 * 3600  # recent messages are kept 48 hours; admins can read all of them back
 REJOIN_GRACE = 45  # a dropped connection that comes back this fast is not "leaving" (chat history stays)
+# A phone on weak internet (or one that minimizes Telegram for a moment) drops its connection and comes back a few
+# seconds later. Each drop used to be a full leave + join: join/leave sounds for everyone, a new row in the logs,
+# the "No username" alert again, and "Rapid join/leave" after four. Now someone stays in the room this long after
+# their connection drops; coming back in time is just a reconnect.
+LINGER = 15
+QUEUE_MAX = 500
 MOD_ACTIONS = {"admin.mute", "admin.unmute", "admin.role", "admin.kick", "admin.clearflags"}  # what moderators may do
 XFADE = 4.0  # the next song starts this many seconds before the end (phones with crossfade on blend the two)
 EMPTY_GRACE = 600  # keep the music running this long after the last person leaves (minimized apps reconnect)
@@ -110,6 +117,21 @@ def _device(ua: str) -> str:
     return f"{os_} {ver} {app}".replace("  ", " ").strip()
 
 
+def _dumps(msg: dict) -> str:
+    # allow_nan=False: a NaN (or Infinity) would reach the phones as bare NaN, which their JSON.parse rejects, and
+    # every music update after it was dropped. Numbers are cleaned where they come in; this makes sure.
+    return json.dumps(msg, ensure_ascii=False, allow_nan=False)
+
+
+def _dur(v) -> float:
+    """A song length from outside: a real number of seconds, else 0 (unknown)."""
+    try:
+        d = float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return d if math.isfinite(d) and 0 < d < 86400 else 0.0
+
+
 class Conn:
     """One app connection. Messages go through its own queue and writer, so a person on a slow network only
     delays their own updates; broadcasts used to wait on each socket in turn, slowing the whole room down."""
@@ -123,11 +145,16 @@ class Conn:
         except Exception:
             self.device = "?"
         self.hits: deque[float] = deque(maxlen=40)
+        self.xfade = False  # this phone blends songs (crossfade on, and it can): see Room._blend_ok
+        self.bg = False     # the app is minimized: see bg_tick_loop
         self.alive = True
         self.q: asyncio.Queue[str] = asyncio.Queue()
         self._writer = asyncio.create_task(self._write())
 
     async def send(self, msg: dict):
+        await self.send_text(_dumps(msg))
+
+    async def send_text(self, text: str):
         if not self.alive:
             return
         if self.q.qsize() >= self.MAX_QUEUE:
@@ -135,7 +162,7 @@ class Conn:
             self.alive = False
             spawn(self._drop())
             return
-        self.q.put_nowait(json.dumps(msg, ensure_ascii=False))
+        self.q.put_nowait(text)
 
     async def _write(self):
         try:
@@ -214,17 +241,41 @@ class Room:
         self._idle: asyncio.Task | None = None
         # admin decisions survive leaving and rejoining: {uid: {"force_muted": bool, "role": str}}
         self.sticky: dict[int, dict] = {}
+        self._lingering: dict[int, asyncio.Task] = {}   # uid -> pending leave after a dropped connection
+        self._alerted: dict[tuple[int, str], float] = {}  # (uid, flag) -> when admins were last told
+        self._watching: set[int] = set()                # qids with a _watch_song task
+        self._idle_paused = False                       # the music was paused because the room emptied
+        self._prefetched = ""                           # the next song we last asked the cache for
+        self._filling = False                           # autoplay is looking for songs
+        self._bad: deque[str] = deque(maxlen=200)       # songs that couldn't be played (skipped)
+        self._load_seek: int | None = None              # qid that was seeked while still loading
+        self.last_active = now()
 
     # ---------------- helpers -----------------
     def is_mod(self, p: Participant | None) -> bool:
         return bool(p) and not p.admin and str(p.uid) in self.settings["mods"]
+
+    def may_publish(self, uid: int, admin: bool) -> bool:
+        """For a voice token: what this person may do now, including an admin's earlier mute or "listener"."""
+        if admin:
+            return True
+        p = self.parts.get(uid)
+        if p:
+            return self.can_speak(p)
+        st = self.sticky.get(uid) or {}
+        if st.get("force_muted"):
+            return False
+        return st.get("role", "speaker" if self.settings["new_can_speak"] else "listener") == "speaker"
 
     def can_speak(self, p: Participant) -> bool:
         if p.force_muted:
             return False
         return p.admin or p.role == "speaker"
 
-    def pub(self, p: Participant, for_admin: bool) -> dict:
+    def staff(self, q: Participant) -> bool:
+        return q.admin or self.is_mod(q)
+
+    def pub(self, p: Participant, for_admin: bool, mod_view: bool = False) -> dict:
         d = {"uid": p.uid, "name": p.name, "username": p.username, "photo": p.photo, "bio": p.bio, "admin": p.admin,
              "role": p.role, "mic": p.mic, "forceMuted": p.force_muted, "canSpeak": self.can_speak(p),
              "hand": p.hand, "video": p.video, "screen": p.screen, "joined": p.joined, "asGroup": p.as_group,
@@ -233,9 +284,17 @@ class Room:
             d.update(name=self.group_title, username="", photo=f"/api/avatar/{self.chat_id}", bio="")
             if for_admin:
                 d["realName"] = p.name
-        if for_admin:
-            d["flags"] = p.flags
+        if for_admin or mod_view:
+            d["flags"] = p.flags  # moderators handle warnings too
         return d
+
+    def chat_view(self, m: dict, viewer: Participant) -> dict:
+        if not m.get("asg") or viewer.admin or viewer.uid == m["uid"]:
+            return m
+        return {**m, "uid": self.chat_id}
+
+    def pub_for(self, p: Participant, viewer: Participant) -> dict:
+        return self.pub(p, viewer.admin, self.is_mod(viewer))
 
     async def send_to(self, uid: int, msg: dict):
         p = self.parts.get(uid)
@@ -244,17 +303,23 @@ class Room:
                 await c.send(msg)
 
     async def broadcast(self, msg: dict, admins_only: bool = False):
+        text = _dumps(msg)  # once, not once per phone (the queue alone can be big)
         for p in list(self.parts.values()):
             if admins_only and not (p.admin or self.is_mod(p)):  # moderators get the alerts too (hands, warnings)
                 continue
             for c in list(p.conns):
-                await c.send(msg)
+                await c.send_text(text)
 
-    async def bcast_part(self, p: Participant):
-        a, n = {"t": "p.upd", "p": self.pub(p, True)}, {"t": "p.upd", "p": self.pub(p, False)}
+    async def bcast_part(self, p: Participant, t: str = "p.upd"):
+        views: dict[tuple, str] = {}
         for q in list(self.parts.values()):
+            if t == "p.join" and q.uid == p.uid:
+                continue
+            key = (q.admin, self.is_mod(q))
+            if key not in views:
+                views[key] = _dumps({"t": t, "p": self.pub(p, *key)})
             for c in list(q.conns):
-                await c.send(a if q.admin else n)
+                await c.send_text(views[key])
 
     def room_state(self) -> dict:
         return {"settings": self.settings, "rec": self.rec, "count": len(self.parts)}
@@ -267,6 +332,13 @@ class Room:
 
     async def push_music(self):
         await self.broadcast({"t": "music", "m": self.music_state(), "now": now()})
+        # whatever is next now (after a move, play now, shuffle, remove…) starts downloading, so it can start
+        # straight away and crossfade
+        nxt = self.queue[0]["id"] if self.queue else ""
+        if nxt and nxt != self._prefetched:
+            self._prefetched = nxt
+            spawn(music.prefetch(nxt))
+        spawn(self._save_soon())
 
     async def toast(self, uid: int, text: str):
         await self.send_to(uid, {"t": "toast", "text": text})
@@ -276,6 +348,16 @@ class Room:
         uid = conn.uid
         p = self.parts.get(uid)
         first = p is None
+        self.last_active = now()
+        if (t := self._lingering.pop(uid, None)) and not t.done():
+            t.cancel()  # back within LINGER: the same visit carries on
+        if self._idle_paused and self.status == "paused" and self.current:
+            # the music was paused only because everyone had gone: carry on now someone is back (a member
+            # without playback rights couldn't start it again, so it stayed off until an admin came)
+            self._idle_paused = False
+            self.status, self.upd = "playing", now()
+            self._arm_timer()
+            spawn(self.push_music())
         if first:
             p = Participant(uid, user, admin)
             p.as_group = as_group and admin
@@ -299,39 +381,61 @@ class Room:
         if self._idle:
             self._idle.cancel()
             self._idle = None
-        everyone = [self.pub(q, admin) for q in self.parts.values()]
+        everyone = [self.pub(q, admin, self.is_mod(p)) for q in self.parts.values()]
         # Messages pop up and disappear, like Telegram's voice chat. Everyone can read back what was said since
         # they joined (leaving and coming back starts over); admins can read back the last 48 hours.
         since = now() - CHAT_KEEP if admin else max(p.chat_since, now() - CHAT_KEEP)
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
-                         "music": self.music_state(), "chat": [m for m in self.chat if m["ts"] >= since],
+                         "music": self.music_state(), "chat": [self.chat_view(m, p) for m in self.chat if m["ts"] >= since],
                          "admin": admin,
-                         "group": self.group_title})
+                         "group": self.group_title,
+                         # a fresh session: one opened 12 hours ago would otherwise expire (and the song links with it)
+                         "session": auth.make_session(uid, self.chat_id)})
         if first:
-            a, n = {"t": "p.join", "p": self.pub(p, True)}, {"t": "p.join", "p": self.pub(p, False)}
-            for q in list(self.parts.values()):
-                if q.uid == uid:
-                    continue
-                for c in list(q.conns):
-                    await c.send(a if q.admin else n)
+            await self.bcast_part(p, "p.join")
             await self.broadcast({"t": "room", "room": self.room_state()})
             pin.schedule(self.chat_id)
-            if p.flags:
-                await self.broadcast({"t": "alert", "uid": uid, "name": p.name, "flags": p.flags}, admins_only=True)
-                if "Joined during a join flood" in p.flags:
+            # each warning once in a while, not on every reconnect
+            new = [f for f in p.flags if now() - self._alerted.get((uid, f), 0) > 6 * 3600]
+            for f in new:
+                self._alerted[(uid, f)] = now()
+            if len(self._alerted) > 2000:
+                self._alerted = {k: v for k, v in self._alerted.items() if now() - v < 6 * 3600}
+            if new:
+                await self.broadcast({"t": "alert", "uid": uid, "name": p.name, "flags": new}, admins_only=True)
+                if "Joined during a join flood" in new:
                     spawn(tg.alert_admins(self.chat_id, "flood",
                         f"⚠️ Many people are joining the voice chat at once ({len(self.parts)} now). Check the Safety tab."))
 
-    async def leave(self, conn: Conn):
+    async def leave(self, conn: Conn, at_once: bool = False):
         p = self.parts.get(conn.uid)
         if not p:
             return
         p.conns.discard(conn)
         if p.conns or self.parts.get(conn.uid) is not p:
             return
+        if at_once:
+            return await self._gone(p)
+        # The connection dropped: give them LINGER seconds to come back before they count as gone.
+        old = self._lingering.get(p.uid)
+        if not old or old.done():
+            self._lingering[p.uid] = spawn(self._linger(p))
+
+    async def _linger(self, p: Participant):
+        await asyncio.sleep(LINGER)
+        self._lingering.pop(p.uid, None)
+        if not p.conns and self.parts.get(p.uid) is p:
+            await self._gone(p)
+
+    async def _gone(self, p: Participant):
+        if (t := self._lingering.pop(p.uid, None)) and not t.done() and t is not asyncio.current_task():
+            t.cancel()
+        if self.parts.get(p.uid) is not p:
+            return
         # Remove from the room before any await, so a quick rejoin creates a fresh participant
         # instead of being dropped by this (late) leave.
         self.parts.pop(p.uid, None)
+        self.last_active = now()
         self._left[p.uid] = (now(), p.chat_since)
         if len(self._left) > 500:
             cut = now() - REJOIN_GRACE
@@ -359,6 +463,7 @@ class Room:
                     self.pos = self.cur_pos()
                     self.upd = now()
                     self.status = "paused"
+                    self._idle_paused = True  # the next person to come in starts it again
                     self._cancel_timer()
         finally:
             self._idle = None
@@ -389,6 +494,10 @@ class Room:
         if not parts:
             return
         t = now()
+        if t - getattr(self, "_sess_at", 0) > 3600:  # keep sessions fresh for people who stay connected for hours
+            self._sess_at = t
+            for p in parts:
+                await self.send_to(p.uid, {"t": "session", "s": auth.make_session(p.uid, self.chat_id)})
         for p in parts:
             self._mic_flush(p)
         await db.xmany("UPDATE sessions SET last_seen=?, mic_secs=? WHERE id=?",
@@ -403,6 +512,8 @@ class Room:
         for p, st in await asyncio.gather(*(check(p) for p in parts)):
             if self.parts.get(p.uid) is not p:
                 continue
+            if st.get("unsure"):
+                continue  # Telegram didn't really answer: check again next minute
             if not st["member"]:
                 await self.kick(p.uid, "You left the group, so you were removed from its voice chat.")
             elif st["admin"] != p.admin:
@@ -416,6 +527,7 @@ class Room:
         await self.send_to(uid, {"t": "kicked", "ban": False, "reason": reason})
         for c in list(p.conns):
             await c.close(4003)
+        await self._gone(p)
         await lk.remove(self.chat_id, uid)
 
     # ---------------- message router -----------------
@@ -427,6 +539,19 @@ class Room:
         try:
             if t == "ping":
                 await conn.send({"t": "pong", "id": msg.get("id"), "now": now()})
+            elif t == "bg":
+                conn.bg = bool(msg.get("on"))
+            elif t == "caps":
+                # whether this phone blends songs; crossfade is used only when every phone does
+                xf = bool(msg.get("xfade"))
+                if xf != conn.xfade:
+                    conn.xfade = xf
+                    async with self._lock:
+                        if self.status == "playing" and self.current:
+                            before = self.current.get("xf")
+                            self._arm_timer()
+                            if self.current.get("xf") != before:
+                                await self.push_music()
             elif t == "diag":
                 kind, detail = str(msg.get("kind", ""))[:40], str(msg.get("detail", ""))[:300]
                 cur = (self.current or {}).get("id", "-")
@@ -491,6 +616,13 @@ class Room:
         text = str(msg.get("text", "")).strip()[:1000]
         if not text:
             return
+        t0 = now()
+        hits = getattr(p, "chat_hits", None)
+        if hits is None:
+            hits = p.chat_hits = deque(maxlen=8)
+        if len(hits) == hits.maxlen and t0 - hits[0] < 10:
+            return await self.toast(p.uid, "Slow down 🙂")  # at most 8 messages in 10 seconds
+        hits.append(t0)
         reply = None
         rid = msg.get("reply")
         if rid:
@@ -503,8 +635,14 @@ class Room:
                          (self.chat_id, p.uid, name, text, json.dumps(reply) if reply else None, ts))
         m = {"id": mid, "uid": p.uid, "name": name, "photo": f"/api/avatar/{self.chat_id}" if p.as_group else p.photo, "text": text,
              "reply": reply, "reactions": {}, "ts": ts}
+        if p.as_group:
+            m["asg"] = True
         self.chat.append(m)
-        await self.broadcast({"t": "chat", "m": m})
+        if not p.as_group:
+            return await self.broadcast({"t": "chat", "m": m})
+        for q in list(self.parts.values()):  # sent "as the group": only admins (and the sender) see who it was
+            for c in list(q.conns):
+                await c.send({"t": "chat", "m": self.chat_view(m, q)})
 
     async def on_react(self, p: Participant, msg: dict):
         emoji = msg.get("emoji")
@@ -552,9 +690,15 @@ class Room:
                               "name": self.group_title if p.as_group else p.name})
 
     async def on_report(self, p: Participant, msg: dict):
-        target = self.parts.get(int(msg.get("uid", 0)))
+        try:
+            target = self.parts.get(int(msg.get("uid", 0)))
+        except (TypeError, ValueError):
+            return
         if not target or target.uid == p.uid:
             return
+        if now() - getattr(p, "last_report", 0) < 30:
+            return await self.toast(p.uid, "You just sent a report — admins will look at it")
+        p.last_report = now()
         reason = str(msg.get("reason", ""))[:300]
         await db.x("INSERT INTO reports(chat_id,uid,name,by_uid,by_name,reason,ts) VALUES(?,?,?,?,?,?,?)",
                    (self.chat_id, target.uid, target.name, p.uid, p.name, reason, now()))
@@ -593,7 +737,11 @@ class Room:
         # crossfade: only when the next song can start straight away (otherwise the end would just be cut off)
         left = end - self.cur_pos()
         length = end - (self.current.get("start") or 0)
-        xf = min(XFADE, max(0.0, left - 0.5), length * 0.15) if (self.loop != "one" and nxt and music.is_ready(nxt["id"])) else 0.0
+        # Crossfade only when every phone in the room blends songs. The room moves on XFADE seconds early for
+        # everyone; a phone that can't blend (iPhone, crossfade switched off, an effect on) used to lose the last
+        # seconds of every song in a hard cut.
+        blend = self._blend_ok() and self.loop != "one" and nxt and music.is_ready(nxt["id"])
+        xf = min(XFADE, max(0.0, left - 0.5), length * 0.15) if blend else 0.0
         xf = round(xf, 2) if xf >= 1 else 0.0  # (re-armed every few seconds: keep the same switch point to the end)
         self.current["xf"] = xf
         remaining = max(0.5, (end - self.cur_pos()) / self.fx["rate"] + (-xf if xf else 0.8))
@@ -607,17 +755,25 @@ class Room:
 
         self._timer = spawn(fire())
 
+    def _blend_ok(self) -> bool:
+        conns = [c for q in self.parts.values() for c in q.conns]
+        return bool(conns) and all(c.xfade for c in conns)
+
     def _item(self, t: dict, p: Participant | None, by: str | None = None) -> dict | None:
+        if not isinstance(t, dict):
+            return None
         vid = str(t.get("id", ""))
         if not re.fullmatch(r"[\w-]{11}", vid):
             return None
         self._qid += 1
         return {"qid": self._qid, "id": vid, "title": str(t.get("title", ""))[:200],
-                "artist": str(t.get("artist", ""))[:120], "duration": float(t.get("duration") or 0),
+                "artist": str(t.get("artist", ""))[:120], "duration": _dur(t.get("duration")),
                 "thumb": f"/api/thumb/{vid}", "by": by or (p.name if p else ""), "byUid": p.uid if p else 0}
 
-    async def _start(self, item: dict | None, from_prev: bool = False):
+    async def _start(self, item: dict | None, from_prev: bool = False, repeat: bool = False):
         cur = self.current
+        self._idle_paused = False
+        self._load_seek = None
         if cur and not from_prev and (not item or item["id"] != cur["id"]):
             self.history.append(cur)
         if (item or {}).get("qid") != (cur or {}).get("qid") and not self.fx_by_admin:
@@ -641,18 +797,21 @@ class Room:
                 spawn(self._when_ready(item["qid"], item["id"]))
             self.recent.append(item["id"])
             spawn(music.prefetch(item["id"]))
-            spawn(self._watch_song(item["qid"], item["id"]))
-            if self.queue:
-                spawn(music.prefetch(self.queue[0]["id"]))
-            t = now()
-            await db.x("INSERT INTO plays(chat_id,vid,title,artist,duration,by_uid,by_name,ts) VALUES(?,?,?,?,?,?,?,?)",
-                       (self.chat_id, item["id"], item["title"], item["artist"], item["duration"], item["byUid"],
-                        item["by"], t))
-            # what each person listens to, for their own "Made for you" recommendations
-            await db.xmany("INSERT INTO listens(uid,vid,title,artist,ts) VALUES(?,?,?,?,?)",
-                           [(uid, item["id"], item["title"], item["artist"], t) for uid in self.parts])
+            if item["qid"] not in self._watching:  # (repeat-one keeps the qid: one watcher, not one more per repeat)
+                self._watching.add(item["qid"])
+                spawn(self._watch_song(item["qid"], item["id"]))
+            if not repeat:  # a song on repeat counts once in the history and badges
+                t = now()
+                await db.x("INSERT INTO plays(chat_id,vid,title,artist,duration,by_uid,by_name,ts) VALUES(?,?,?,?,?,?,?,?)",
+                           (self.chat_id, item["id"], item["title"], item["artist"], item["duration"], item["byUid"],
+                            item["by"], t))
+                # what each person listens to, for their own "Made for you" recommendations
+                await db.xmany("INSERT INTO listens(uid,vid,title,artist,ts) VALUES(?,?,?,?,?)",
+                               [(uid, item["id"], item["title"], item["artist"], t) for uid in self.parts])
             if not item["duration"]:
                 spawn(self._fill_duration(item))
+            if self.autoplay and not self.queue:
+                spawn(self._autoplay_fill(item["id"]))  # line up the next song now, not after this one ends
         else:
             self.status = "stopped"
         self._arm_timer()
@@ -661,8 +820,17 @@ class Room:
     async def _when_ready(self, qid: int, vid: str):
         try:
             await asyncio.wait_for(music.resolve(vid), 15)
-        except Exception as e:  # can't be found / too slow: start anyway, the phones retry on their own
+        except asyncio.TimeoutError:  # YouTube is slow: start anyway, the phones retry on their own
+            log.info("resolve before start too slow %s", vid)
+        except Exception as e:
+            # Private, removed, blocked here, age-restricted: skip it. (Before, the room sat on the song: with no
+            # length it never ended, with one everyone heard silence.) Other failures (YouTube blocking the server
+            # for a bit) start it anyway: the phones retry, and skipping would run through the whole queue.
             log.info("resolve before start failed %s: %s", vid, e)
+            if music.unplayable(e):
+                async with self._lock:
+                    await self._skip_unplayable(qid, str(e))
+                return
         try:
             await music.prefetch(vid)  # make sure the download (and with it the silence check) has started
         except Exception:
@@ -676,9 +844,29 @@ class Room:
                 tr = music.trim(vid)
                 if tr:
                     self.current["start"], self.current["end"] = tr
-                self.status, self.pos, self.upd = "playing", self.current.get("start") or 0.0, now()
+                start = self.current.get("start") or 0.0
+                # someone moved the slider while it was loading: start there
+                pos = self.pos if self._load_seek == qid else start
+                self._load_seek = None
+                self.status, self.pos, self.upd = "playing", pos, now()
                 self._arm_timer()
                 await self.push_music()
+
+    async def _skip_unplayable(self, qid: int, why: str = ""):
+        cur = self.current
+        if not cur or cur["qid"] != qid:
+            return
+        log.info("skipping unplayable song %s: %s", cur["id"], why[:200])
+        self._bad.append(cur["id"])
+        await self.broadcast({"t": "toast", "text": f"Can't play “{cur['title'][:60]}” — skipped"})
+        self.current = None  # (not put back by repeat, not repeated)
+        self.queue = [q for q in self.queue if q["id"] != cur["id"]]
+        if self.queue:
+            await self._start(self.queue.pop(0))
+        else:
+            await self._start(None)
+            if self.autoplay:
+                spawn(self._autoplay_fill(cur["id"]))
 
     async def _import_job(self, p: Participant, source: str, fetch):
         """Find each Spotify / SoundCloud song on YouTube and queue them in order, a few at a time (the first ones
@@ -714,8 +902,14 @@ class Room:
     async def _watch_song(self, qid: int, vid: str):
         """While a song plays: apply its silence info once known (skip a silent intro that's still playing, end
         before a silent tail), and switch crossfade on once the next song is ready."""
+        try:
+            await self._watch_loop(qid, vid)
+        finally:
+            self._watching.discard(qid)
+
+    async def _watch_loop(self, qid: int, vid: str):
         trimmed = False
-        for _ in range(400):
+        for _ in range(2400):
             await asyncio.sleep(3)
             async with self._lock:
                 cur = self.current
@@ -739,49 +933,75 @@ class Room:
     async def _fill_duration(self, item: dict):
         try:
             info = await music.resolve(item["id"])
-            d = (info.get("track") or {}).get("duration") or 0
+        except Exception as e:
+            if music.unplayable(e) and self.status != "loading":  # (_when_ready deals with it while loading)
+                async with self._lock:
+                    await self._skip_unplayable(item["qid"], str(e))
+            return
+        d = _dur((info.get("track") or {}).get("duration"))
+        async with self._lock:
             if d and self.current and self.current["qid"] == item["qid"]:
                 self.current["duration"] = d
                 self._arm_timer()
                 await self.push_music()
-        except Exception:
-            pass
 
     async def _next(self, auto: bool = False):
         cur = self.current
         if cur and auto and self.loop == "one":
-            return await self._start({**cur})
+            return await self._start({**cur}, repeat=True)
         if cur and self.loop == "all" and all(q["id"] != cur["id"] for q in self.queue):
             self._qid += 1
             self.queue.append({**cur, "qid": self._qid})
         if self.queue:
             return await self._start(self.queue.pop(0))
         if self.autoplay and cur:
+            # (normally the next autoplay song is lined up already; this is when that lookup hadn't finished)
             await self._start(None)
             spawn(self._autoplay_fill(cur["id"]))
             return
         await self._start(None)
 
     async def _autoplay_fill(self, seed: str):
-        try:
-            rel = await music.related(seed)
-        except Exception as e:
-            log.info("autoplay failed: %s", e)
+        """Line up a few songs like the last one. While a song plays they go into the queue (so the next one starts
+        right away, with no "Nothing playing" gap); with nothing playing, the first one starts."""
+        if self._filling:
             return
-        rel = [r for r in rel if r["id"] not in self.recent and (not r["duration"] or r["duration"] < 900)]
-        top = rel[:8]
-        random.shuffle(top)  # (shuffling a slice in place would shuffle a throwaway copy)
-        rel = top + rel[8:]
-        async with self._lock:
-            if not self.autoplay or self.current:
-                return
-            for r in rel[:3]:
-                it = self._item(r, None, by="Autoplay")
-                if it:
-                    it["auto"] = True
-                    self.queue.append(it)
-            if self.queue:
-                await self._start(self.queue.pop(0))
+        self._filling = True
+        try:
+            rel: list[dict] = []
+            seeds = [seed] + [v for v in reversed(self.recent) if v != seed][:2]
+            for sd in seeds:  # the related list can fail or come back empty: try the songs before it
+                try:
+                    rel = await music.related(sd)
+                except Exception as e:
+                    log.info("autoplay lookup failed for %s: %s", sd, e)
+                    continue
+                rel = [r for r in rel if r["id"] not in self.recent and r["id"] not in self._bad
+                       and (not r["duration"] or r["duration"] < 900)]
+                if rel:
+                    break
+            top = rel[:8]
+            random.shuffle(top)  # (shuffling a slice in place would shuffle a throwaway copy)
+            rel = top + rel[8:]
+            async with self._lock:
+                if not self.autoplay or (self.current and self.queue):
+                    return
+                if not rel:
+                    if not self.current:
+                        await self.broadcast({"t": "toast", "text": "Autoplay couldn't find more songs right now"})
+                    return
+                for r in rel[:3]:
+                    it = self._item(r, None, by="Autoplay")
+                    if it:
+                        it["auto"] = True
+                        self.queue.append(it)
+                if not self.current:
+                    await self._start(self.queue.pop(0))
+                else:
+                    self._arm_timer()  # (the next song is known now: crossfade can be set up)
+                    await self.push_music()
+        finally:
+            self._filling = False
 
     def can(self, p: Participant, perm: str) -> bool:
         if p.admin:
@@ -816,6 +1036,10 @@ class Room:
                 return
             if len([q for q in self.queue if q["byUid"] == p.uid]) + len(items) > 200 and not admin:
                 return await self.toast(p.uid, "Queue limit reached")
+            if len(self.queue) + len(items) > QUEUE_MAX:  # the whole queue goes to every phone on each change
+                items = items[:max(0, QUEUE_MAX - len(self.queue))]
+                if not items:
+                    return await self.toast(p.uid, f"The queue is full ({QUEUE_MAX} songs)")
             # No duplicates in the queue. "Play now" / "Play next" on a song that's already queued moves it instead.
             queued = {q["id"] for q in self.queue}
             if now_ or next_:
@@ -909,6 +1133,7 @@ class Room:
             return
         if cmd == "play":
             if self.status == "paused":
+                self._idle_paused = False
                 self.status, self.upd = "playing", now()
                 self._arm_timer()
                 await self.push_music()
@@ -922,12 +1147,21 @@ class Room:
         elif cmd == "seek":
             if self.current:
                 dur = self.current.get("duration") or 1e9
-                self.pos, self.upd = max(0.0, min(float(msg.get("pos", 0)), dur - 1)), now()
+                try:
+                    to = float(msg.get("pos", 0))
+                except (TypeError, ValueError):
+                    return
+                if not math.isfinite(to):
+                    return
+                self.pos, self.upd = max(0.0, min(to, dur - 1)), now()
+                if self.status == "loading":
+                    self._load_seek = self.current["qid"]  # (kept when it starts)
                 self._arm_timer()
                 await self.push_music()
         elif cmd == "prev":
-            if self.current and self.cur_pos() > 5:
-                self.pos, self.upd = 0.0, now()
+            start = (self.current or {}).get("start") or 0.0
+            if self.current and self.cur_pos() - start > 5:
+                self.pos, self.upd = start, now()  # back to where the sound starts, not the silent intro
                 self._arm_timer()
                 await self.push_music()
             elif self.history:
@@ -972,13 +1206,14 @@ class Room:
         elif cmd == "autoplay":
             self.autoplay = bool(msg.get("on"))
             await self.push_music()
-            if self.autoplay and not self.current and not self.queue:
-                last = self.recent[-1] if self.recent else None
+            if self.autoplay and not self.queue:
+                last = self.current["id"] if self.current else (self.recent[-1] if self.recent else None)
                 if last:
                     spawn(self._autoplay_fill(last))
         elif cmd == "ended":
-            # client hint for tracks with unknown duration
-            if self.current and self.current["qid"] == msg.get("qid") and not self.current.get("duration"):
+            # client hint for tracks with unknown duration; it must have played a while (anyone can send this)
+            if (self.current and self.current["qid"] == msg.get("qid") and not self.current.get("duration")
+                    and self.status == "playing" and self.cur_pos() > 20):
                 await self._next(auto=True)
 
     async def set_fx(self, p: Participant, new: dict):
@@ -1005,13 +1240,64 @@ class Room:
         self._arm_timer()
         await self.push_music()
 
+    # ---------------- surviving a restart -----------------
+    # The queue and the song playing lived only in memory: every deploy or restart emptied them. They're saved
+    # (a moment after each change) and read back when the room is built again.
+    async def _save_soon(self):
+        if getattr(self, "_saving", False):
+            return
+        self._saving = True
+        try:
+            await asyncio.sleep(2)
+            await self.save_now()
+        finally:
+            self._saving = False
+
+    async def save_now(self):
+        data = {"queue": self.queue, "current": self.current, "status": self.status, "pos": self.cur_pos(),
+                "at": now(), "loop": self.loop, "autoplay": self.autoplay, "fx": self.fx, "qid": self._qid}
+        try:
+            await db.x("INSERT OR REPLACE INTO room_state(chat_id,data,ts) VALUES(?,?,?)",
+                       (self.chat_id, _dumps(data), now()))
+        except Exception as e:
+            log.info("saving music state failed: %s", e)
+
+    def restore(self, data: dict):
+        if not isinstance(data, dict):
+            return
+        self._qid = int(data.get("qid") or 0)
+        self.queue = [q for q in data.get("queue") or [] if isinstance(q, dict) and q.get("id")][:QUEUE_MAX]
+        self.loop = data.get("loop") if data.get("loop") in ("off", "one", "all") else "off"
+        self.autoplay = bool(data.get("autoplay"))
+        if isinstance(data.get("fx"), dict):
+            self.fx = {**FX_DEFAULT, **data["fx"]}
+        cur = data.get("current")
+        if isinstance(cur, dict) and cur.get("id") and data.get("status") in ("playing", "paused", "loading"):
+            self.current = cur
+            pos = float(data.get("pos") or 0)
+            if data.get("status") == "playing":
+                pos += (now() - float(data.get("at") or now())) * self.fx["rate"]
+            dur = cur.get("duration") or 0
+            if dur and pos >= (cur.get("end") or dur) - 1:
+                # it would have ended while the server was down: start with the next one when someone comes
+                self.current = None
+                if self.queue:
+                    self.current = self.queue.pop(0)
+                    pos = self.current.get("start") or 0.0
+            if self.current:
+                # paused until someone is here; the first person in starts it again (see join)
+                self.pos, self.upd, self.status, self._idle_paused = pos, now(), "paused", True
+                self._watching.add(self.current["qid"])
+                spawn(self._watch_song(self.current["qid"], self.current["id"]))
+                spawn(music.prefetch(self.current["id"]))
+
     def _remember(self, q: Participant):
         self.sticky[q.uid] = {"force_muted": q.force_muted, "role": q.role}
 
     # ---------------- admin -----------------
     async def on_admin(self, p: Participant, t: str, msg: dict):
         await self._on_admin(p, t, msg)
-        for q in self.parts.values():
+        for q in list(self.parts.values()):
             if not q.admin and (q.force_muted or q.role == "listener" or q.uid in self.sticky):
                 self._remember(q)
 
@@ -1062,6 +1348,7 @@ class Room:
                 await self.send_to(uid, {"t": "kicked", "ban": t == "admin.ban"})
                 for c in list(target.conns):
                     await c.close(4003)
+                await self._gone(target)
                 await lk.remove(self.chat_id, uid)
             await self.toast(p.uid, f"{'Banned' if t == 'admin.ban' else 'Removed'} {name}")
         elif t == "admin.musicperms":
@@ -1115,7 +1402,7 @@ class Room:
             target.flags = []
             await self.bcast_part(target)
         elif t == "admin.muteall":
-            for q in self.parts.values():
+            for q in list(self.parts.values()):
                 if not q.admin:
                     q.force_muted = True
                     if q.mic:
@@ -1124,7 +1411,7 @@ class Room:
                     await self.bcast_part(q)
             await self.broadcast({"t": "toast", "text": "Admin muted everyone"})
         elif t == "admin.unmuteall":
-            for q in self.parts.values():
+            for q in list(self.parts.values()):
                 if q.force_muted:
                     q.force_muted = False
                     await lk.set_publish(self.chat_id, q.uid, self.can_speak(q))
@@ -1143,10 +1430,18 @@ class Room:
         elif t == "admin.resetlink":
             await db.x("UPDATE groups SET link_version=link_version+1 WHERE chat_id=?", (self.chat_id,))
             await p_send(self, p, {"t": "link", "url": await tg.group_link(self.chat_id), "reset": True})
+            spawn(pin.refresh(self.chat_id, force=True))  # the pinned JOIN button gets the new link too
         elif t == "admin.link":
             await p_send(self, p, {"t": "link", "url": await tg.group_link(self.chat_id)})
         elif t == "admin.schedule":
-            at = float(msg.get("at", 0))
+            try:
+                at = float(msg.get("at", 0))
+            except (TypeError, ValueError):
+                at = 0.0
+            if not math.isfinite(at) or not at:
+                return await self.toast(p.uid, "Pick a date and time")
+            if at > now() + 60 * 86400:
+                return await self.toast(p.uid, "Pick a time within the next 60 days")
             if at < now() + 30:
                 return await self.toast(p.uid, "Pick a time in the future")
             await db.x("INSERT INTO schedules(chat_id,title,at,by_uid) VALUES(?,?,?,?)",
@@ -1186,7 +1481,15 @@ async def get_room(chat_id: int) -> Room:
                        "ORDER BY id DESC LIMIT 20", (chat_id,))
     if chat_id in ROOMS:  # another request built it while we were reading the database
         return ROOMS[chat_id]
+    saved = await db.q1("SELECT data FROM room_state WHERE chat_id=?", (chat_id,))
+    if chat_id in ROOMS:
+        return ROOMS[chat_id]
     r = Room(chat_id, g)
+    if saved:
+        try:
+            r.restore(json.loads(saved["data"]))
+        except Exception as e:
+            log.info("couldn't restore the music of %s: %s", chat_id, e)
     for m in reversed(rows):
         r.chat.append({"id": m["id"], "uid": m["uid"], "name": m["name"], "photo": f"/api/avatar/{m['uid']}", "text": m["text"],
                        "reply": json.loads(m["reply"]) if m["reply"] else None,
@@ -1196,6 +1499,23 @@ async def get_room(chat_id: int) -> Room:
                           "duration": pl["duration"] or 0, "by": pl["by_name"] or "", "byUid": pl["by_uid"] or 0})
     ROOMS[chat_id] = r
     return r
+
+
+async def bg_tick_loop():
+    """A minimized Telegram stops the app's timers, but messages from the server still wake it. Without that, a
+    song that failed to load in the background (its retry waits on a timer) stayed silent until the app was opened
+    again, while everyone else's phone had moved on. Minimized apps get a small tick every 3 seconds, and the
+    player checks itself on each one."""
+    tick = _dumps({"t": "tick"})
+    while True:
+        await asyncio.sleep(3)
+        for r in list(ROOMS.values()):
+            if r.status not in ("playing", "loading"):
+                continue
+            for p in list(r.parts.values()):
+                for c in list(p.conns):
+                    if c.bg:
+                        await c.send_text(tick)
 
 
 async def heartbeat_loop():
@@ -1210,3 +1530,9 @@ async def heartbeat_loop():
                 await r.heartbeat()
             except Exception:
                 log.exception("heartbeat")
+            # a voice chat nobody has been in for 6 hours, with no music playing, is let go of (it's built
+            # again from the database when someone comes back)
+            if not r.parts and not r._lingering and r.status != "playing" and now() - r.last_active > 6 * 3600:
+                await r.save_now()
+                r._cancel_timer()
+                ROOMS.pop(r.chat_id, None)

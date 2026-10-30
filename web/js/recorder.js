@@ -1,6 +1,6 @@
 // Admin recording: mixes everyone's voice + the music on the admin's device, then the bot sends the file.
 import { S, api, h, off, on, send, sheet, toast } from './core.js';
-import { musicTap } from './player.js';
+import { musicTap, musicUntap } from './player.js';
 import { getCtx } from './sounds.js';
 import { audioTracks } from './voice.js';
 
@@ -72,6 +72,7 @@ export const recorder = {
       let chapters = '';
       try { chapters = buildChapters(samples, names); } catch (e) { console.warn(e); }
       if (tap) try { tap.node.disconnect(dest); } catch {}
+      musicUntap(); // the music goes back to the plain player (Web Audio crackles in the background)
       const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
       const ext = (mr.mimeType || '').includes('mp4') ? 'm4a' : (mr.mimeType || '').includes('ogg') ? 'ogg' : 'webm';
       toast('Uploading recording…', 4000);

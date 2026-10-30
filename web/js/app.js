@@ -1,4 +1,4 @@
-import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
+import { $, CID, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
 import { getMusicVolume, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
@@ -60,7 +60,7 @@ let byeSent = false;
 function bye() {
   if (byeSent || !S.session) return;
   byeSent = true;
-  try { navigator.sendBeacon('/api/bye?s=' + encodeURIComponent(S.session)); } catch {}
+  try { navigator.sendBeacon('/api/bye?s=' + encodeURIComponent(S.session) + '&c=' + CID); } catch {}
   leaveVoice();
 }
 window.addEventListener('pagehide', bye);
@@ -86,6 +86,12 @@ on('ws:init', (m) => {
     started = true;
     startVoice(S.lk);
     bindDock();
+  } else {
+    // Reconnected after a longer drop: the room has us back with the mic off, but we may still be talking.
+    // Tell it what we're really doing (before, we saw "You're live" and everyone else saw us muted).
+    if (V.mic) send({ t: 'mic', on: true });
+    if (V.cam) send({ t: 'video', on: true });
+    if (V.screen) send({ t: 'screen', on: true });
   }
   renderHeader(); renderGrid(true); renderDock();
 });
@@ -773,7 +779,7 @@ function scheduleBox() {
       h('button', { class: 'close-x', 'aria-label': 'Delete', onclick: () => { send({ t: 'admin.unschedule', id: x.id }); setTimeout(load, 300); } }, icon('trash'))))) : '');
   };
   box.append(h('div', { style: { display: 'grid', gap: '8px', margin: '8px 0' } }, when, ttl,
-    h('button', { class: 'btn sm', onclick: () => { const at = new Date(when.value).getTime() / 1000; send({ t: 'admin.schedule', at, title: ttl.value }); setTimeout(load, 400); } }, 'Schedule reminder')), list);
+    h('button', { class: 'btn sm', onclick: () => { const at = new Date(when.value).getTime() / 1000; if (!when.value || !Number.isFinite(at)) return toast('Pick a date and time first'); send({ t: 'admin.schedule', at, title: ttl.value }); setTimeout(load, 400); } }, 'Schedule reminder')), list);
   load().catch(() => {});
   return box;
 }
@@ -803,7 +809,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;

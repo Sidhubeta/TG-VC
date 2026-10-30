@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import config
 
@@ -52,6 +53,7 @@ CREATE INDEX IF NOT EXISTS ix_sched ON schedules(sent, at);
 CREATE TABLE IF NOT EXISTS listens(
   id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, vid TEXT, title TEXT, artist TEXT, ts REAL);
 CREATE INDEX IF NOT EXISTS ix_listens_uid ON listens(uid, ts);
+CREATE TABLE IF NOT EXISTS room_state(chat_id INTEGER PRIMARY KEY, data TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS members(
   chat_id INTEGER, uid INTEGER, name TEXT, username TEXT, seen REAL, PRIMARY KEY(chat_id, uid));
 """
@@ -70,8 +72,17 @@ def q_sync(sql, args=()):
         return [dict(r) for r in _conn.execute(sql, args).fetchall()]
 
 
+# The database gets its own threads: in the shared pool, YouTube lookups and ffmpeg (seconds each) could fill
+# every thread during a Spotify import, and logins, chat and every other query waited behind them.
+_POOL = ThreadPoolExecutor(2, thread_name_prefix="db")
+
+
+def _run(fn, *args):
+    return asyncio.get_running_loop().run_in_executor(_POOL, fn, *args)
+
+
 async def q(sql, args=()):
-    return await asyncio.to_thread(q_sync, sql, args)
+    return await _run(q_sync, sql, args)
 
 
 async def q1(sql, args=()):
@@ -86,7 +97,7 @@ def x_sync(sql, args=()):
 
 
 async def x(sql, args=()):
-    return await asyncio.to_thread(x_sync, sql, args)
+    return await _run(x_sync, sql, args)
 
 
 def xmany_sync(sql, rows):
@@ -104,7 +115,7 @@ async def xmany(sql, rows):
     """Many writes in one transaction and one thread hop (much faster than a loop of x())."""
     rows = list(rows)
     if rows:
-        await asyncio.to_thread(xmany_sync, sql, rows)
+        await _run(xmany_sync, sql, rows)
 
 
 # --- helpers -------------------------------------------------------------

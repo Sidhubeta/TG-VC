@@ -915,3 +915,43 @@ body.composing #chat-pop { margin-bottom: 0; }
 .pick.queue .ico { color: var(--tg-green); }
 .pick.locked { opacity: .45; }
 .np-card .ctl .muted-btn { color: #ffb340; animation: dotpulse 1.6s ease-in-out infinite; }
+
+/* ============ round 7 ============ */
+/* Taps: no double-tap-zoom wait, the icon inside a button never "steals" the tap, and a sheet or backdrop that
+   is sliding away no longer swallows the next tap for half a second. */
+button, [role="button"], .trk, .cc, .pick, a { touch-action: manipulation; }
+button .ico, button svg, .btn .ico { pointer-events: none; }
+.backdrop:not(.show), .sheet:not(.show) { pointer-events: none; }
+/* instant press feedback everywhere */
+button:not(:disabled):active, [role="button"]:active { transition-duration: .08s; }
+.btn:active, .round:active, .np-card .ctl button:active, .ctrls button:active, .vbtn:active { transform: scale(.92); }
+/* mic: instant feedback while the microphone switches on/off */
+.mic-wrap.busy .mic { transform: scale(.93); }
+.mic-wrap.busy .mic .blob { animation: micbusy .9s ease-in-out infinite; }
+@keyframes micbusy { 50% { opacity: .65; } }
+
+/* ---- motion polish (transform / opacity only, so it stays smooth on phones) ---- */
+#room:not([hidden]) { animation: roomin .45s var(--ease) both; }
+@keyframes roomin { from { opacity: 0; transform: scale(.985); } }
+/* new song: art and title slide in */
+.np-card.swap .art, .np-card.swap .meta { animation: songin .5s var(--spring) both; }
+.np-card.swap .meta { animation-delay: .05s; }
+@keyframes songin { from { opacity: 0; transform: translateX(14px); } }
+.np-card .card-vid { animation: vidin .4s var(--ease) both; transform-origin: top center; }
+@keyframes vidin { from { opacity: 0; transform: scaleY(.92); } }
+/* sheet contents fade up one after another as the sheet opens */
+.sheet.show .sh-body > *, .sheet.show .sh-body > div > .picks > * { animation: shin .38s var(--ease) both; }
+.sheet.show .sh-body > *:nth-child(2), .sheet.show .picks > *:nth-child(2) { animation-delay: .04s; }
+.sheet.show .sh-body > *:nth-child(3), .sheet.show .picks > *:nth-child(3) { animation-delay: .08s; }
+.sheet.show .sh-body > *:nth-child(n+4) { animation-delay: .11s; }
+@keyframes shin { from { opacity: 0; transform: translateY(8px); } }
+/* play / pause icon pops when it changes */
+#np-pp .ico, .np-card .ctl button .ico { animation: iconpop .25s var(--spring); }
+@keyframes iconpop { from { transform: scale(.7); opacity: .4; } }
+/* "you can't do that" toasts give a small shake */
+.toast.err { animation: tin .35s var(--spring), errshake .4s ease .15s; }
+.toast.err.out { animation: tout .3s ease forwards; }
+@keyframes errshake { 20%, 60% { transform: translateX(-5px); } 40%, 80% { transform: translateX(5px); } }
+@media (prefers-reduced-motion: reduce) {
+  #room, .np-card .art, .np-card .meta, .np-card .card-vid, .sheet .sh-body *, #composer, .ico, .toast { animation: none !important; }
+}

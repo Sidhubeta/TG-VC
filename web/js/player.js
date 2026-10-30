@@ -1,5 +1,5 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
-import { $, S, actionRow, api, avatarEl, can, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
+import { $, S, actionRow, api, can, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
 
 // ======================= engine =======================
@@ -10,10 +10,20 @@ function makeAudio() {
   const a = new Audio();
   a.preload = 'auto';
   a.crossOrigin = 'anonymous';
-  a.addEventListener('loadedmetadata', () => sync(true));
-  a.addEventListener('ended', onEnded);
-  a.addEventListener('error', onAudioError);
+  // (a spare element waiting to be used must not steer the music)
+  a.addEventListener('loadedmetadata', () => a === audio && sync(true));
+  a.addEventListener('ended', () => a === audio && onEnded());
+  a.addEventListener('error', () => a === audio && onAudioError());
+  // Minimized Telegram freezes the page's timers, but the playing song still sends time updates: use them to
+  // keep the music on track in the background.
+  a.addEventListener('timeupdate', () => { if (a === audio && document.hidden && Date.now() - lastSync > 900) sync(); });
   return a;
+}
+let lastSync = 0;
+// play(), and treat only a real "needs a tap" refusal as blocked sound. A play() cut short because the song
+// changed or reloaded (AbortError) used to light up the "sound off" button on new songs for no reason.
+function tryPlay() {
+  return audio.play().then(() => setBlocked(false), (e) => { if (e?.name === 'NotAllowedError') setBlocked(true); });
 }
 const video = h('video', { class: 'vid', playsinline: true, muted: true, preload: 'auto' });
 video.muted = true;
@@ -48,20 +58,29 @@ export function expectedPos() {
   return Math.max(0, Math.min(p, d));
 }
 // The server starts the next song ~0.8 s after one ends. If that news hasn't arrived (phones pause the app's
-// connection in the background), play the next song from the queue ourselves instead of sitting on the old one.
+// connection in the background), play the next songs from the queue ourselves instead of sitting on the old one.
+// Also used the moment our own copy of a song ends (P.endedQid), so the next one starts without a gap.
 function predicted() {
   const m = S.music, c = m?.current;
   if (!c || m.status !== 'playing' || !c.duration) return null;
-  const over = (m.pos + (serverNow() - m.upd) * (m.rate || 1) - c.duration) / (m.rate || 1);
-  if (over < 1.5) return null;
-  const next = m.loop === 'one' ? c : (m.queue[0] || (m.loop === 'all' ? c : null));
-  return next ? { track: next, pos: over - 0.8 } : { ended: true };
+  const r = m.rate || 1;
+  const over = (m.pos + (serverNow() - m.upd) * r - c.duration) / r; // seconds past the end of the current song
+  if (over < 1.5 && !(P.endedQid === c.qid && over > -3)) return null;
+  let pos = Math.max(0, over - 0.8);
+  if (m.loop === 'one') return { track: c, pos: pos % (c.duration + 0.8) };
+  for (const t of m.queue) {
+    const done = t.duration && (pos >= t.duration + 0.8 || (P.endedQid === t.qid && pos > t.duration - 3));
+    if (!done) return { track: t, pos };
+    pos = Math.max(0, pos - t.duration - 0.8);
+  }
+  return m.loop === 'all' ? { track: m.queue[0] || c, pos: 0 } : { ended: true };
 }
 
 function audioSrc(t) { return media(`/api/stream/${t.id}/audio?c=${CODEC}&q=${P.aq}`); }
 
 function load(t) {
   P.loadedQid = t ? t.qid : null;
+  P.loadedTrack = t || null;
   P.localPaused = false;
   if (!t) { audio.removeAttribute('src'); audio.load(); unloadVideo(); return; }
   audio.src = audioSrc(t);
@@ -70,7 +89,7 @@ function load(t) {
   else unloadVideo();
 }
 function loadVideo(t) {
-  t = t || cur(); if (!t) return;
+  t = t || P.loadedTrack || cur(); if (!t) return;
   const src = media(`/api/stream/${t.id}/video?q=${P.vq}`);
   if (video.dataset.src === src) return;
   video.dataset.src = src;
@@ -85,26 +104,67 @@ video.addEventListener('playing', () => setVideoLoading(false));
 video.addEventListener('canplay', () => setVideoLoading(false));
 function unloadVideo() { if (video.dataset.src) { video.removeAttribute('src'); delete video.dataset.src; video.load(); } }
 
-function onEnded() { const c = cur(); if (c && !c.duration) send({ t: 'music.ended', qid: c.qid }); }
+// Start the next song right here, inside the "ended" event. When Telegram is minimized its timers are frozen,
+// so waiting for the next tick left the old song stuck (or looping) until the app was opened again.
+function onEnded() {
+  const c = cur(); if (!c) return;
+  if (!c.duration) send({ t: 'music.ended', qid: c.qid });
+  P.endedQid = P.loadedQid;
+  sync();
+}
 // retry a failed stream a few times (with backoff), not forever every 3s
 let errQid = null, errCount = 0;
 function onAudioError() {
-  const t = cur(); if (!t || !audio.getAttribute('src')) return;
+  // retry the song that's loaded: after moving on by ourselves (no news from the server) that's not cur()
+  const t = P.loadedTrack; if (!t || !audio.getAttribute('src')) return;
   console.warn('audio error', audio.error);
   if (errQid !== t.qid) { errQid = t.qid; errCount = 0; }
   if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
-  setTimeout(() => { const c = cur(); if (c && c.qid === t.qid && audio.error) { audio.src = audioSrc(c); audio.load(); } }, 2000 * errCount);
+  setTimeout(() => { if (P.loadedQid === t.qid && audio.error) { audio.src = audioSrc(t); audio.load(); } }, 2000 * errCount);
 }
 video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused) video.play().catch(() => {}); });
+// A video that fails to load (network blip, expired link) is retried by itself; before, it stayed blank until
+// you switched to audio and back.
+let vErr = 0;
+video.addEventListener('error', () => {
+  if (!video.dataset.src || ++vErr > 4) return;
+  const t = P.loadedTrack;
+  setTimeout(() => { if (t && P.loadedQid === t.qid && isVideo() && video.error) { delete video.dataset.src; loadVideo(t); } }, 1500 * vErr);
+});
+video.addEventListener('playing', () => { vErr = 0; });
 
-let lastVideoSeek = 0;
+let lastVideoSeek = 0, seekCost = 0.25, seekAt = 0;
 function seekVideo() {
-  // aim a little ahead: after a seek the video needs a moment to buffer before it moves again
-  try { video.currentTime = Math.min(audio.currentTime + 0.2, video.duration || Infinity); lastVideoSeek = Date.now(); } catch {}
+  // Aim ahead by as long as the last seek took: after a seek the video needs a moment before it moves again,
+  // so aiming at "now" left it behind the sound every time.
+  try {
+    video.currentTime = Math.min(audio.currentTime + seekCost * (audio.playbackRate || 1), video.duration || Infinity);
+    lastVideoSeek = seekAt = Date.now();
+  } catch {}
+}
+video.addEventListener('seeked', () => { if (seekAt) { seekCost = Math.min(1.5, Math.max(0.1, (Date.now() - seekAt) / 1000 + 0.05)); seekAt = 0; } });
+// The time of the frame really on screen (Chrome / Safari 15.4+). video.currentTime runs ahead of what's shown
+// when the phone is slow to decode, which hid the "picture behind the sound" gap from the old check.
+let frameTime = null;
+function watchFrames() {
+  if (!video.requestVideoFrameCallback) return;
+  video.requestVideoFrameCallback((now, meta) => { frameTime = { media: meta.mediaTime, at: now }; watchFrames(); });
+}
+watchFrames();
+function shownVideoTime() {
+  if (frameTime && !video.paused && performance.now() - frameTime.at < 400) return frameTime.media + (performance.now() - frameTime.at) / 1000 * video.playbackRate;
+  return video.currentTime;
 }
 
 function sync(force = false) {
-  const pr = predicted();
+  lastSync = Date.now();
+  let pr = predicted();
+  // The room's clock says the song is over (our copy may be stopped a moment before its own "ended" fires):
+  // count it as ended and go straight on to the next song, rather than pausing and waiting.
+  if (!pr) {
+    const c = cur();
+    if (c?.duration && playing() && !P.localPaused && P.loadedQid === c.qid && expectedPos() >= c.duration - 0.3) { P.endedQid = c.qid; pr = predicted(); }
+  }
   if (pr?.ended) { if (!audio.paused) audio.pause(); return; } // song over, nothing queued: wait, don't replay it
   const t = pr ? pr.track : cur();
   if (!t) { if (!audio.paused) audio.pause(); return; }
@@ -124,10 +184,11 @@ function sync(force = false) {
       try { audio.currentTime = exp; } catch {}
       fine = 0;
     } else if (want && keepPitch && !document.hidden) {
-      // Small gaps (everyone a bit apart): play 2% faster/slower until we're within 0.1 s. With the pitch kept,
-      // 2% can't be heard, unlike the jumps (or the 4% wobble of the first version).
-      if (Math.abs(drift) > 0.25) fine = drift > 0 ? -1 : 1;
-      else if (Math.abs(drift) < 0.08) fine = 0;
+      // Small gaps (everyone a bit apart): play 2% faster/slower until we're within 0.04 s. With the pitch kept,
+      // 2% can't be heard, unlike the jumps. (It used to start only at 0.25 s, so a phone could stay a fifth of
+      // a second off for the whole song: an echo between phones.)
+      if (Math.abs(drift) > 0.12) fine = drift > 0 ? -1 : 1;
+      else if (Math.abs(drift) < 0.04) fine = 0;
       speed = r * (1 + 0.02 * fine);
     }
   }
@@ -136,7 +197,7 @@ function sync(force = false) {
   // A finished <audio> restarts from 0 when played again. That was the "first 1-2 seconds on repeat" in the
   // background: never replay a song whose time is up.
   const over = !pr && t.duration && exp >= t.duration - 0.3;
-  if (want && audio.paused && !over) audio.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
+  if (want && audio.paused && !over) tryPlay();
   else if ((!want || over) && !audio.paused) audio.pause();
   // With an effect on, the song goes through Web Audio; if the phone suspended it, the song "plays" in silence.
   if (want && G && G.c.state !== 'running') { setBlocked(true); G.c.resume().then(() => { if (G?.c.state === 'running') setBlocked(false); }, () => {}); }
@@ -148,18 +209,28 @@ setInterval(sync, 700);
 // The video (muted) is kept on the audio's clock 4x a second. Small gaps are closed by playing the video a little
 // faster or slower (it's silent, so nobody hears it); only big gaps seek. Before, anything under 1 s was left,
 // so the picture ran visibly behind the sound.
+let vStuck = { t: -1, since: 0 };
 function syncVideo() {
   if (document.hidden) { if (!video.paused) video.pause(); return; } // nobody sees it: save the phone's power for the sound
   if (!video.dataset.src || video.readyState < 1) return;
   const r = audio.playbackRate || 1;
   if (!audio.paused && video.paused && video.isConnected) video.play().catch(() => {});
   if (audio.paused && !video.paused) video.pause();
-  const vd = video.currentTime - audio.currentTime;
+  const vd = shownVideoTime() - audio.currentTime;
   let vr = r;
-  if (Math.abs(vd) > 1) {
-    if (!video.seeking && video.readyState >= 3 && Date.now() - lastVideoSeek > 3000) seekVideo();
-  } else if (Math.abs(vd) > 0.08) vr = r * (vd > 0 ? 0.92 : 1.08);
+  if (Math.abs(vd) > 0.8) {
+    if (!video.seeking && video.readyState >= 2 && Date.now() - lastVideoSeek > 2000) seekVideo();
+  } else if (Math.abs(vd) > 0.05) {
+    // catch up in about 2 s: the further apart, the bigger the nudge (it's muted, so nobody hears it)
+    vr = r * (1 - Math.max(-0.25, Math.min(0.25, vd / 2)));
+  }
   if (Math.abs(video.playbackRate - vr) > 0.001) video.playbackRate = vr;
+  // the picture froze while the sound plays (stalled download): reload it at the right spot
+  if (!audio.paused && !video.paused && !video.seeking && video.isConnected) {
+    const now = Date.now();
+    if (Math.abs(video.currentTime - vStuck.t) > 0.05) vStuck = { t: video.currentTime, since: now };
+    else if (now - vStuck.since > 6000) { vStuck.since = now; const t = P.loadedTrack; if (t) { delete video.dataset.src; loadVideo(t); } }
+  } else vStuck.since = Date.now();
 }
 setInterval(() => { if (video.dataset.src && !document.hidden) syncVideo(); }, 250);
 
@@ -177,7 +248,7 @@ function watchdog(want, exp) {
     console.warn('music stalled, reloading at', exp.toFixed(1));
     const src = audio.getAttribute('src');
     audio.src = src; audio.load(); // loadedmetadata -> sync(true) seeks to the room's position
-    audio.play().catch(() => setBlocked(true));
+    tryPlay();
   }
 }
 // coming back to the app: jump to where the room is now (not where it was when you left)
@@ -197,11 +268,33 @@ function setBlocked(b) {
   renderCard(); // the card's play button turns into a "sound off" button while the phone holds the sound back
 }
 export const musicBlocked = () => P.blocked;
+// Called on every tap (touchend / click count as a "user gesture" on phones; pointerdown doesn't).
 export function unlockAudio() {
   getCtx();
   if (needGraph()) buildGraph();
-  G?.c.resume().catch(() => {});
-  if (cur() && playing() && !P.localPaused) audio.play().then(() => { if (!G || G.c.state === 'running') setBlocked(false); }).catch(() => {});
+  if (G && G.c.state !== 'running') G.c.resume().then(() => { if (G?.c.state === 'running' && !audio.paused) setBlocked(false); }, () => {});
+  // (sync decides: it never replays a song that's already over, which a bare play() would restart from 0)
+  if (cur() && playing() && !P.localPaused && audio.paused) sync();
+  else if (P.blocked && !audio.paused && (!G || G.c.state === 'running')) setBlocked(false);
+  primeSpare();
+}
+// iPhone unlocks sound per <audio> element. Keep one spare element that a tap already played (a short bit of
+// silence), so switching the effects off later can move the song to it without needing another tap.
+let spare = null, priming = false;
+const SILENCE = (() => {
+  const n = 800, b = new Uint8Array(44 + n).fill(128), v = new DataView(b.buffer);
+  const str = (o, x) => [...x].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true);
+  v.setUint16(34, 8, true); str(36, 'data'); v.setUint32(40, n, true);
+  return URL.createObjectURL(new Blob([b], { type: 'audio/wav' }));
+})();
+function primeSpare() {
+  if (spare || priming) return;
+  priming = true;
+  const a = makeAudio();
+  a.src = SILENCE;
+  a.play().then(() => { a.pause(); spare = a; }, () => {}).finally(() => { priming = false; });
 }
 
 // ======================= picture in picture =======================
@@ -235,10 +328,12 @@ const needGraph = () => {
 function releaseGraph() {
   if (!G || needGraph()) return;
   const old = audio, src = old.getAttribute('src'), was = !old.paused;
-  audio = makeAudio();
+  // a fresh element would need a new tap on iPhone: use the spare one that a tap already unlocked
+  audio = spare || makeAudio(); spare = null;
+  audio.removeAttribute('src');
   audio.volume = P.vol;
   audio.playbackRate = rate();
-  if (src) { audio.src = src; audio.load(); if (was) audio.play().catch(() => setBlocked(true)); }
+  if (src) { audio.src = src; audio.load(); if (was) tryPlay(); }
   old.pause(); old.removeAttribute('src'); old.load();
   try { G.master.disconnect(); } catch {}
   G = null;
@@ -357,9 +452,21 @@ async function loadLiked() {
   if (likedLoaded) return; likedLoaded = true;
   try { const r = await api('/api/like'); S.liked = new Set(r.ids); } catch {}
 }
+// The card is rebuilt only when something on it changes. Rebuilding it on every music update (a vote, someone
+// adding a song…) swapped the buttons out from under your finger, so taps were sometimes lost, and it moved
+// the video around, which made it stutter.
+let cardSig = '', cardQid;
 export function renderCard() {
   const el = card(); if (!el) return;
   const t = cur();
+  const vidHere = !!t && isVideo() && !NP.open && !FV;
+  const sig = t ? [t.qid, t.title, t.by, playing() && !P.localPaused, P.blocked, vidHere, can('add')].join('|') : 'empty|' + can('add');
+  // (full screen and the player borrow the video element: rebuild if it should be here but isn't)
+  if (sig === cardSig && el.firstChild && (!vidHere || el.contains(video))) return;
+  cardSig = sig;
+  // a new song slides in (only when the song really changes, not on play/pause)
+  if (t && t.qid !== cardQid && cardQid !== undefined) { el.classList.remove('swap'); void el.offsetWidth; el.classList.add('swap'); }
+  cardQid = t?.qid ?? null;
   el.replaceChildren();
   el.classList.toggle('empty', !t);
   document.body.classList.toggle('playing', !!t && playing() && !P.localPaused);
@@ -576,18 +683,20 @@ export function refresh() {
   el.querySelector('#np-t').textContent = t.title;
   el.querySelector('#np-a').textContent = t.artist;
   el.querySelector('#np-by').textContent = t.by ? `Added by ${t.by}` : '';
-  const pp = el.querySelector('#np-pp'); pp.replaceChildren(icon(isPlay ? 'pause' : 'play', 'fill'));
-  pp.setAttribute('aria-label', isPlay ? 'Pause' : 'Play');
+  const pp = el.querySelector('#np-pp');
+  if (pp.getAttribute('aria-label') !== (isPlay ? 'Pause' : 'Play')) { pp.replaceChildren(icon(isPlay ? 'pause' : 'play', 'fill')); pp.setAttribute('aria-label', isPlay ? 'Pause' : 'Play'); }
   el.querySelector('#np-prev').classList.toggle('locked', !can('playback'));
   const v = S.music;
   el.querySelector('#np-votes').textContent = !can('playback') && t.byUid !== S.uid && v.votes ? `${v.votes}/${v.need}` : '';
   el.querySelector('#np-scrub').classList.toggle('ro', !can('playback'));
   el.querySelector('#np-like').classList.toggle('on', S.liked.has(t.id));
-  el.querySelector('#np-like').replaceChildren(icon('heart', S.liked.has(t.id) ? 'fill' : ''));
+  const lk = el.querySelector('#np-like'), liked = S.liked.has(t.id) ? '1' : '0';
+  if (lk.dataset.on !== liked) { lk.dataset.on = liked; lk.replaceChildren(icon('heart', liked === '1' ? 'fill' : '')); }
   el.querySelector('#tab-vid').classList.toggle('on', isVideo());
   el.querySelector('#tab-fx').classList.toggle('on', fx().preset !== 'normal');
-  if (NP.view === 'queue') renderStage();
+  if (NP.view === 'queue' && queueSig() !== NP.qsig) renderStage();
 }
+const queueSig = () => { const m = S.music; return [m.loop, m.autoplay, can('queue'), can('modes'), can('add'), ...m.queue.map(q => q.qid + q.title + q.by)].join('|'); };
 
 // ======================= server updates =======================
 let lastQid = null, lastTimeline = '', lastFx = '';
@@ -664,6 +773,7 @@ function highlightLyrics(pos) {
 // ======================= queue =======================
 function renderQueue(st) {
   const m = S.music;
+  NP.qsig = queueSig();
   const box = h('div', { class: 'qv' });
   const loopIcon = m.loop === 'one' ? 'repeat1' : 'repeat';
   box.append(
@@ -726,7 +836,7 @@ function toggleMode() { setVideo(!isVideo()); }
 async function openQuality() {
   const t = cur();
   const body = h('div');
-  const s = sheet({ title: 'Quality', body });
+  sheet({ title: 'Quality', body });
   const render = () => {
     body.replaceChildren(
       h('div', { class: 'grp-h' }, 'Mode'),
@@ -742,7 +852,7 @@ async function openQuality() {
             h('span', { class: 'lab' }, `${q}p`, q === 480 ? h('small', null, 'Default') : null),
             String(P.vq) === String(q) ? icon('check') : null))));
   };
-  const setAq = (k) => { P.aq = k; store.set('aq', k); const c = cur(); if (c) { audio.src = audioSrc(c); audio.load(); } render(); };
+  const setAq = (k) => { P.aq = k; store.set('aq', k); const c = P.loadedTrack; if (c) { audio.src = audioSrc(c); audio.load(); } render(); };
   const setVq = (q) => { P.vq = Number(q); store.set('vq', P.vq); delete video.dataset.src; if (isVideo()) loadVideo(); render(); };
   render();
   if (t) { try { P.heights = (await api(`/api/formats/${t.id}`)).heights; render(); } catch {} }

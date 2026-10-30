@@ -1,5 +1,5 @@
 import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
-import { getMusicVolume, openNP, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
+import { getMusicVolume, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
@@ -144,7 +144,7 @@ function tileFor(p) {
   if (t._key !== key) { t._key = key; t._av = avatarEl(p); }
   const [st, cls] = statusOf(p);
   // rebuilding a row costs layout + emoji scanning; only do it when something visible changed
-  const sig = [st, cls, live, p.hand, p.admin, p.asGroup, p.flags?.length, S.admin, t._key, weak].join('|');
+  const sig = [st, cls, live, p.hand, p.admin, p.mod, p.asGroup, p.flags?.length, S.admin, t._key, weak].join('|');
   if (t._sig === sig) return t;
   t._sig = sig;
   t.replaceChildren(
@@ -152,6 +152,7 @@ function tileFor(p) {
     h('div', { class: 'pmeta' },
       h('div', { class: 'pname' }, h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, p.name), p.uid === S.uid ? h('span', { class: 'you' }, '(you)') : null,
         p.admin && !p.asGroup ? h('span', { class: 'tag' }, 'admin') : null,
+        p.mod ? h('span', { class: 'tag mod' }, 'mod') : null,
         S.admin && p.flags?.length ? h('span', { class: 'tag warn', title: p.flags.join('\n') }, 'check') : null),
       h('div', { class: 'psub ' + cls }, st)),
     weak ? h('span', { class: 'pnet', title: 'Weak internet' }, icon('signal')) : null,
@@ -188,8 +189,8 @@ on('ws:p.upd', (m) => {
   }
   renderGrid();
 });
-on('ws:hand', (m) => { if (S.admin && m.uid !== S.uid) toast(`✋ ${m.name} wants to speak`); });
-on('ws:alert', (m) => { if (S.admin) { toast(`⚠️ ${m.name}: ${m.flags[0]}`, 4000); bumpAdminBadge(); } });
+on('ws:hand', (m) => { if ((S.admin || isMod()) && m.uid !== S.uid) toast(`✋ ${m.name} wants to speak`); });
+on('ws:alert', (m) => { if (S.admin || isMod()) { toast(`⚠️ ${m.name}: ${m.flags[0]}`, 4000); bumpAdminBadge(); } });
 on('voice:speaking', () => { for (const p of S.parts.values()) tileFor(p); renderDock(); });
 // ---- connection quality: everyone sees who has weak internet; you get a banner for your own ----
 const net = new Map();
@@ -206,6 +207,8 @@ on('voice:quality', ({ uid, q }) => {
   }
 });
 
+// moderators (made by admins): can mute, move and remove people who aren't admins or moderators
+const isMod = () => !!S.parts.get(S.uid)?.mod;
 // participant action sheet
 function openParticipant(uid) {
   const p = S.parts.get(uid); if (!p) return;
@@ -220,14 +223,16 @@ function openParticipant(uid) {
     vol.oninput = () => { setVolume(uid, Number(vol.value)); paint(); };
     body.replaceChildren(
       h('div', { class: 'ph' }, h('div', { class: 'av' }, avatarEl(p)), h('h3', null, p.name),
-        h('p', null, [p.username ? '@' + p.username : null, p.realName ? `real: ${p.realName}` : null, p.admin ? 'admin' : null].filter(Boolean).join('  ·  ')),
+        h('p', null, [p.username ? '@' + p.username : null, p.realName ? `real: ${p.realName}` : null, p.admin ? 'admin' : null, p.mod ? 'moderator' : null,
+          S.room.settings?.music_dj?.[String(p.uid)] ? 'music DJ' : null].filter(Boolean).join('  ·  ')),
         p.bio ? h('div', { class: 'bio' }, p.bio) : null,
         h('p', { style: { marginTop: '6px' } }, p.forceMuted ? 'muted by admin' : p.hand ? 'wants to speak' : (p.mic && p.canSpeak) ? 'unmuted' : 'listening')),
-      S.admin && p.flags?.length ? h('div', null, ...p.flags.map(f => h('div', { class: 'flag' }, '⚠️', h('span', null, f)))) : null,
+      (S.admin || isMod()) && p.flags?.length ? h('div', null, ...p.flags.map(f => h('div', { class: 'flag' }, '⚠️', h('span', null, f)))) : null,
       !me ? h('div', { class: 'list' },
         h('div', { class: 'row' }, icon('vol-low'), vol, icon('vol')),
         actionRow(isMutedForMe(uid) ? 'vol' : 'vol-x', isMutedForMe(uid) ? 'Unmute for me' : 'Mute for me', () => { const m = toggleMuteForMe(uid); toast(m ? `${p.name} is muted for you` : `${p.name} unmuted for you`); renderGrid(); render(); }, '', 'Only you stop hearing them')) : null,
-      S.admin && !me && !p.admin ? h('div', { class: 'list' },
+      // admins, and moderators for people who aren't admins or moderators themselves
+      (S.admin || (isMod() && !p.mod)) && !me && !p.admin ? h('div', { class: 'list' },
         p.forceMuted
           ? actionRow('mic', 'Allow to speak', () => { send({ t: 'admin.unmute', uid }); s.close(); })
           : actionRow('mic-off', 'Mute for everyone', () => { send({ t: 'admin.mute', uid }); s.close(); }, '', 'They can’t unmute until you allow it'),
@@ -236,7 +241,10 @@ function openParticipant(uid) {
           : !p.forceMuted ? actionRow('hand', p.hand ? 'Accept hand — let them speak' : 'Make speaker', () => { send({ t: 'admin.role', uid, role: 'speaker' }); s.close(); }) : null,
         p.flags?.length ? actionRow('check', 'Clear warnings', () => { send({ t: 'admin.clearflags', uid }); s.close(); }) : null,
         actionRow('user-x', 'Remove from voice chat', async () => { if (await confirmBox(`Remove ${p.name}? They can rejoin.`, 'Remove', true)) { send({ t: 'admin.kick', uid }); s.close(); } }, 'red'),
-        actionRow('ban', 'Ban', async () => { if (await confirmBox(`Ban ${p.name}? They won't be able to join again until you unban them.`, 'Ban', true)) { send({ t: 'admin.ban', uid }); s.close(); } }, 'red')) : null,
+        S.admin ? actionRow('ban', 'Ban', async () => { if (await confirmBox(`Ban ${p.name}? They won't be able to join again until you unban them.`, 'Ban', true)) { send({ t: 'admin.ban', uid }); s.close(); } }, 'red') : null) : null,
+      S.admin && !me && !p.admin ? h('div', { class: 'list' },
+        p.mod ? actionRow('shield', 'Remove as moderator', () => { send({ t: 'admin.unmod', uid }); toast(`${p.name} is no longer a moderator`); s.close(); })
+          : actionRow('shield', 'Make moderator', () => { send({ t: 'admin.mod', uid }); toast(`${p.name} is now a moderator`); s.close(); }, '', 'Can mute, move and remove people')) : null,
       !me ? h('div', { class: 'list' }, actionRow('flag', 'Report to admins', async () => {
         const reason = await prompt_('Report ' + p.name, 'What happened? (optional)');
         send({ t: 'report', uid, reason }); s.close();
@@ -421,6 +429,7 @@ function openMore() {
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
       actionRow('music', 'Music player', () => { s.close(); openNP(); }),
       actionRow('search', 'Browse music', () => { s.close(); openSearch('home'); }),
+      actionRow('history', 'Play history', () => { s.close(); openPlayHistory(); }, '', 'What played and who added it'),
       actionRow('history', 'Recent messages', () => { s.close(); openHistory(); }, '', S.admin ? 'Last 48 hours' : 'Since you joined'),
       S.room.settings?.soundboard ? actionRow('sound', 'Soundboard', () => { s.close(); openBoard(); }) : null,
       screenSupported() && p?.canSpeak ? actionRow('screen', V.screen ? 'Stop sharing screen' : 'Share screen', () => { s.close(); setScreen(!V.screen); }) : null),
@@ -447,39 +456,57 @@ on('ws:sound', (m) => {
 async function openInvite() {
   haptic('light');
   const search = h('input', { type: 'search', placeholder: 'Search members', 'aria-label': 'Search members' });
-  const list = h('div', null, h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
   const note = h('p', { class: 'muted note' });
-  const body = h('div', null, h('div', { class: 'searchbar', style: { margin: '4px 0 6px' } }, icon('search'), search), note, list);
-  sheet({ title: 'Invite to voice chat', body, tall: true });
-  let people = [];
+  const list = h('div', { class: 'list' });
+  const foot = h('div', { class: 'inv-foot' });
+  const body = h('div', null, h('div', { class: 'searchbar', style: { margin: '4px 0 6px' } }, icon('search'), search), note, list, foot);
+  const sh = sheet({ title: 'Invite to voice chat', body, tall: true, onClose: () => io?.disconnect() });
   const sent = new Set();
-  const draw = () => {
-    const q = search.value.trim().toLowerCase().replace(/^@/, '');
-    const shown = people.filter(p => !q || p.name.toLowerCase().includes(q) || p.username.toLowerCase().includes(q));
-    list.replaceChildren(shown.length ? h('div', { class: 'list' }, ...shown.map(p => {
-      const btn = h('button', { class: 'btn sm' + (sent.has(p.uid) ? ' soft' : ''), disabled: sent.has(p.uid) }, sent.has(p.uid) ? 'Invited' : 'Invite');
-      btn.onclick = async () => {
-        btn.disabled = true;
-        try {
-          const r = await api('/api/invite', { body: { uid: p.uid } });
-          sent.add(p.uid); haptic('success');
-          toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} was mentioned in the group`);
-          btn.textContent = 'Invited'; btn.classList.add('soft');
-        } catch (e) { btn.disabled = false; toast(e.message, 3200, 'err'); }
-      };
-      return h('div', { class: 'row' }, h('div', { class: 'ia' }, avatarEl(p)),
-        h('span', { class: 'lab' }, p.name, h('small', null, [p.admin ? 'admin' : null, p.username ? '@' + p.username : null].filter(Boolean).join(' · '))), btn);
-    })) : h('div', { class: 'empty-note' }, q ? 'Nobody found.' : 'Nobody to invite right now.'));
+  // the list comes in pages: more people load by themselves as you scroll down
+  let q = '', next = 0, more = true, busy = false, gen = 0, io = null, shown = 0;
+  const row = (p) => {
+    const btn = h('button', { class: 'btn sm' + (sent.has(p.uid) ? ' soft' : ''), disabled: sent.has(p.uid) }, sent.has(p.uid) ? 'Invited' : 'Invite');
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        const r = await api('/api/invite', { body: { uid: p.uid } });
+        sent.add(p.uid); haptic('success');
+        toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} hasn’t started the bot, so they were mentioned in the group`, 3600);
+        btn.textContent = 'Invited'; btn.classList.add('soft');
+      } catch (e) { btn.disabled = false; btn.textContent = 'Invite'; toast(e.message, 3600, 'err'); }
+    };
+    return h('div', { class: 'row' }, h('div', { class: 'ia' }, avatarEl(p)),
+      h('span', { class: 'lab' }, p.name, h('small', null, [p.admin ? 'admin' : null, p.username ? '@' + p.username : null].filter(Boolean).join(' · '))), btn);
   };
-  search.oninput = draw;
-  try {
-    const r = await api('/api/invite');
-    people = r.people;
-    note.textContent = r.hidden
-      ? 'This group hides its member list, so only admins are shown.'
-      : 'Shows admins and members who have chatted in the group or joined the voice chat before. Telegram doesn’t let bots see the full member list.';
-    draw();
-  } catch (e) { list.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
+  const load = async () => {
+    if (busy || !more) return;
+    busy = true;
+    const my = gen;
+    foot.replaceChildren(h('div', { class: 'spinner', style: { margin: '14px auto' } }));
+    try {
+      const r = await api(`/api/invite?q=${encodeURIComponent(q)}&offset=${next}&limit=40`);
+      if (my !== gen) return; // a newer search started meanwhile
+      list.append(...r.people.map(row));
+      shown += r.people.length;
+      more = r.more; next = r.next;
+      note.textContent = r.only_admins ? 'This group hides its member list, so you can invite its admins.'
+        : r.source === 'full' ? (r.total != null ? `${r.total} members` : '')
+        : 'Admins and the members the bot has seen in the group.';
+      if (r.hint) note.append(h('span', { class: 'inv-hint' }, r.privacy
+        ? ' To list more people: in @BotFather send /setprivacy → choose the bot → Disable. To list everyone, set TG_API_ID and TG_API_HASH (my.telegram.org).'
+        : ' To list everyone in the group, set TG_API_ID and TG_API_HASH (from my.telegram.org) on the server.'));
+      foot.replaceChildren(!shown ? h('div', { class: 'empty-note' }, q ? 'Nobody found.' : 'Nobody to invite right now.') : '');
+      if (more && sh.body.scrollHeight <= sh.body.clientHeight + 40) { busy = false; return load(); } // fill the screen
+    } catch (e) {
+      if (my === gen) foot.replaceChildren(h('div', { class: 'empty-note' }, e.message, ' ', h('button', { class: 'btn sm soft', onclick: () => { busy = false; load(); } }, 'Retry')));
+    } finally { if (my === gen) busy = false; }
+  };
+  const restart = () => { gen++; busy = false; more = true; next = 0; shown = 0; list.replaceChildren(); load(); };
+  let tmr = null;
+  search.oninput = () => { clearTimeout(tmr); tmr = setTimeout(() => { q = search.value.trim().replace(/^@/, ''); restart(); }, 300); };
+  io = new IntersectionObserver((es) => { if (es.some(e => e.isIntersecting)) load(); }, { root: sh.body, rootMargin: '300px' });
+  io.observe(foot);
+  restart();
 }
 
 // ======================= chat (like Telegram's voice chat) =======================
@@ -585,7 +612,7 @@ function msgMenu(m) {
     h('div', { class: 'list' },
       actionRow('reply', 'Reply', () => { s.close(); historySheet?.close(); openChat(m); }),
       actionRow('copy', 'Copy text', () => { s.close(); copyText(m.text); }),
-      S.admin || m.uid === S.uid ? actionRow('trash', 'Delete', () => { send({ t: 'chat.del', id: m.id }); s.close(); }, 'red') : null));
+      S.admin || isMod() || m.uid === S.uid ? actionRow('trash', 'Delete', () => { send({ t: 'chat.del', id: m.id }); s.close(); }, 'red') : null));
   const s = sheet({ title: m.name, body });
 }
 function openHistory() {
@@ -630,11 +657,11 @@ function openAdmin(tab = 'room') {
   const body = h('div', null, tabs, content);
   let cleanup = null;
   const s = sheet({ title: 'Manage', body, tall: true, onClose: () => cleanup?.() });
-  const TABS = [['room', 'Room'], ['music', 'Music'], ['logs', 'Logs'], ['safety', 'Safety']];
+  const TABS = [['room', 'Room'], ['music', 'Music'], ['team', 'Team'], ['logs', 'Logs'], ['safety', 'Safety'], ['health', 'Health']];
   const go = (k) => {
     tab = k; cleanup?.(); cleanup = null;
     tabs.replaceChildren(...TABS.map(([id, l]) => h('button', { class: id === k ? 'on' : '', onclick: () => go(id) }, l)));
-    const r = ({ room: adminRoom, music: adminMusic, logs: adminLogs, safety: adminSafety })[k](content, s);
+    const r = ({ room: adminRoom, music: adminMusic, team: (c) => adminTeam(c, go), logs: adminLogs, safety: adminSafety, health: adminHealth })[k](content, s);
     cleanup = typeof r === 'function' ? r : null;
   };
   go(tab);
@@ -742,6 +769,68 @@ function adminMusic(c) {
   draw();
   on('room:changed', draw);
   return () => off('room:changed', draw);
+}
+// ---- health: is everything working? ----
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound',
+  js: 'App error', promise: 'App error' };
+function adminHealth(c) {
+  let alive = true;
+  const load = async () => {
+    c.replaceChildren(h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
+    let r;
+    try { r = await api('/api/health'); } catch (e) { c.replaceChildren(h('div', { class: 'empty-note' }, e.message)); return; }
+    if (!alive) return;
+    const dot = (ok) => h('span', { class: 'hdot ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'idle') });
+    const pr = r.problems;
+    c.replaceChildren(
+      h('div', { class: 'list' }, ...r.items.map(it => h('div', { class: 'row health' }, dot(it.ok),
+        h('span', { class: 'lab' }, it.name, h('small', null, it.detail)),
+        it.test ? h('button', { class: 'btn sm soft', onclick: async (e) => {
+          const b = e.currentTarget; b.disabled = true; b.textContent = '…';
+          try { const t = await api('/api/health', { body: { test: it.test } }); toast(t.detail, 4000, t.ok ? '' : 'err'); } catch (er) { toast(er.message, 3000, 'err'); }
+          load();
+        } }, 'Test') : null))),
+      h('div', { class: 'grp-h' }, 'Problems on people’s phones (24 h)'),
+      Object.keys(pr.counts).length
+        ? h('div', null,
+          h('p', { class: 'muted note' }, Object.entries(pr.counts).map(([k, n]) => `${PROBLEM[k] || k}: ${n}`).join(' · ')),
+          h('div', { class: 'list' }, ...pr.latest.map(d => h('div', { class: 'row' },
+            h('span', { class: 'lab' }, `${PROBLEM[d.kind] || d.kind} — ${d.name}`, h('small', null, `${fmtDate(d.ts)} · ${d.device} · ${d.detail}`))))))
+        : h('p', { class: 'muted note' }, 'None reported. 🎉'),
+      h('button', { class: 'btn sm soft', style: { marginTop: '10px' }, onclick: load }, 'Refresh'));
+  };
+  load();
+  return () => { alive = false; };
+}
+
+// ---- team: moderators (people) and music DJs (music) ----
+function adminTeam(c, go) {
+  const draw = () => {
+    const st = S.room.settings || {}, mods = st.mods || {}, djs = st.music_dj || {};
+    c.replaceChildren(
+      h('p', { class: 'muted note' }, 'Admins can do everything. Moderators look after people: mute or unmute, make listener or speaker, remove from the voice chat, delete messages (not ban, settings or recording). Music DJs get the music rights you choose.'),
+      h('div', { class: 'grp-h' }, 'Moderators'),
+      h('div', { class: 'list' },
+        ...Object.entries(mods).map(([uid, m]) => actionRow('shield', m.name, async () => {
+          if (await confirmBox(`Remove ${m.name} as moderator?`, 'Remove')) { send({ t: 'admin.unmod', uid: Number(uid) }); toast(`${m.name} is no longer a moderator`); }
+        }, '', 'Tap to remove')),
+        actionRow('plus', 'Add a moderator', () => pickPerson('Add a moderator', (p) => !p.admin && !mods[String(p.uid)], (p) => { send({ t: 'admin.mod', uid: p.uid }); toast(`${p.name} is now a moderator`); }), 'acc', 'Pick someone in the voice chat')),
+      h('div', { class: 'grp-h' }, 'Music DJs'),
+      h('div', { class: 'list' },
+        ...Object.values(djs).map(d => actionRow('headphones', d.name, () => go('music'), '', `${Object.values(d.perms || {}).filter(Boolean).length} music rights`)),
+        actionRow('headphones', 'Manage music DJs', () => go('music'), 'acc')));
+  };
+  draw();
+  on('room:changed', draw);
+  return () => off('room:changed', draw);
+}
+function pickPerson(title, filter, done) {
+  const people = [...S.parts.values()].filter(p => p.uid !== S.uid && filter(p));
+  const body = people.length
+    ? h('div', { class: 'list' }, ...people.map(p => h('button', { class: 'row', onclick: () => { s.close(); done(p); } },
+      h('div', { class: 'ia' }, avatarEl(p)), h('span', { class: 'lab' }, p.name, p.username ? h('small', null, '@' + p.username) : null))))
+    : h('div', { class: 'empty-note' }, 'Nobody else to pick in the voice chat right now.');
+  const s = sheet({ title, body });
 }
 function addDj() {
   const djs = S.room.settings?.music_dj || {};

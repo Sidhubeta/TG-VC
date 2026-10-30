@@ -190,6 +190,21 @@ function onPong(m) {
   S.offset = clock.reduce((a, b) => (b.rtt < a.rtt ? b : a)).off;
 }
 
+// ---------- problem reports ----------
+// Things that go wrong on a phone (music errors, stalls, blocked sound, script errors) are sent to the server
+// log with the phone type, so a problem like "the song plays but there's no sound" can be found from the logs
+// instead of guessed. A few per minute at most, never any personal data beyond what's needed.
+const reported = {};
+let reportCount = 0;
+export function report(kind, detail = '') {
+  const now = Date.now();
+  if (reportCount > 40 || now - (reported[kind] || 0) < 30000) return;
+  reported[kind] = now; reportCount++;
+  send({ t: 'diag', kind: String(kind).slice(0, 40), detail: String(detail).slice(0, 300) });
+}
+window.addEventListener('error', (e) => report('js', `${e.message} @${(e.filename || '').split('/').pop()}:${e.lineno}`));
+window.addEventListener('unhandledrejection', (e) => report('promise', e.reason?.message || String(e.reason)));
+
 // ---------- toasts ----------
 export function toast(text, ms = 2600, kind = '') {
   const el = h('div', { class: 'toast' + (kind ? ' ' + kind : '') }, text);

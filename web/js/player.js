@@ -1,5 +1,5 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
-import { $, S, actionRow, api, can, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
+import { $, S, actionRow, api, can, report, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
 
 // ======================= engine =======================
@@ -11,20 +11,46 @@ function makeAudio() {
   a.preload = 'auto';
   a.crossOrigin = 'anonymous';
   // (a spare element waiting to be used must not steer the music)
-  a.addEventListener('loadedmetadata', () => a === audio && sync(true));
-  a.addEventListener('ended', () => a === audio && onEnded());
-  a.addEventListener('error', () => a === audio && onAudioError());
+  a.addEventListener('loadedmetadata', () => a === audio && !isSilence(a) && sync(true));
+  a.addEventListener('ended', () => a === audio && !isSilence(a) && onEnded());
+  a.addEventListener('error', () => a === audio && !isSilence(a) && onAudioError());
   // Minimized Telegram freezes the page's timers, but the playing song still sends time updates: use them to
   // keep the music on track in the background.
-  a.addEventListener('timeupdate', () => { if (a === audio && document.hidden && Date.now() - lastSync > 900) sync(); });
+  a.addEventListener('timeupdate', () => {
+    if (a !== audio) return;
+    if (fade) stepFade();
+    if (document.hidden && Date.now() - lastSync > 900) sync();
+  });
   return a;
 }
 let lastSync = 0;
 // play(), and treat only a real "needs a tap" refusal as blocked sound. A play() cut short because the song
 // changed or reloaded (AbortError) used to light up the "sound off" button on new songs for no reason.
 function tryPlay() {
-  return audio.play().then(() => setBlocked(false), (e) => { if (e?.name === 'NotAllowedError') setBlocked(true); });
+  return audio.play().then(() => setBlocked(false), (e) => {
+    if (e?.name === 'NotAllowedError') { setBlocked(true); report('music-blocked', `unlocked=${!!audio.__ok}`); }
+  });
 }
+// The phone switched its audio between media and call mode (mic on/off, joining voice, new speaker). iPhone and
+// many Androids then keep the song "playing" with no sound until it's paused and played again — exactly what
+// people had to do by hand. So the player does that itself, quickly, once the switch has settled.
+let kickTimer = null;
+function kickAudio(why) {
+  clearTimeout(kickTimer);
+  kickTimer = setTimeout(() => {
+    if (audio.paused || !playing() || P.localPaused || !audio.getAttribute('src') || isSilence(audio)) return;
+    const t = audio.currentTime;
+    audio.pause();
+    setTimeout(() => {
+      if (!playing() || P.localPaused || !audio.paused) return;
+      try { audio.currentTime = t + 0.08; } catch {}
+      tryPlay();
+      if (G && G.c.state !== 'running') G.c.resume().catch(() => {});
+    }, 60);
+    console.info('music: audio route changed (' + why + '), restarted the sound');
+  }, 500);
+}
+on('voice:session', kickAudio);
 const video = h('video', { class: 'vid', playsinline: true, muted: true, preload: 'auto' });
 video.muted = true;
 const isApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document || /iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -49,6 +75,7 @@ let G = null; // WebAudio graph
 
 const cur = () => S.music?.current || null;
 const playing = () => S.music?.status === 'playing';
+const loadingSong = () => S.music?.status === 'loading'; // the server is still finding the stream: the song starts at 0 once it's ready
 // video is on when someone turned it on for this song (and you didn't switch back), or you turned it on for you
 export const isVideo = () => { const c = cur(); return !!c && ((c.video && P.optOut !== c.qid) || P.localVid === c.qid); };
 export function expectedPos() {
@@ -57,28 +84,40 @@ export function expectedPos() {
   const d = m.current.duration || Infinity;
   return Math.max(0, Math.min(p, d));
 }
-// The server starts the next song ~0.8 s after one ends. If that news hasn't arrived (phones pause the app's
-// connection in the background), play the next songs from the queue ourselves instead of sitting on the old one.
-// Also used the moment our own copy of a song ends (P.endedQid), so the next one starts without a gap.
+// Songs start where their sound starts and end where it ends (the server skips silent intros and tails).
+const startOf = (t) => t.start || 0;
+const endOf = (t) => t.end || t.duration;
+// Where the room moves on from the current song: a few seconds before its end with crossfade, else just after.
+const switchAt = (c) => endOf(c) + (c.xf ? -c.xf : 0.8);
+// If the server's news hasn't arrived (phones pause the app's connection in the background), play the next songs
+// from the queue ourselves instead of sitting on the old one. Also used the moment our own copy of a song ends
+// (P.endedQid), so the next one starts without a gap.
 function predicted() {
   const m = S.music, c = m?.current;
   if (!c || m.status !== 'playing' || !c.duration) return null;
   const r = m.rate || 1;
-  const over = (m.pos + (serverNow() - m.upd) * r - c.duration) / r; // seconds past the end of the current song
-  if (over < 1.5 && !(P.endedQid === c.qid && over > -3)) return null;
-  let pos = Math.max(0, over - 0.8);
-  if (m.loop === 'one') return { track: c, pos: pos % (c.duration + 0.8) };
+  const into = (m.pos + (serverNow() - m.upd) * r - switchAt(c)) / r; // seconds since the room should have moved on
+  if (into < 0.7 && !(P.endedQid === c.qid && into > -3.8)) return null;
+  let pos = Math.max(0, into);
+  if (m.loop === 'one') return { track: c, pos: startOf(c) + pos % (endOf(c) - startOf(c) + 0.8) };
   for (const t of m.queue) {
-    const done = t.duration && (pos >= t.duration + 0.8 || (P.endedQid === t.qid && pos > t.duration - 3));
-    if (!done) return { track: t, pos };
-    pos = Math.max(0, pos - t.duration - 0.8);
+    const len = endOf(t) - startOf(t);
+    const done = t.duration && (pos >= len + 0.8 || (P.endedQid === t.qid && pos > len - 3));
+    if (!done) return { track: t, pos: startOf(t) + pos };
+    pos = Math.max(0, pos - len - 0.8);
   }
-  return m.loop === 'all' ? { track: m.queue[0] || c, pos: 0 } : { ended: true };
+  return m.loop === 'all' ? { track: m.queue[0] || c, pos: startOf(m.queue[0] || c) } : { ended: true };
 }
 
 function audioSrc(t) { return media(`/api/stream/${t.id}/audio?c=${CODEC}&q=${P.aq}`); }
 
 function load(t) {
+  // the song reached its end and the next one starts: blend them (crossfade) instead of a hard switch
+  const old = P.loadedTrack;
+  if (t && old && old.qid !== t.qid && crossfadeOn() && canFade() && !audio.paused && !document.hidden) {
+    const left = (endOf(old) - audio.currentTime) / (audio.playbackRate || 1);
+    if (left > 0.5 && left < (S.music?.xfade || 4) + 1.5) startFade(Math.min(left, S.music?.xfade || 4));
+  }
   P.loadedQid = t ? t.qid : null;
   P.loadedTrack = t || null;
   P.localPaused = false;
@@ -118,6 +157,7 @@ function onAudioError() {
   // retry the song that's loaded: after moving on by ourselves (no news from the server) that's not cur()
   const t = P.loadedTrack; if (!t || !audio.getAttribute('src')) return;
   console.warn('audio error', audio.error);
+  report('music-error', `code=${audio.error?.code} ${audio.error?.message || ''} song=${t.id} try=${errCount + 1}`);
   if (errQid !== t.qid) { errQid = t.qid; errCount = 0; }
   if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
   setTimeout(() => { if (P.loadedQid === t.qid && audio.error) { audio.src = audioSrc(t); audio.load(); } }, 2000 * errCount);
@@ -163,7 +203,7 @@ function sync(force = false) {
   // count it as ended and go straight on to the next song, rather than pausing and waiting.
   if (!pr) {
     const c = cur();
-    if (c?.duration && playing() && !P.localPaused && P.loadedQid === c.qid && expectedPos() >= c.duration - 0.3) { P.endedQid = c.qid; pr = predicted(); }
+    if (c?.duration && playing() && !P.localPaused && P.loadedQid === c.qid && expectedPos() >= endOf(c) - 0.3) { P.endedQid = c.qid; pr = predicted(); }
   }
   if (pr?.ended) { if (!audio.paused) audio.pause(); return; } // song over, nothing queued: wait, don't replay it
   const t = pr ? pr.track : cur();
@@ -246,6 +286,7 @@ function watchdog(want, exp) {
   if (now - stuck.since > (audio.readyState >= 3 ? 2500 : 10000)) {
     stuck.since = 0;
     console.warn('music stalled, reloading at', exp.toFixed(1));
+    report('music-stall', `song=${P.loadedTrack?.id} at=${exp.toFixed(1)} ready=${audio.readyState} net=${audio.networkState}`);
     const src = audio.getAttribute('src');
     audio.src = src; audio.load(); // loadedmetadata -> sync(true) seeks to the room's position
     tryPlay();
@@ -276,8 +317,26 @@ export function unlockAudio() {
   // (sync decides: it never replays a song that's already over, which a bare play() would restart from 0)
   if (cur() && playing() && !P.localPaused && audio.paused) sync();
   else if (P.blocked && !audio.paused && (!G || G.c.state === 'running')) setBlocked(false);
-  primeSpare();
+  unlockElement(audio);
+  primeSpare(); // once: ready for when effects switch off later (that moves the song to the spare player)
 }
+// iPhone lets an <audio> element play by itself later only if a tap has started it once. The first tap usually
+// comes before any song is playing (mic, chat…), and that left the music player locked: every song stayed silent
+// until the "sound off" button was tapped. So the first tap now starts the player itself — a moment of silence,
+// or the loaded song started and stopped at once — and it stays unlocked for every song after that.
+function unlockElement(a) {
+  if (a.__ok) return;
+  if (!a.paused) { a.__ok = true; return; } // already playing: it's unlocked
+  const song = a.getAttribute('src');
+  if (!song) a.src = SILENCE;
+  a.__ok = true; // the play() inside this tap is what counts, even if it's stopped right away
+  const pr = a.play();
+  if (song) a.pause();
+  pr.then(() => {
+    if (a.getAttribute('src') === SILENCE) { a.pause(); a.removeAttribute('src'); a.load(); }
+  }, (e) => { if (e?.name === 'NotAllowedError') a.__ok = false; }); // not a real tap (a scroll): next one
+}
+const isSilence = (a) => a.getAttribute('src') === SILENCE;
 // iPhone unlocks sound per <audio> element. Keep one spare element that a tap already played (a short bit of
 // silence), so switching the effects off later can move the song to it without needing another tap.
 let spare = null, priming = false;
@@ -295,6 +354,48 @@ function primeSpare() {
   const a = makeAudio();
   a.src = SILENCE;
   a.play().then(() => { a.pause(); spare = a; }, () => {}).finally(() => { priming = false; });
+}
+
+// ======================= crossfade =======================
+// On by default; anyone can switch it off for themselves (Queue → Crossfade). The room starts the next song a few
+// seconds before the end; with crossfade the old song fades out on a second player while the new one fades in.
+// iPhone can't change an <audio> element's volume, and with a sound effect on the song runs through Web Audio:
+// there the songs simply switch.
+export const crossfadeOn = () => store.get('xfade', true) !== false;
+const canFade = () => !isApple && !G;
+let fade = null; // { old, t0, len }
+function startFade(secs) {
+  if (fade) endFade();
+  const old = audio;
+  audio = spare || makeAudio(); spare = null; // the spare was unlocked by a tap already
+  audio.removeAttribute('src');
+  audio.volume = 0;
+  const sink = store.get('dev:audiooutput', '');
+  if (sink && audio.setSinkId) audio.setSinkId(sink).catch(() => {});
+  fade = { old, t0: performance.now(), len: secs * 1000 };
+}
+function stepFade() {
+  if (!fade) return;
+  const k = Math.min(1, (performance.now() - fade.t0) / fade.len);
+  if (k >= 1 || document.hidden) return endFade();
+  fade.old.volume = P.vol * Math.cos(k * Math.PI / 2); // equal-power: no dip in loudness halfway
+  audio.volume = P.vol * Math.sin(k * Math.PI / 2);
+}
+function endFade() {
+  if (!fade) return;
+  const old = fade.old; fade = null;
+  audio.volume = P.vol;
+  old.pause(); old.removeAttribute('src'); old.load(); old.volume = P.vol;
+  if (!spare) spare = old; // already unlocked: ready for the next crossfade
+}
+setInterval(stepFade, 50);
+document.addEventListener('visibilitychange', () => { if (document.hidden) endFade(); }); // background: just switch
+function toggleCrossfade() {
+  const on = !crossfadeOn();
+  store.set('xfade', on); haptic('select');
+  if (!on) endFade();
+  toast(on ? (isApple ? 'Crossfade on — iPhone switches songs without blending' : 'Crossfade on — songs blend into each other') : 'Crossfade off');
+  if (NP.view === 'queue') { NP.qsig = ''; renderStage(); }
 }
 
 // ======================= picture in picture =======================
@@ -388,6 +489,7 @@ function applyFx(f = fx()) {
 }
 function setVol(v) {
   P.vol = v; store.set('vol', v);
+  if (fade) return stepFade();
   if (!G && isApple && v < 0.99) buildGraph();
   if (G) G.master.gain.setTargetAtTime(v, G.c.currentTime, 0.05);
   else audio.volume = v;
@@ -401,7 +503,7 @@ async function setMusicSink(id) {
     else if (audio.setSinkId) await audio.setSinkId(id);
   } catch (e) { console.warn('music output switch failed', e); }
 }
-on('voice:sink', setMusicSink);
+on('voice:sink', (id) => { setMusicSink(id); kickAudio('speaker'); });
 // the recorder needs the music as Web Audio
 export function musicTap() { tapped = true; buildGraph(); return G ? { ctx: G.c, node: G.master } : null; }
 
@@ -460,7 +562,7 @@ export function renderCard() {
   const el = card(); if (!el) return;
   const t = cur();
   const vidHere = !!t && isVideo() && !NP.open && !FV;
-  const sig = t ? [t.qid, t.title, t.by, playing() && !P.localPaused, P.blocked, vidHere, can('add')].join('|') : 'empty|' + can('add');
+  const sig = t ? [t.qid, t.title, t.by, playing() && !P.localPaused, loadingSong(), P.blocked, vidHere, can('add')].join('|') : 'empty|' + can('add');
   // (full screen and the player borrow the video element: rebuild if it should be here but isn't)
   if (sig === cardSig && el.firstChild && (!vidHere || el.contains(video))) return;
   cardSig = sig;
@@ -473,7 +575,7 @@ export function renderCard() {
   if (!t) {
     el.onclick = () => openSearch('home');
     el.append(h('div', { class: 'art' }, icon('music')),
-      h('div', { class: 'meta' }, h('div', { class: 'ttl' }, 'Nothing playing'), h('div', { class: 'art-sub' }, canAdd() ? 'Tap to search songs or paste a YouTube link' : 'Admins will play music here')),
+      h('div', { class: 'meta' }, h('div', { class: 'ttl' }, 'Nothing playing'), h('div', { class: 'art-sub' }, canAdd() ? 'Tap to search songs or paste a YouTube / Spotify link' : 'Admins will play music here')),
       canAdd() ? h('div', { class: 'ctl' }, h('button', { 'aria-label': 'Search', onclick: (e) => { e.stopPropagation(); openSearch(); } }, icon('plus'))) : null);
     return;
   }
@@ -489,7 +591,9 @@ export function renderCard() {
       h('div', { class: 'art-sub' }, t.artist + (t.by ? ` · added by ${t.by}` : ''))),
     h('div', { class: 'ctl' },
       showVid ? null : h('button', { class: 'vsw', 'aria-label': 'Watch the video', onclick: (e) => { e.stopPropagation(); setVideo(true); } }, icon('video')),
-      isPlay && P.blocked
+      loadingSong()
+        ? h('button', { class: 'loading-btn', 'aria-label': 'Loading the song', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, h('span', { class: 'spin' }))
+        : isPlay && P.blocked
         // the phone stopped the sound (call, lock screen, no tap yet): one tap here brings it back
         ? h('button', { class: 'muted-btn', 'aria-label': 'Sound is off — tap to turn it on', onclick: (e) => { e.stopPropagation(); unlockAudio(); } }, icon('vol-x'))
         : h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
@@ -546,7 +650,7 @@ function togglePlay() {
   const m = S.music; if (!m) return;
   if (can('playback')) {
     if (P.localPaused) { P.localPaused = false; sync(true); refresh(); return; }
-    send({ t: m.status === 'playing' ? 'music.pause' : 'music.play' });
+    send({ t: m.status === 'playing' || m.status === 'loading' ? 'music.pause' : 'music.play' });
   } else {
     // without playback rights you pause only for yourself; resuming jumps back to live
     P.localPaused = !P.localPaused;
@@ -705,6 +809,7 @@ on('ws:init', (m) => onMusic(m.music));
 function onMusic(m) {
   S.music = m;
   const t = m.current;
+  if (t && t.qid === P.loadedQid) P.loadedTrack = t; // keep what we know about the playing song fresh (start/end arrive later)
   if ((t?.qid ?? null) !== lastQid) {
     lastQid = t?.qid ?? null;
     NP.lyrics = null;
@@ -780,11 +885,14 @@ function renderQueue(st) {
     h('div', { class: 'qbtns' },
       h('button', { class: can('queue') ? '' : 'locked', onclick: () => can('queue') ? send({ t: 'music.shuffle' }) : deny('queue'), 'aria-label': 'Shuffle' }, icon('shuffle'), 'Shuffle'),
       h('button', { class: (m.loop !== 'off' ? 'on' : '') + (can('modes') ? '' : ' locked'), onclick: () => can('modes') ? send({ t: 'music.loop', mode: { off: 'all', all: 'one', one: 'off' }[m.loop] }) : deny('modes') }, icon(loopIcon), m.loop === 'one' ? 'Repeat 1' : 'Repeat'),
-      h('button', { class: (m.autoplay ? 'on' : '') + (can('modes') ? '' : ' locked'), onclick: () => can('modes') ? send({ t: 'music.autoplay', on: !m.autoplay }) : deny('modes') }, icon('infinity'), 'Autoplay')),
+      h('button', { class: (m.autoplay ? 'on' : '') + (can('modes') ? '' : ' locked'), onclick: () => can('modes') ? send({ t: 'music.autoplay', on: !m.autoplay }) : deny('modes') }, icon('infinity'), 'Autoplay'),
+      // just for you: blend the end of a song into the next
+      h('button', { class: crossfadeOn() ? 'on' : '', 'aria-label': 'Crossfade', onclick: toggleCrossfade }, icon('xfade'), 'Crossfade')),
     h('div', { class: 'qh' }, h('span', null, 'Playing next'),
       h('span', { style: { display: 'flex', gap: '6px' } },
         m.queue.length ? h('button', { class: 'round', 'aria-label': 'Save queue as playlist', onclick: saveQueue }, icon('list-plus')) : null,
         m.queue.length ? h('button', { class: 'round' + (can('queue') ? '' : ' locked'), 'aria-label': 'Clear queue', onclick: async () => { if (!can('queue')) return deny('queue'); if (await confirmBox('Clear the whole queue?', 'Clear', true)) send({ t: 'music.clear' }); } }, icon('trash')) : null,
+        h('button', { class: 'round', 'aria-label': 'Play history', onclick: openPlayHistory }, icon('history')),
         canAdd() ? h('button', { class: 'round', 'aria-label': 'Add songs', onclick: () => openSearch('search') }, icon('plus')) : null)));
   if (!m.queue.length) box.append(h('p', { style: { color: 'rgba(255,255,255,.6)', margin: '14px 0' } }, m.autoplay ? 'Autoplay is on — similar songs will play when the queue ends.' : 'Queue is empty. When this song ends, the music stops.'));
   m.queue.forEach((t, i) => box.append(trackRow(t, {
@@ -802,6 +910,45 @@ function queueMenu(t, i) {
     actionRow('list-plus', 'Add to a playlist', () => { s.close(); addToPlaylist([t]); }),
     actionRow('trash', 'Remove from queue', () => { if (!(mine || can('queue'))) return deny('queue'); send({ t: 'music.remove', qid: t.qid }); s.close(); }, mine || can('queue') ? 'red' : 'red locked'));
   const s = sheet({ title: t.title, body });
+}
+
+// ======================= play history =======================
+// What played in this voice chat, who added it and when — grouped by day, more loads as you scroll.
+export function openPlayHistory() {
+  const list = h('div'), foot = h('div', { class: 'inv-foot' });
+  let mine = false, next = 0, more = true, busy = false, gen = 0, lastDay = '';
+  const seg = h('div', { class: 'seg', style: { margin: '2px 0 10px' } });
+  const drawSeg = () => seg.replaceChildren(...[[false, 'Everyone'], [true, 'Added by me']].map(([v, l]) =>
+    h('button', { class: mine === v ? 'on' : '', onclick: () => { mine = v; drawSeg(); restart(); } }, l)));
+  const day = (ts) => {
+    const d = new Date(ts * 1000), t = new Date(); const y = new Date(t); y.setDate(t.getDate() - 1);
+    return d.toDateString() === t.toDateString() ? 'Today' : d.toDateString() === y.toDateString() ? 'Yesterday'
+      : d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'short' });
+  };
+  const time = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  const s = sheet({ title: 'Play history', body: h('div', null, seg, list, foot), tall: true, onClose: () => io.disconnect() });
+  const load = async () => {
+    if (busy || !more) return;
+    busy = true; const my = gen;
+    foot.replaceChildren(h('div', { class: 'spinner', style: { margin: '14px auto' } }));
+    try {
+      const r = await api(`/api/history?offset=${next}&limit=40${mine ? '&mine=1' : ''}`);
+      if (my !== gen) return;
+      for (const t of r.tracks) {
+        const d = day(t.ts);
+        if (d !== lastDay) { list.append(h('div', { class: 'grp-h' }, d)); lastDay = d; }
+        const row = trackRow(t, { sub: `${t.artist ? t.artist + ' · ' : ''}${time(t.ts)} · ${t.by_uid === S.uid ? 'you' : t.by_name || 'autoplay'}`, btn: icon('plus-c'), onBtn: () => addTrack(t, row) });
+        list.append(pressable(row, () => songMenu(t), () => songMenu(t)));
+      }
+      more = r.more; next = r.next;
+      foot.replaceChildren(list.children.length ? '' : h('div', { class: 'empty-note' }, mine ? 'You haven’t added songs here yet.' : 'Nothing has played in this voice chat yet.'));
+    } catch (e) { if (my === gen) foot.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
+    finally { if (my === gen) busy = false; }
+  };
+  const restart = () => { gen++; busy = false; more = true; next = 0; lastDay = ''; list.replaceChildren(); load(); };
+  const io = new IntersectionObserver((es) => { if (es.some(e => e.isIntersecting)) load(); }, { root: s.body, rootMargin: '300px' });
+  io.observe(foot);
+  drawSeg(); restart();
 }
 
 // ======================= track helpers =======================
@@ -1105,7 +1252,7 @@ async function renderLibrary(sc, openId = null) {
     try { pls = (await api('/api/playlists')).playlists; } catch (e) { box.replaceChildren(h('div', { class: 'empty-note' }, e.message)); return; }
     box.replaceChildren(
       h('div', { class: 'list' },
-        actionRow('history', 'Recently played in this room', showHistory, 'acc'),
+        actionRow('history', 'Play history of this voice chat', () => openPlayHistory(), 'acc'),
         actionRow('plus', 'New playlist', async () => {
           const name = await prompt_('New playlist', 'Playlist name');
           if (name) { await api('/api/playlists', { body: { name } }); showList(); }
@@ -1115,12 +1262,6 @@ async function renderLibrary(sc, openId = null) {
         h('div', { class: 'cc-t' }, p.name), h('div', { class: 'cc-a' }, `${p.count} songs`)))));
   };
   const backBtn = () => h('button', { class: 'br-back inline', 'aria-label': 'Back', onclick: showList }, icon('down'));
-  const showHistory = async () => {
-    const r = await api('/api/history');
-    box.replaceChildren(h('div', { class: 'br-sub' }, backBtn(), h('h2', null, 'Recently played')),
-      r.tracks.length ? h('div', null, ...r.tracks.map(t => { const row = trackRow(t, { sub: `${t.artist} · ${t.by_name || ''}`, btn: icon('plus-c'), onBtn: () => addTrack(t, row) }); return pressable(row, () => songMenu(t), () => songMenu(t)); }))
-        : h('div', { class: 'empty-note' }, 'Songs played in this voice chat show up here.'));
-  };
   const showPlaylist = async (id) => {
     const p = await api('/api/playlists/' + id);
     const list = h('div', null, ...p.tracks.map(t => {
@@ -1161,7 +1302,17 @@ function renderSearchTab(sc) {
     try {
       const r = await api('/api/search?q=' + encodeURIComponent(q));
       if (my !== seq) return;
-      if (r.playlist) {
+      if (r.spotify) {
+        const sp = r.spotify;
+        results.replaceChildren(
+          h('div', { class: 'pl-card spotify' },
+            h('div', { class: 'ta sp-logo' }, icon('music')),
+            h('div', { style: { flex: 1, minWidth: 0 } },
+              h('div', { style: { fontWeight: 700, fontSize: '17px' } }, sp.title),
+              h('div', { class: 'muted', style: { fontSize: '13px', margin: '2px 0 10px' } }, `Spotify ${sp.kind} · ${sp.count} song${sp.count === 1 ? '' : 's'} · each one is found on YouTube`),
+              canAdd() ? h('button', { class: 'btn sm', onclick: (e) => { send({ t: 'music.spotify', url: sp.url }); haptic('success'); e.currentTarget.disabled = true; e.currentTarget.textContent = 'Adding…'; } }, 'Add all to queue') : null)),
+          ...sp.songs.map(t => h('div', { class: 'trk' }, h('div', { class: 'tm' }, h('div', { class: 'tt' }, t.title), h('div', { class: 'ts' }, `${t.artist}${t.duration ? ' · ' + fmtTime(t.duration) : ''}`)))));
+      } else if (r.playlist) {
         const pl = r.playlist;
         results.replaceChildren(
           h('div', { class: 'pl-card' },

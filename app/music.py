@@ -32,6 +32,7 @@ elif config.YT_COOKIES:
         _fh.write(config.YT_COOKIES.replace("\\n", "\n"))
 
 _info_cache: dict[str, tuple[float, dict]] = {}
+STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": ""}  # for the admins' Health page
 _downloads: dict[str, asyncio.Task] = {}
 _resolve_locks: dict[str, asyncio.Lock] = {}
 _http: httpx.AsyncClient | None = None
@@ -114,6 +115,106 @@ def parse_youtube(text: str) -> tuple[str | None, str | None]:
     return vid, pl
 
 
+# ---- Spotify links: read the song names, find each song on YouTube ------------------------------------------
+SPOTIFY_RE = re.compile(r"(?:open\.spotify\.com/(?:intl-[\w-]+/)?|spotify:)(playlist|album|track)[/:]([A-Za-z0-9]{22})")
+_sp_token: tuple[float, str] = (0.0, "")
+
+
+def parse_spotify(text: str) -> tuple[str, str] | None:
+    m = SPOTIFY_RE.search(text or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+async def _spotify_api(kind: str, sid: str, limit: int) -> tuple[str, list[dict]]:
+    global _sp_token
+    if time.time() > _sp_token[0]:
+        r = await http().post("https://accounts.spotify.com/api/token", data={"grant_type": "client_credentials"},
+                              auth=(config.SPOTIFY_CLIENT_ID, config.SPOTIFY_CLIENT_SECRET))
+        r.raise_for_status()
+        j = r.json()
+        _sp_token = (time.time() + j.get("expires_in", 3600) - 60, j["access_token"])
+    h = {"Authorization": f"Bearer {_sp_token[1]}"}
+    api = "https://api.spotify.com/v1"
+    one = lambda t: {"title": t.get("name") or "", "artist": ", ".join(a["name"] for a in t.get("artists") or []),  # noqa: E731
+                     "duration": round((t.get("duration_ms") or 0) / 1000)}
+    if kind == "track":
+        t = (await http().get(f"{api}/tracks/{sid}", headers=h)).raise_for_status().json()
+        return t.get("name") or "Song", [one(t)]
+    meta = (await http().get(f"{api}/{kind}s/{sid}", headers=h, params={"fields": "name"} if kind == "playlist" else None)).raise_for_status().json()
+    out, url = [], f"{api}/{kind}s/{sid}/tracks?limit={50 if kind == 'album' else 100}"
+    while url and len(out) < limit:
+        j = (await http().get(url, headers=h)).raise_for_status().json()
+        for it in j.get("items") or []:
+            t = it.get("track") if kind == "playlist" else it
+            if t and t.get("name") and t.get("type", "track") == "track":
+                out.append(one(t))
+        url = j.get("next")
+    return meta.get("name") or "Spotify", out[:limit]
+
+
+def _find(obj, key):
+    """First value stored under `key` anywhere in a JSON tree."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, (dict, list)) and (r := _find(v, key)) is not None:
+                return r
+    return None
+
+
+def parse_spotify_embed(html: str) -> tuple[str, list[dict]]:
+    import json as _json
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    if not m:
+        raise ValueError("Spotify page not understood")
+    data = _json.loads(m.group(1))
+    entity = _find(data, "entity") or {}
+    title = entity.get("name") or entity.get("title") or "Spotify"
+    tl = entity.get("trackList") or _find(data, "trackList")
+    if tl:
+        return title, [{"title": t.get("title") or "", "artist": t.get("subtitle") or "",
+                        "duration": round((t.get("duration") or 0) / 1000)} for t in tl if t.get("title")]
+    # a single song
+    artists = ", ".join(a.get("name", "") for a in entity.get("artists") or [])
+    return title, [{"title": title, "artist": artists, "duration": round((entity.get("duration") or 0) / 1000)}]
+
+
+async def spotify(kind: str, sid: str, limit: int = 200) -> tuple[str, list[dict]]:
+    """(name, [{title, artist, duration}]) for a Spotify playlist / album / song."""
+    if config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET:
+        try:
+            return await _spotify_api(kind, sid, limit)
+        except Exception as e:
+            log.info("spotify api failed (%s), using the embed page", e)
+    r = await http().get(f"https://open.spotify.com/embed/{kind}/{sid}",
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"})
+    if r.status_code != 200:
+        raise ValueError("Spotify didn't answer — is the link right and public?")
+    name, tracks = parse_spotify_embed(r.text)
+    return name, tracks[:limit]
+
+
+async def match(song: dict) -> dict | None:
+    """The YouTube upload that best fits a song name (+ artist), preferring the same length."""
+    q = f"{song['title']} {song['artist']}".strip()
+    try:
+        res = await search(q, limit=4)
+    except Exception as e:
+        log.info("match failed %r: %s", q, e)
+        return None
+    if not res:
+        return None
+    d = song.get("duration") or 0
+    if d:
+        close = [t for t in res if t.get("duration") and abs(t["duration"] - d) <= max(8, d * 0.06)]
+        if close:
+            return close[0]
+    return res[0]
+
+
 def _extract(url: str, **extra) -> dict:
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed")
@@ -138,6 +239,12 @@ async def related(vid: str, limit: int = 25) -> list[dict]:
     return [t for e in info.get("entries") or [] if (t := _track(e)) and t["id"] != vid]
 
 
+def is_ready(vid: str) -> bool:
+    """The stream address is already known, so the song can start right away."""
+    hit = _info_cache.get(vid)
+    return bool(hit) and time.time() - hit[0] < 3 * 3600
+
+
 async def resolve(vid: str, force: bool = False) -> dict:
     hit = _info_cache.get(vid)
     if hit and not force and time.time() - hit[0] < 3 * 3600:
@@ -150,7 +257,12 @@ async def resolve(vid: str, force: bool = False) -> dict:
         hit = _info_cache.get(vid)
         if hit and not force and time.time() - hit[0] < 3 * 3600:
             return hit[1]
-        info = await asyncio.to_thread(_extract, f"https://www.youtube.com/watch?v={vid}")
+        try:
+            info = await asyncio.to_thread(_extract, f"https://www.youtube.com/watch?v={vid}")
+        except Exception as e:
+            STATS["yt_err"], STATS["yt_err_at"] = str(e)[:300], time.time()
+            raise
+        STATS["yt_ok_at"] = time.time()
         fmts = []
         for f in info.get("formats") or []:
             if not f.get("url") or f.get("protocol") not in ("https", "http"):
@@ -224,6 +336,7 @@ async def _download(vid: str, fmt: dict):
                     break
         os.replace(tmp, path)
         _trim_cache()
+        spawn_analyze(vid, path)
     except Exception as e:
         log.info("cache download failed %s: %s", vid, e)
         if os.path.exists(tmp):
@@ -252,11 +365,82 @@ async def prefetch(vid: str):
         if not f:
             continue
         key = f"{vid}_{f['id']}"
-        if os.path.exists(_cache_path(vid, f["id"])) or key in _downloads:
+        if os.path.exists(_cache_path(vid, f["id"])):
+            spawn_analyze(vid, _cache_path(vid, f["id"]))
+            continue
+        if key in _downloads:
             continue
         t = asyncio.create_task(_download(vid, f))
         _downloads[key] = t
         t.add_done_callback(lambda _t, k=key: _downloads.pop(k, None))
+
+
+# ---- silence at the start / end of songs -----------------------------------------------------------------
+# Many uploads open with a second or more of silence (or end with a long quiet tail). Once a song is in the cache,
+# ffmpeg finds those parts; the room then starts the song where the sound starts and moves on where it ends.
+_trims: dict[str, tuple[float, float | None]] = {}  # vid -> (start, end or None)
+_analyzing: set[str] = set()
+
+
+def trim(vid: str) -> tuple[float, float | None] | None:
+    return _trims.get(vid)
+
+
+def trim_pending(vid: str) -> bool:
+    """The song is downloading or being checked right now (its silence info is coming soon)."""
+    return vid in _analyzing or any(k.startswith(vid + "_") for k in _downloads)
+
+
+def spawn_analyze(vid: str, path: str):
+    if vid in _trims or vid in _analyzing:
+        return
+    _analyzing.add(vid)
+
+    async def run():
+        try:
+            _trims[vid] = await asyncio.to_thread(_silence, path)
+            if len(_trims) > 3000:
+                for k in list(_trims)[:500]:
+                    _trims.pop(k, None)
+        except Exception as e:
+            log.info("silence check failed %s: %s", vid, e)
+        finally:
+            _analyzing.discard(vid)
+    asyncio.get_running_loop().create_task(run())
+
+
+def _silence(path: str) -> tuple[float, float | None]:
+    import subprocess
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-af", "silencedetect=noise=-50dB:d=0.4",
+                       "-f", "null", "-"], capture_output=True, text=True, timeout=120)
+    return parse_silence(p.stderr)
+
+
+def parse_silence(log_text: str) -> tuple[float, float | None]:
+    """(where the sound starts, where it ends or None) from ffmpeg silencedetect output."""
+    dur = None
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", log_text)
+    if m:
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    m = re.findall(r"time=(\d+):(\d+):([\d.]+)", log_text)  # what was really decoded (Duration can be missing)
+    if m:
+        h, mi, se = m[-1]
+        dur = max(dur or 0, int(h) * 3600 + int(mi) * 60 + float(se))
+    spans, open_at = [], None
+    for kind, val in re.findall(r"silence_(start|end): (-?[\d.]+)", log_text):
+        if kind == "start":
+            open_at = float(val)
+        elif open_at is not None:
+            spans.append((open_at, float(val)))
+            open_at = None
+    if open_at is not None and dur:
+        spans.append((open_at, dur))  # silent right to the end
+    start, end = 0.0, None
+    if spans and spans[0][0] <= 0.05:
+        start = min(spans[0][1], 15.0)  # never skip more than 15 s (a quiet intro isn't silence)
+    if dur and spans and spans[-1][1] >= dur - 0.3 and dur - spans[-1][0] < 40 and spans[-1][0] > start + 10:
+        end = spans[-1][0] + 0.3  # keep a breath of the tail
+    return round(max(0.0, start - 0.05), 2), round(end, 2) if end else None
 
 
 def _mime(fmt: dict) -> str:

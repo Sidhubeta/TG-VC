@@ -14,7 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, config, db, lk, music, pin, tg
+from . import auth, config, db, lk, members, music, pin, tg
 from .room import Conn, ROOMS, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -169,6 +169,13 @@ async def api_search(request: Request, uid, chat_id, st):
     q = (request.query_params.get("q") or "").strip()[:200]
     if not q:
         return JSONResponse({"tracks": []})
+    if sp := music.parse_spotify(q):
+        try:
+            name, songs = await music.spotify(*sp)
+        except Exception as e:
+            log.info("spotify preview failed: %s", e)
+            return err("Couldn't read that Spotify link — is it public?")
+        return JSONResponse({"spotify": {"url": q, "kind": sp[0], "title": name, "count": len(songs), "songs": songs[:50]}})
     vid, pl = music.parse_youtube(q)
     if pl:
         title, tracks = await music.playlist(pl)
@@ -264,10 +271,18 @@ async def api_lyrics(request: Request, uid, chat_id, st):
 
 @guarded()
 async def api_history(request: Request, uid, chat_id, st):
-    rows = await db.q("SELECT vid as id,title,artist,duration,by_name,ts FROM plays WHERE chat_id=? ORDER BY id DESC LIMIT 100", (chat_id,))
+    """Play history of this voice chat: what played, who added it, when. ?offset= for more, ?mine=1 for my songs."""
+    offset = max(0, int(_num(request.query_params.get("offset"), 0)))
+    limit = max(10, min(100, int(_num(request.query_params.get("limit"), 50))))
+    mine = request.query_params.get("mine") == "1"
+    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts FROM plays WHERE chat_id=?"
+                      + (" AND by_uid=?" if mine else "") + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                      (chat_id, uid, limit + 1, offset) if mine else (chat_id, limit + 1, offset))
+    more = len(rows) > limit
+    rows = rows[:limit]
     for r in rows:
         r["thumb"] = f"/api/thumb/{r['id']}"
-    return JSONResponse({"tracks": rows})
+    return JSONResponse({"tracks": rows, "more": more, "next": offset + limit})
 
 
 @guarded()
@@ -495,6 +510,12 @@ async def api_recording(request: Request, uid, chat_id, st):
     name = f"{custom}.{ext}" if custom else f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{ext}"
     if not await tg.send_recording(uid, data, name, f"🎙 {custom or 'Recording'} — {title}"):
         return err("Couldn't send the recording to your private chat. Open the bot, press Start, and try again.")
+    chapters = str(form.get("chapters") or "")[:3800].strip()
+    if chapters:  # who spoke when + the songs, so the recording is easy to jump around in
+        try:
+            await tg.call("sendMessage", chat_id=uid, text=f"📑 {custom or 'Recording'} — {chapters}")
+        except Exception as e:
+            log.info("chapters not sent: %s", e)
     return JSONResponse({"ok": True, "to": "dm"})
 
 
@@ -516,44 +537,93 @@ _invite_by: dict[tuple, list[float]] = {}  # (chat, inviter) -> recent invite ti
 
 @guarded()
 async def api_invite(request: Request, uid, chat_id, st):
+    """GET: one page of people to invite (?q= search, ?offset=, ?limit=). POST {uid}: invite that person.
+
+    Who is listed: everyone in the group when the full member list is available (TG_API_ID/TG_API_HASH), else
+    everyone the bot has seen (admins, people who chatted or joined the voice chat). If the group hides its
+    members, normal members see only the admins; admins always see everyone.
+    """
     room = await get_room(chat_id)
     in_room = set(room.parts)
-    hidden = await tg.hidden_members(chat_id)
     admins = await tg.admin_list(chat_id)
-    banned = {r["uid"] for r in await db.q("SELECT uid FROM bans WHERE chat_id=?", (chat_id,))}
-    people: dict[int, dict] = {}
-    for a in admins:
-        if not a["anonymous"]:  # anonymous admins stay hidden
-            people[a["uid"]] = {"uid": a["uid"], "name": a["name"], "username": a["username"], "admin": True}
-    if not hidden:
-        rows = await db.q("SELECT uid, name, username FROM members WHERE chat_id=? ORDER BY seen DESC LIMIT 400", (chat_id,))
-        rows += await db.q("""SELECT s.uid, MAX(s.name) AS name, MAX(s.username) AS username FROM sessions s
-                              WHERE s.chat_id=? AND s.uid > 0 GROUP BY s.uid ORDER BY MAX(s.joined) DESC LIMIT 200""", (chat_id,))
-        for r in rows:
-            people.setdefault(r["uid"], {"uid": r["uid"], "name": r["name"] or "User", "username": r["username"] or "", "admin": False})
     anon = {a["uid"] for a in admins if a["anonymous"]}
-    out = [p for p in people.values() if p["uid"] not in in_room and p["uid"] != uid and p["uid"] not in banned
-           and p["uid"] not in anon and p["uid"] > 0]
+    admin_ids = {a["uid"] for a in admins}
+    hidden = await tg.hidden_members(chat_id)
+    only_admins = hidden and not st["admin"]
+    banned = {r["uid"] for r in await db.q("SELECT uid FROM bans WHERE chat_id=?", (chat_id,))}
+
+    def ok(p: dict) -> bool:
+        return (p["uid"] > 0 and p["uid"] != uid and p["uid"] not in in_room and p["uid"] not in banned
+                and p["uid"] not in anon and not p.get("bot") and not p.get("deleted"))
+
     if request.method == "GET":
-        out.sort(key=lambda p: (not p["admin"], p["name"].lower()))
-        for p in out:
+        q = (request.query_params.get("q") or "").strip().lstrip("@")[:64]
+        offset = max(0, int(_num(request.query_params.get("offset"), 0)))
+        limit = max(10, min(100, int(_num(request.query_params.get("limit"), 50))))
+        source = "seen"
+        if only_admins:
+            pool = [{"uid": a["uid"], "name": a["name"], "username": a["username"], "admin": True} for a in admins]
+            total = None
+        else:
+            full = await members.page(chat_id, q, offset, limit) if members.enabled() else None
+            if full is not None:
+                source = "full"
+                pool, total = full["people"], full["total"]
+            else:
+                # everyone the bot has seen: admins first, then the most recently active
+                people: dict[int, dict] = {}
+                for a in admins:
+                    people[a["uid"]] = {"uid": a["uid"], "name": a["name"], "username": a["username"], "admin": True}
+                rows = await db.q("SELECT uid, name, username FROM members WHERE chat_id=? ORDER BY seen DESC LIMIT 5000", (chat_id,))
+                rows += await db.q("""SELECT s.uid, MAX(s.name) AS name, MAX(s.username) AS username FROM sessions s
+                                      WHERE s.chat_id=? AND s.uid > 0 GROUP BY s.uid ORDER BY MAX(s.joined) DESC LIMIT 2000""", (chat_id,))
+                for r in rows:
+                    people.setdefault(r["uid"], {"uid": r["uid"], "name": r["name"] or "User", "username": r["username"] or "",
+                                                 "admin": r["uid"] in admin_ids})
+                pool, total = list(people.values()), None
+        if total is None:  # filter + page here (the full list comes paged and searched by Telegram)
+            ql = q.lower()
+            pool = [p for p in pool if ok(p) and (not ql or ql in p["name"].lower() or ql in p["username"].lower())]
+            if only_admins:
+                pool.sort(key=lambda p: p["name"].lower())
+            total, pool = len(pool), pool[offset:offset + limit]
+            more = offset + limit < total
+        else:
+            more = offset + limit < total
+            pool = [p for p in pool if ok(p)]
+        for p in pool:
             p["photo"] = f"/api/avatar/{p['uid']}"
-        return JSONResponse({"people": out, "hidden": hidden})
+            p["admin"] = p.get("admin") or p["uid"] in admin_ids
+        return JSONResponse({"people": pool, "more": more, "next": offset + limit, "total": total, "hidden": hidden,
+                             "only_admins": only_admins, "source": source,
+                             # admins get told how to make the list complete
+                             "hint": st["admin"] and source == "seen" and not only_admins,
+                             "privacy": st["admin"] and tg.PRIVACY_ON})
+
     body = await _json(request)
     target = int(_num(body.get("uid")))
-    person = next((p for p in out if p["uid"] == target), None)
-    if not person:
+    if target <= 0 and not (config.DEV_MODE and target < 0):
         return err("You can't invite this person")
+    if target == uid or target in in_room:
+        return err("They're already here" if target in in_room else "That's you 🙂")
+    if target in banned or target in anon:
+        return err("You can't invite this person")
+    if only_admins and target not in admin_ids:
+        return err("This group hides its members: you can invite admins only")
     t = time.time()
     # Inviting several people one after another is normal: allow a burst of 10 a minute per person
     # (an old 4-second gap made every invite after the first one fail when tapped quickly).
     recent = [x for x in _invite_by.get((chat_id, uid), []) if t - x < 60]
     if len(recent) >= 10:
         return err("That's a lot of invites — try again in a minute 🙂", 429)
+    info = await tg.member_status(chat_id, target, fresh=True)  # also gives the real name (not trusted from the app)
+    name = info.get("name") or "Member"
+    if not info["member"]:
+        return err(f"{name if info.get('name') else 'This person'} isn't in the group any more")
+    if info.get("bot"):
+        return err("Bots can't join the voice chat")
     if t - _invite_last.get((chat_id, target), 0) < 300:
-        return err(f"{person['name']} was invited a moment ago", 429)
-    if not (await tg.member_status(chat_id, target, fresh=True))["member"]:
-        return err(f"{person['name']} isn't in the group any more")
+        return err(f"{name} was invited a moment ago", 429)
     _invite_by[(chat_id, uid)] = recent + [t]
     _invite_last[(chat_id, target)] = t
     if len(_invite_last) > 5000 or len(_invite_by) > 5000:
@@ -563,11 +633,74 @@ async def api_invite(request: Request, uid, chat_id, st):
             _invite_by.pop(k, None)
     me = room.parts.get(uid)
     by = room.group_title if me and me.as_group else (me.name if me else "Someone")
-    via = await tg.invite(chat_id, target, person["name"], by, len(room.parts))
+    via = await tg.invite(chat_id, target, name, by, len(room.parts))
     if not via:
         _invite_last.pop((chat_id, target), None)
         return err("Couldn't send the invite — try again")
-    return JSONResponse({"ok": True, "via": via})
+    return JSONResponse({"ok": True, "via": via, "name": name})
+
+
+# ---------------- health (admins) ----------------
+_started = time.time()
+
+
+def _ago(ts: float) -> str:
+    if not ts:
+        return "never"
+    s = int(time.time() - ts)
+    return f"{s}s ago" if s < 120 else f"{s // 60} min ago" if s < 7200 else f"{s // 3600} h ago"
+
+
+@guarded(need_admin=True)
+async def api_health(request: Request, uid, chat_id, st):
+    """Is everything working? One look for admins: bot, YouTube, LiveKit, member lists, storage, phones' problems."""
+    import shutil
+    from .room import DIAG
+    if request.method == "POST":  # "Test YouTube now"
+        t = time.time()
+        try:
+            await music.resolve("jNQXAC9IVRw", force=True)  # a tiny public video
+            return JSONResponse({"ok": True, "detail": f"YouTube works ({time.time() - t:.1f} s)"})
+        except Exception as e:
+            return JSONResponse({"ok": False, "detail": f"YouTube failed: {str(e)[:200]}"})
+    items = []
+    tgs = tg.STATS
+    if not config.BOT_TOKEN:
+        items.append({"name": "Telegram bot", "ok": False, "detail": "BOT_TOKEN is not set"})
+    else:
+        ok = tgs["poll_ok_at"] and time.time() - tgs["poll_ok_at"] < 180
+        items.append({"name": "Telegram bot", "ok": bool(ok), "detail": f"@{tg.BOT_USERNAME} · last update check {_ago(tgs['poll_ok_at'])}"
+                      + (f" · last error {_ago(tgs['poll_err_at'])}: {tgs['poll_err']}" if tgs["poll_err_at"] > tgs["poll_ok_at"] else "")})
+        items.append({"name": "Bot privacy mode", "ok": not tg.PRIVACY_ON,
+                      "detail": "On: the bot doesn't see group messages (@BotFather → /setprivacy → Disable)" if tg.PRIVACY_ON else "Off: the bot sees who chats"})
+    ms = music.STATS
+    yt_ok = ms["yt_ok_at"] >= ms["yt_err_at"]
+    items.append({"name": "YouTube", "ok": None if not (ms["yt_ok_at"] or ms["yt_err_at"]) else yt_ok, "test": "youtube",
+                  "detail": (f"Last song found {_ago(ms['yt_ok_at'])}" if yt_ok and ms["yt_ok_at"] else
+                             f"Last failure {_ago(ms['yt_err_at'])}: {ms['yt_err'][:160]}" if ms["yt_err_at"] else "No songs played yet")
+                  + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
+    lkc = await lk.check()
+    items.append({"name": "Voice (LiveKit)", **lkc})
+    items.append({"name": "Full member list", **members.status()})
+    items.append({"name": "Spotify links", "ok": True, "detail": "Official API (whole playlists)" if config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET
+                  else "Public page (up to ~100 songs) · set SPOTIFY_CLIENT_ID / SECRET for more"})
+    try:
+        du = shutil.disk_usage(config.DATA_DIR)
+        cache = sum(os.path.getsize(os.path.join(music.CACHE_DIR, f)) for f in os.listdir(music.CACHE_DIR))
+        items.append({"name": "Storage", "ok": du.free > 300 * 1024 * 1024,
+                      "detail": f"{du.free // 2**20} MB free · song cache {cache // 2**20} MB of {config.AUDIO_CACHE_MB} MB"
+                      + ("" if os.path.ismount(config.DATA_DIR) or config.DEV_MODE else " · no volume at /data: data is lost on redeploy")})
+    except Exception as e:
+        items.append({"name": "Storage", "ok": False, "detail": str(e)[:150]})
+    online = sum(len(r.parts) for r in ROOMS.values())
+    items.append({"name": "Server", "ok": True, "detail": f"Up {_ago(_started).replace(' ago', '')} · {len(ROOMS)} voice chat{'s' if len(ROOMS) != 1 else ''} · {online} people online"})
+    day = time.time() - 86400
+    probs = [d for d in DIAG if d["chat"] == chat_id and d["ts"] > day]
+    kinds: dict[str, int] = {}
+    for d in probs:
+        kinds[d["kind"]] = kinds.get(d["kind"], 0) + 1
+    return JSONResponse({"items": items, "problems": {"counts": kinds, "latest": [
+        {k: d[k] for k in ("ts", "name", "device", "kind", "detail")} for d in list(probs)[-25:][::-1]]}})
 
 
 # ---------------- websocket ----------------
@@ -683,6 +816,7 @@ routes = [
     Route("/api/recording", api_recording, methods=["POST"]),
     Route("/api/dmcheck", api_dm_check),
     Route("/api/invite", api_invite, methods=["GET", "POST"]),
+    Route("/api/health", api_health, methods=["GET", "POST"]),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),
     Mount("/static", StaticFiles(directory=WEB), name="static"),

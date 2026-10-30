@@ -137,8 +137,16 @@ async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0)
     try:
         await call("sendMessage", **params)
     except Exception as e:
-        log.info("invite failed: %s", e)
-        return None
+        if "message_thread_id" not in params:
+            log.info("invite failed: %s", e)
+            return None
+        # the topic may be closed or gone: mention them in the main chat instead
+        params.pop("message_thread_id")
+        try:
+            await call("sendMessage", **params)
+        except Exception as e2:
+            log.info("invite failed: %s / %s", e, e2)
+            return None
     return "group"
 
 
@@ -165,7 +173,7 @@ async def alert_admins(chat_id: int, kind: str, text: str, every: int = 120):
 async def member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
     """Returns {'member': bool, 'admin': bool}. Cached for 60s."""
     if config.DEV_MODE and uid < 0:  # fake dev users
-        return {"member": True, "admin": uid == -1}
+        return {"member": True, "admin": uid == -1, "name": f"Dev {abs(uid)}", "username": f"dev{abs(uid)}", "bot": False}
     key = (chat_id, uid)
     hit = _member_cache.get(key)
     if hit and not fresh and time.time() - hit[0] < 60:
@@ -173,17 +181,19 @@ async def member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
     try:
         m = await call("getChatMember", chat_id=chat_id, user_id=uid)
         st = m.get("status")
+        u = m.get("user") or {}
         res = {
             "member": st in ("creator", "administrator", "member") or (st == "restricted" and bool(m.get("is_member"))),
             "admin": st in ("creator", "administrator"),
+            "name": _full_name(u)[:64], "username": u.get("username") or "", "bot": bool(u.get("is_bot")),
         }
     except ApiError as e:  # Telegram's answer: not a member / chat gone
         log.info("getChatMember %s %s: %s", chat_id, uid, e)
-        res = {"member": False, "admin": False}
+        res = {"member": False, "admin": False, "name": "", "username": "", "bot": False}
     except Exception as e:
         # Network trouble is not an answer: keep the last known status instead of kicking people out.
         log.warning("getChatMember failed %s %s: %s", chat_id, uid, e)
-        return hit[1] if hit else {"member": False, "admin": False}
+        return hit[1] if hit else {"member": False, "admin": False, "name": "", "username": "", "bot": False}
     if len(_member_cache) > 5000:
         cutoff = time.time() - 120
         for k in [k for k, v in _member_cache.items() if v[0] < cutoff]:
@@ -226,6 +236,15 @@ async def send_recording(uid: int, data: bytes, filename: str, caption: str) -> 
 
 # ---- update handling ----------------------------------------------------------------------
 async def _handle(upd: dict):
+    # every way the bot sees someone in the group adds them to the invite list
+    if mr := upd.get("message_reaction"):
+        if mr.get("chat", {}).get("type") in ("group", "supergroup"):
+            await remember_member(mr["chat"]["id"], mr.get("user"))
+        return
+    if em := upd.get("edited_message"):
+        if em.get("chat", {}).get("type") in ("group", "supergroup") and not em.get("sender_chat"):
+            await remember_member(em["chat"]["id"], em.get("from"))
+        return
     msg = upd.get("message")
     if cm := upd.get("chat_member"):  # someone joined / left the group (needs the bot to be admin)
         if cm["chat"]["type"] in ("group", "supergroup"):
@@ -300,8 +319,11 @@ def _esc(s: str) -> str:
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+PRIVACY_ON = False  # privacy mode on = the bot doesn't see normal group messages (set from getMe)
+
+
 async def run_polling():
-    global BOT_USERNAME
+    global BOT_USERNAME, PRIVACY_ON
     if not config.BOT_TOKEN:
         log.warning("BOT_TOKEN missing; bot disabled")
         return
@@ -309,6 +331,10 @@ async def run_polling():
         try:
             me = await call("getMe")
             BOT_USERNAME = me["username"]
+            PRIVACY_ON = not me.get("can_read_all_group_messages")
+            if PRIVACY_ON:
+                log.warning("Bot privacy mode is ON: the bot can't see group messages, so the invite list only fills "
+                            "up slowly. Turn it off: @BotFather -> /setprivacy -> your bot -> Disable")
             await call("setMyCommands", commands=[
                 {"command": "vc", "description": "Open the voice chat"},
                 {"command": "resetlink", "description": "Admins: make a new private link"},
@@ -321,7 +347,7 @@ async def run_polling():
     offset = 0
     while True:
         try:
-            ups = await call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "my_chat_member", "chat_member"])
+            ups = await call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "edited_message", "my_chat_member", "chat_member", "message_reaction"])
             for u in ups:
                 offset = u["update_id"] + 1
                 try:

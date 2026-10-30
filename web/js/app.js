@@ -447,39 +447,57 @@ on('ws:sound', (m) => {
 async function openInvite() {
   haptic('light');
   const search = h('input', { type: 'search', placeholder: 'Search members', 'aria-label': 'Search members' });
-  const list = h('div', null, h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
   const note = h('p', { class: 'muted note' });
-  const body = h('div', null, h('div', { class: 'searchbar', style: { margin: '4px 0 6px' } }, icon('search'), search), note, list);
-  sheet({ title: 'Invite to voice chat', body, tall: true });
-  let people = [];
+  const list = h('div', { class: 'list' });
+  const foot = h('div', { class: 'inv-foot' });
+  const body = h('div', null, h('div', { class: 'searchbar', style: { margin: '4px 0 6px' } }, icon('search'), search), note, list, foot);
+  const sh = sheet({ title: 'Invite to voice chat', body, tall: true, onClose: () => io?.disconnect() });
   const sent = new Set();
-  const draw = () => {
-    const q = search.value.trim().toLowerCase().replace(/^@/, '');
-    const shown = people.filter(p => !q || p.name.toLowerCase().includes(q) || p.username.toLowerCase().includes(q));
-    list.replaceChildren(shown.length ? h('div', { class: 'list' }, ...shown.map(p => {
-      const btn = h('button', { class: 'btn sm' + (sent.has(p.uid) ? ' soft' : ''), disabled: sent.has(p.uid) }, sent.has(p.uid) ? 'Invited' : 'Invite');
-      btn.onclick = async () => {
-        btn.disabled = true;
-        try {
-          const r = await api('/api/invite', { body: { uid: p.uid } });
-          sent.add(p.uid); haptic('success');
-          toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} was mentioned in the group`);
-          btn.textContent = 'Invited'; btn.classList.add('soft');
-        } catch (e) { btn.disabled = false; toast(e.message, 3200, 'err'); }
-      };
-      return h('div', { class: 'row' }, h('div', { class: 'ia' }, avatarEl(p)),
-        h('span', { class: 'lab' }, p.name, h('small', null, [p.admin ? 'admin' : null, p.username ? '@' + p.username : null].filter(Boolean).join(' · '))), btn);
-    })) : h('div', { class: 'empty-note' }, q ? 'Nobody found.' : 'Nobody to invite right now.'));
+  // the list comes in pages: more people load by themselves as you scroll down
+  let q = '', next = 0, more = true, busy = false, gen = 0, io = null, shown = 0;
+  const row = (p) => {
+    const btn = h('button', { class: 'btn sm' + (sent.has(p.uid) ? ' soft' : ''), disabled: sent.has(p.uid) }, sent.has(p.uid) ? 'Invited' : 'Invite');
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        const r = await api('/api/invite', { body: { uid: p.uid } });
+        sent.add(p.uid); haptic('success');
+        toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} hasn’t started the bot, so they were mentioned in the group`, 3600);
+        btn.textContent = 'Invited'; btn.classList.add('soft');
+      } catch (e) { btn.disabled = false; btn.textContent = 'Invite'; toast(e.message, 3600, 'err'); }
+    };
+    return h('div', { class: 'row' }, h('div', { class: 'ia' }, avatarEl(p)),
+      h('span', { class: 'lab' }, p.name, h('small', null, [p.admin ? 'admin' : null, p.username ? '@' + p.username : null].filter(Boolean).join(' · '))), btn);
   };
-  search.oninput = draw;
-  try {
-    const r = await api('/api/invite');
-    people = r.people;
-    note.textContent = r.hidden
-      ? 'This group hides its member list, so only admins are shown.'
-      : 'Shows admins and members who have chatted in the group or joined the voice chat before. Telegram doesn’t let bots see the full member list.';
-    draw();
-  } catch (e) { list.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
+  const load = async () => {
+    if (busy || !more) return;
+    busy = true;
+    const my = gen;
+    foot.replaceChildren(h('div', { class: 'spinner', style: { margin: '14px auto' } }));
+    try {
+      const r = await api(`/api/invite?q=${encodeURIComponent(q)}&offset=${next}&limit=40`);
+      if (my !== gen) return; // a newer search started meanwhile
+      list.append(...r.people.map(row));
+      shown += r.people.length;
+      more = r.more; next = r.next;
+      note.textContent = r.only_admins ? 'This group hides its member list, so you can invite its admins.'
+        : r.source === 'full' ? (r.total != null ? `${r.total} members` : '')
+        : 'Admins and the members the bot has seen in the group.';
+      if (r.hint) note.append(h('span', { class: 'inv-hint' }, r.privacy
+        ? ' To list more people: in @BotFather send /setprivacy → choose the bot → Disable. To list everyone, set TG_API_ID and TG_API_HASH (my.telegram.org).'
+        : ' To list everyone in the group, set TG_API_ID and TG_API_HASH (from my.telegram.org) on the server.'));
+      foot.replaceChildren(!shown ? h('div', { class: 'empty-note' }, q ? 'Nobody found.' : 'Nobody to invite right now.') : '');
+      if (more && sh.body.scrollHeight <= sh.body.clientHeight + 40) { busy = false; return load(); } // fill the screen
+    } catch (e) {
+      if (my === gen) foot.replaceChildren(h('div', { class: 'empty-note' }, e.message, ' ', h('button', { class: 'btn sm soft', onclick: () => { busy = false; load(); } }, 'Retry')));
+    } finally { if (my === gen) busy = false; }
+  };
+  const restart = () => { gen++; busy = false; more = true; next = 0; shown = 0; list.replaceChildren(); load(); };
+  let tmr = null;
+  search.oninput = () => { clearTimeout(tmr); tmr = setTimeout(() => { q = search.value.trim().replace(/^@/, ''); restart(); }, 300); };
+  io = new IntersectionObserver((es) => { if (es.some(e => e.isIntersecting)) load(); }, { root: sh.body, rootMargin: '300px' });
+  io.observe(foot);
+  restart();
 }
 
 // ======================= chat (like Telegram's voice chat) =======================

@@ -41,6 +41,14 @@ secret into the app variables. Voice works over TCP, just with a little more del
   (`base64 -w0 cookies.txt`) and put it in `YT_COOKIES_B64`.
 - yt-dlp updates itself on every restart.
 
+### 4b. Full member list for invites (recommended)
+Telegram's Bot API can't list a group's members, so by default the Invite list only shows admins and the people
+the bot has seen (chatting, reacting, joining the voice chat). To list **everyone** in the group:
+1. Open https://my.telegram.org → **API development tools** → create an app (any name).
+2. Set `TG_API_ID` and `TG_API_HASH` on Railway. The bot logs in with its own token (no phone number) and only
+   reads member lists. The bot must be an admin of the group.
+Also turn off privacy mode (`/setprivacy` → Disable in @BotFather) so the bot sees who chats.
+
 ### 5. Pinned voice chat bar
 Send `/vc` in the group. The bot posts a **Voice Chat** photo message with a **JOIN** button and pins it.
 It shows up to 3 participants' photos and the count ("5 participants" / "No participants" / "Starts in 2h"),
@@ -73,8 +81,10 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
   ear speaker, Bluetooth, earphones; iPhone uses Control Center), voice and music volume sliders,
   weak-internet warnings (yours, and a label on anyone with a weak connection), join/leave sounds, appear as the group
 - **Invite:** invite members from inside the voice chat. The bot sends them a private Join button, or mentions
-  them in the group if they never started the bot. If the group hides its members, only admins are listed;
-  anonymous admins are never shown. Invite as many people in a row as you like (up to 10 a minute); the same
+  them in the group if they never started the bot. The list loads more people as you scroll and searches on
+  the server. With `TG_API_ID`/`TG_API_HASH` it shows every member, otherwise everyone the bot has seen. If the
+  group hides its members, normal members see only the admins (admins still see everyone); anonymous admins and
+  bots are never shown. Invite as many people in a row as you like (up to 10 a minute); the same
   person can be invited again after 5 minutes.
 - **Chat:** like Telegram's voice chat: the Message button slides a message box up over the room, messages pop up for
   a few seconds and disappear, tap one to reply, floating reactions. Everyone can read back the messages sent

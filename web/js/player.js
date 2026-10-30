@@ -11,9 +11,9 @@ function makeAudio() {
   a.preload = 'auto';
   a.crossOrigin = 'anonymous';
   // (a spare element waiting to be used must not steer the music)
-  a.addEventListener('loadedmetadata', () => a === audio && sync(true));
-  a.addEventListener('ended', () => a === audio && onEnded());
-  a.addEventListener('error', () => a === audio && onAudioError());
+  a.addEventListener('loadedmetadata', () => a === audio && !isSilence(a) && sync(true));
+  a.addEventListener('ended', () => a === audio && !isSilence(a) && onEnded());
+  a.addEventListener('error', () => a === audio && !isSilence(a) && onAudioError());
   // Minimized Telegram freezes the page's timers, but the playing song still sends time updates: use them to
   // keep the music on track in the background.
   a.addEventListener('timeupdate', () => { if (a === audio && document.hidden && Date.now() - lastSync > 900) sync(); });
@@ -49,6 +49,7 @@ let G = null; // WebAudio graph
 
 const cur = () => S.music?.current || null;
 const playing = () => S.music?.status === 'playing';
+const loadingSong = () => S.music?.status === 'loading'; // the server is still finding the stream: the song starts at 0 once it's ready
 // video is on when someone turned it on for this song (and you didn't switch back), or you turned it on for you
 export const isVideo = () => { const c = cur(); return !!c && ((c.video && P.optOut !== c.qid) || P.localVid === c.qid); };
 export function expectedPos() {
@@ -276,8 +277,26 @@ export function unlockAudio() {
   // (sync decides: it never replays a song that's already over, which a bare play() would restart from 0)
   if (cur() && playing() && !P.localPaused && audio.paused) sync();
   else if (P.blocked && !audio.paused && (!G || G.c.state === 'running')) setBlocked(false);
-  primeSpare();
+  unlockElement(audio);
+  primeSpare(); // once: ready for when effects switch off later (that moves the song to the spare player)
 }
+// iPhone lets an <audio> element play by itself later only if a tap has started it once. The first tap usually
+// comes before any song is playing (mic, chat…), and that left the music player locked: every song stayed silent
+// until the "sound off" button was tapped. So the first tap now starts the player itself — a moment of silence,
+// or the loaded song started and stopped at once — and it stays unlocked for every song after that.
+function unlockElement(a) {
+  if (a.__ok) return;
+  if (!a.paused) { a.__ok = true; return; } // already playing: it's unlocked
+  const song = a.getAttribute('src');
+  if (!song) a.src = SILENCE;
+  a.__ok = true; // the play() inside this tap is what counts, even if it's stopped right away
+  const pr = a.play();
+  if (song) a.pause();
+  pr.then(() => {
+    if (a.getAttribute('src') === SILENCE) { a.pause(); a.removeAttribute('src'); a.load(); }
+  }, (e) => { if (e?.name === 'NotAllowedError') a.__ok = false; }); // not a real tap (a scroll): next one
+}
+const isSilence = (a) => a.getAttribute('src') === SILENCE;
 // iPhone unlocks sound per <audio> element. Keep one spare element that a tap already played (a short bit of
 // silence), so switching the effects off later can move the song to it without needing another tap.
 let spare = null, priming = false;
@@ -460,7 +479,7 @@ export function renderCard() {
   const el = card(); if (!el) return;
   const t = cur();
   const vidHere = !!t && isVideo() && !NP.open && !FV;
-  const sig = t ? [t.qid, t.title, t.by, playing() && !P.localPaused, P.blocked, vidHere, can('add')].join('|') : 'empty|' + can('add');
+  const sig = t ? [t.qid, t.title, t.by, playing() && !P.localPaused, loadingSong(), P.blocked, vidHere, can('add')].join('|') : 'empty|' + can('add');
   // (full screen and the player borrow the video element: rebuild if it should be here but isn't)
   if (sig === cardSig && el.firstChild && (!vidHere || el.contains(video))) return;
   cardSig = sig;
@@ -489,7 +508,9 @@ export function renderCard() {
       h('div', { class: 'art-sub' }, t.artist + (t.by ? ` · added by ${t.by}` : ''))),
     h('div', { class: 'ctl' },
       showVid ? null : h('button', { class: 'vsw', 'aria-label': 'Watch the video', onclick: (e) => { e.stopPropagation(); setVideo(true); } }, icon('video')),
-      isPlay && P.blocked
+      loadingSong()
+        ? h('button', { class: 'loading-btn', 'aria-label': 'Loading the song', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, h('span', { class: 'spin' }))
+        : isPlay && P.blocked
         // the phone stopped the sound (call, lock screen, no tap yet): one tap here brings it back
         ? h('button', { class: 'muted-btn', 'aria-label': 'Sound is off — tap to turn it on', onclick: (e) => { e.stopPropagation(); unlockAudio(); } }, icon('vol-x'))
         : h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
@@ -546,7 +567,7 @@ function togglePlay() {
   const m = S.music; if (!m) return;
   if (can('playback')) {
     if (P.localPaused) { P.localPaused = false; sync(true); refresh(); return; }
-    send({ t: m.status === 'playing' ? 'music.pause' : 'music.play' });
+    send({ t: m.status === 'playing' || m.status === 'loading' ? 'music.pause' : 'music.play' });
   } else {
     // without playback rights you pause only for yourself; resuming jumps back to live
     P.localPaused = !P.localPaused;

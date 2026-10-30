@@ -580,7 +580,14 @@ class Room:
         self.pos = 0.0
         self.upd = now()
         if item:
-            self.status = "playing"
+            # Finding the stream on YouTube can take several seconds. The room's clock used to start at once, so
+            # everyone joined the song a few seconds in (or heard nothing at first). Now it waits ("loading") and
+            # starts at 0 the moment the song can be played.
+            if music.is_ready(item["id"]):
+                self.status = "playing"
+            else:
+                self.status = "loading"
+                spawn(self._when_ready(item["qid"], item["id"]))
             self.recent.append(item["id"])
             spawn(music.prefetch(item["id"]))
             if self.queue:
@@ -598,6 +605,17 @@ class Room:
             self.status = "stopped"
         self._arm_timer()
         await self.push_music()
+
+    async def _when_ready(self, qid: int, vid: str):
+        try:
+            await asyncio.wait_for(music.resolve(vid), 15)
+        except Exception as e:  # can't be found / too slow: start anyway, the phones retry on their own
+            log.info("resolve before start failed %s: %s", vid, e)
+        async with self._lock:
+            if self.current and self.current["qid"] == qid and self.status == "loading":
+                self.status, self.pos, self.upd = "playing", 0.0, now()
+                self._arm_timer()
+                await self.push_music()
 
     async def _fill_duration(self, item: dict):
         try:
@@ -762,7 +780,7 @@ class Room:
             elif self.status == "stopped" and self.queue:
                 await self._start(self.queue.pop(0))
         elif cmd == "pause":
-            if self.status == "playing":
+            if self.status in ("playing", "loading"):
                 self.pos, self.upd, self.status = self.cur_pos(), now(), "paused"
                 self._cancel_timer()
                 await self.push_music()

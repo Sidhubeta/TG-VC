@@ -138,6 +138,12 @@ async def related(vid: str, limit: int = 25) -> list[dict]:
     return [t for e in info.get("entries") or [] if (t := _track(e)) and t["id"] != vid]
 
 
+def is_ready(vid: str) -> bool:
+    """The stream address is already known, so the song can start right away."""
+    hit = _info_cache.get(vid)
+    return bool(hit) and time.time() - hit[0] < 3 * 3600
+
+
 async def resolve(vid: str, force: bool = False) -> dict:
     hit = _info_cache.get(vid)
     if hit and not force and time.time() - hit[0] < 3 * 3600:

@@ -955,3 +955,9 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
 @media (prefers-reduced-motion: reduce) {
   #room, .np-card .art, .np-card .meta, .np-card .card-vid, .sheet .sh-body *, #composer, .ico, .toast { animation: none !important; }
 }
+/* the song is being fetched: a small spinner where the play button goes */
+.np-card .ctl .loading-btn .spin { width: 20px; height: 20px; border-radius: 50%; border: 2.5px solid rgba(255, 255, 255, .25);
+  border-top-color: #fff; animation: spin .8s linear infinite; }
+/* invite list */
+.inv-foot { min-height: 8px; }
+.inv-hint { display: block; margin-top: 6px; color: var(--fg2); }

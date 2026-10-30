@@ -31,6 +31,12 @@ YT_COOKIES_B64 = _env("YT_COOKIES_B64")    # same, base64 encoded (easier for Ra
 POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. http://bgutil.railway.internal:4416
 AUDIO_CACHE_MB = int(_env("AUDIO_CACHE_MB", "800"))
 
+# Optional: the full member list for invites. The Bot API can't list a group's members, Telegram's full API
+# (MTProto) can. Get both values at https://my.telegram.org -> API development tools. Without them, the invite
+# list shows the members the bot has seen.
+TG_API_ID = _env("TG_API_ID")
+TG_API_HASH = _env("TG_API_HASH")
+
 # Open the Mini App in fullscreen from group links (Telegram 8.0+; older apps just open normally)
 FULLSCREEN = _env("FULLSCREEN", "1") == "1"
 

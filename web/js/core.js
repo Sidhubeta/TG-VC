@@ -137,7 +137,7 @@ export function connectWS(opts = {}) {
   ws.onopen = () => {
     retry = 0;
     while (outbox.length) ws.send(JSON.stringify(outbox.shift()));
-    syncClock();
+    syncClock(true);
     clearInterval(wsTimer);
     wsTimer = setInterval(syncClock, 30000);
   };
@@ -145,7 +145,7 @@ export function connectWS(opts = {}) {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     if (m.t === 'pong') return onPong(m);
-    if (m.now && m.t === 'init') S.offset = m.now - Date.now() / 1000;
+    if (m.now && m.t === 'init' && !clock.length) S.offset = m.now - Date.now() / 1000; // rough, until the pings answer
     emit('ws:' + m.t, m);
   };
   const sock = ws;
@@ -170,17 +170,24 @@ document.addEventListener('visibilitychange', () => {
 });
 export function reconnectWS(opts) { closedByUs = true; try { ws?.close(); } catch {} setTimeout(() => connectWS(opts), 200); }
 export function closeWS() { closedByUs = true; clearTimeout(retryTimer); try { ws?.close(); } catch {} }
-let pingId = 0; const pings = {};
-function syncClock() {
+// Server clock, NTP style: the music timeline is in server time, so every phone must know it well. One slow
+// ping used to skew it by 0.1-0.2 s (everyone's music a little apart); now a few pings are sent and the one
+// with the fastest round trip wins (the least delay = the least error).
+let pingId = 0, clock = [];
+const pings = {};
+function syncClock(burst = false) {
   if (!ws || ws.readyState !== 1) return; // don't queue clock pings while offline (stale timings)
   const id = ++pingId; pings[id] = Date.now() / 1000; send({ t: 'ping', id });
   for (const k in pings) if (pings[k] < pings[id] - 60) delete pings[k];
+  if (burst) for (let i = 1; i < 5; i++) setTimeout(() => syncClock(), i * 250);
 }
 function onPong(m) {
   const t0 = pings[m.id]; delete pings[m.id];
   if (!t0) return;
   const t1 = Date.now() / 1000;
-  S.offset = m.now - (t0 + t1) / 2;
+  clock.push({ off: m.now - (t0 + t1) / 2, rtt: t1 - t0, at: t1 });
+  clock = clock.filter(c => t1 - c.at < 300).slice(-12);
+  S.offset = clock.reduce((a, b) => (b.rtt < a.rtt ? b : a)).off;
 }
 
 // ---------- toasts ----------

@@ -49,9 +49,11 @@ async function boot() {
   try { tg?.enableClosingConfirmation?.(); } catch {}
 }
 // Browsers only allow sound after a tap. Instead of a "Tap to listen" button, any tap anywhere starts it.
-const unlockAll = () => { unlockAudio(); unblockAudio(); };
-document.addEventListener('pointerdown', unlockAll, { capture: true, passive: true });
-document.addEventListener('keydown', unlockAll, { capture: true });
+// Phones count only the end of a tap (touchend / click) as permission for sound, not the moment the finger
+// lands; listening to pointerdown alone is why only the "sound off" button itself used to bring the music back.
+let lastUnlock = 0;
+const unlockAll = () => { if (Date.now() - lastUnlock < 250) return; lastUnlock = Date.now(); unlockAudio(); unblockAudio(); };
+['touchend', 'click', 'keydown'].forEach(e => document.addEventListener(e, unlockAll, { capture: true, passive: true }));
 
 // Closing the app = leaving the voice chat (the socket also drops, this just makes it instant)
 let byeSent = false;
@@ -74,10 +76,10 @@ let started = false;
 on('ws:init', (m) => {
   S.admin = m.admin; S.room = m.room; S.group = m.group;
   S.parts = new Map(m.parts.map(p => [p.uid, p]));
-  // keep what we already saw (reconnects), add what's new; the server only sends messages since we joined
-  const known = new Set(S.msgs.map(x => x.id));
-  for (const x of m.chat) if (!known.has(x.id)) S.msgs.push(x);
-  S.msgs.sort((a, b) => a.id - b.id);
+  // The server decides what we may read back: since we joined (admins: 48 hours). A quick reconnect keeps it;
+  // leaving and joining again starts over.
+  S.msgs = [...m.chat].sort((a, b) => a.id - b.id);
+  if (historySheet) { historySheet.close(); historySheet = null; }
   $('#gate').hidden = true;
   $('#room').hidden = false;
   if (!started) {
@@ -293,15 +295,18 @@ function renderDock() {
 on('voice', ({ state }) => { S.voiceState = state; renderDock(); });
 on('voice:local', renderDock);
 
+let micBusy = false;
 function bindDock() {
   $('#b-mic').onclick = async () => {
     const p = me(); if (!p) return;
     if (S.voiceState !== 'ready') return toast(S.voiceState === 'off' ? 'Voice isn’t set up on the server yet' : 'Voice is still connecting');
     if (p.forceMuted) return denied('An admin muted you — only admins can let you speak');
     if (!p.canSpeak) { haptic('medium'); send({ t: 'hand', up: !p.hand }); if (!p.hand) toast('Hand raised — admins will let you speak'); return; }
+    if (micBusy) return; // a second quick tap while the first one is still switching the mic
     haptic('medium');
-    const want = !V.mic;
-    if (await setMic(want)) { micSound(want); renderDock(); }
+    const want = !V.mic, btn = $('#b-mic').parentElement;
+    micBusy = true; btn.classList.add('busy'); // feedback at once; turning the mic on can take a moment
+    try { if (await setMic(want)) { micSound(want); } } finally { micBusy = false; btn.classList.remove('busy'); renderDock(); }
   };
   $('#b-cam').onclick = openCamera;
   $('#b-speaker').onclick = openAudio;
@@ -416,7 +421,7 @@ function openMore() {
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
       actionRow('music', 'Music player', () => { s.close(); openNP(); }),
       actionRow('search', 'Browse music', () => { s.close(); openSearch('home'); }),
-      S.admin ? actionRow('history', 'Recent messages', () => { s.close(); openHistory(); }, '', 'Last 48 hours · only admins see this') : null,
+      actionRow('history', 'Recent messages', () => { s.close(); openHistory(); }, '', S.admin ? 'Last 48 hours' : 'Since you joined'),
       S.room.settings?.soundboard ? actionRow('sound', 'Soundboard', () => { s.close(); openBoard(); }) : null,
       screenSupported() && p?.canSpeak ? actionRow('screen', V.screen ? 'Stop sharing screen' : 'Share screen', () => { s.close(); setScreen(!V.screen); }) : null),
     h('div', { class: 'list' },
@@ -460,7 +465,7 @@ async function openInvite() {
           sent.add(p.uid); haptic('success');
           toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} was mentioned in the group`);
           btn.textContent = 'Invited'; btn.classList.add('soft');
-        } catch (e) { btn.disabled = false; toast(e.message); }
+        } catch (e) { btn.disabled = false; toast(e.message, 3200, 'err'); }
       };
       return h('div', { class: 'row' }, h('div', { class: 'ia' }, avatarEl(p)),
         h('span', { class: 'lab' }, p.name, h('small', null, [p.admin ? 'admin' : null, p.username ? '@' + p.username : null].filter(Boolean).join(' · '))), btn);
@@ -479,7 +484,7 @@ async function openInvite() {
 
 // ======================= chat (like Telegram's voice chat) =======================
 // Tap Message: a message box slides up over the room (no separate screen). Messages pop up for a few seconds
-// and disappear. Tap a message to reply. Only admins can read back recent messages (kept 48 hours).
+// and disappear. Tap a message to reply. Everyone can read back messages since they joined; admins, 48 hours.
 const REACTS = ['👍', '❤️', '😂', '🔥', '😮', '😢', '👏', '🎉'];
 const FLY = ['👍', '❤️', '🔥', '😂', '😍', '🤩', '👏', '🎉', '😮', '😢', '🙏', '💯', '🥳', '😎', '🤣', '💔'];
 const nameColor = (uid) => `hsl(${(Math.abs(uid) * 47) % 360} 70% 62%)`;
@@ -491,7 +496,7 @@ function openChat(reply = null) {
   if (!box.hidden && !reply) return closeComposer();
   box.hidden = false;
   document.body.classList.add('composing');
-  $('#cmp-history').hidden = !S.admin;
+  $('#cmp-history').hidden = false;
   setReply(reply);
   input.focus();
   haptic('light');
@@ -556,7 +561,7 @@ on('ws:fly', (m) => {
   setTimeout(() => el.remove(), 3200);
 });
 
-// ---- recent messages (admins only, last 48 hours) ----
+// ---- recent messages (since you joined; admins: last 48 hours) ----
 function msgEl(m) {
   const mine = m.uid === S.uid;
   return h('div', { class: 'msg' + (mine ? ' mine' : ''), 'data-id': m.id, onclick: () => msgMenu(m) },
@@ -584,15 +589,17 @@ function msgMenu(m) {
   const s = sheet({ title: m.name, body });
 }
 function openHistory() {
-  if (!S.admin) return;
+  historySheet?.close();
   const list = h('div', { class: 'chat-list' }, ...S.msgs.map(msgEl));
-  if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, 'No messages in the last 48 hours.'));
-  const body = h('div', null, h('p', { class: 'muted note' }, 'Only admins see this. Messages are kept for 48 hours. Tap one to reply.'), list);
+  if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, S.admin ? 'No messages in the last 48 hours.' : 'No messages since you joined.'));
+  const note = S.admin ? 'As an admin you see the last 48 hours. Tap a message to reply.'
+    : 'Messages since you joined. When you leave the voice chat they’re gone for you. Tap a message to reply.';
+  const body = h('div', null, h('p', { class: 'muted note' }, note), list);
   historySheet = sheet({ title: 'Recent messages', body, tall: true, onClose: () => { historySheet = null; } });
   setTimeout(() => (historySheet && (historySheet.body.scrollTop = historySheet.body.scrollHeight)), 50);
 }
 on('ws:chat', ({ m }) => {
-  if (S.admin) { S.msgs.push(m); if (S.msgs.length > 300) S.msgs.shift(); }
+  S.msgs.push(m); if (S.msgs.length > 300) S.msgs.shift();
   if (historySheet) {
     const body = historySheet.body;
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;

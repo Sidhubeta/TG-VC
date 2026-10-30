@@ -510,7 +510,8 @@ async def api_dm_check(request: Request, uid, chat_id, st):
 
 
 # ---------------- invites ----------------
-_invite_last: dict[tuple, float] = {}
+_invite_last: dict[tuple, float] = {}  # (chat, invited uid) -> when
+_invite_by: dict[tuple, list[float]] = {}  # (chat, inviter) -> recent invite times
 
 
 @guarded()
@@ -544,22 +545,28 @@ async def api_invite(request: Request, uid, chat_id, st):
     if not person:
         return err("You can't invite this person")
     t = time.time()
-    if t - _invite_last.get(("by", chat_id, uid), 0) < 4:
-        return err("Slow down a little 🙂", 429)
-    if t - _invite_last.get(("to", chat_id, target), 0) < 600:
-        return err(f"{person['name']} was invited recently", 429)
+    # Inviting several people one after another is normal: allow a burst of 10 a minute per person
+    # (an old 4-second gap made every invite after the first one fail when tapped quickly).
+    recent = [x for x in _invite_by.get((chat_id, uid), []) if t - x < 60]
+    if len(recent) >= 10:
+        return err("That's a lot of invites — try again in a minute 🙂", 429)
+    if t - _invite_last.get((chat_id, target), 0) < 300:
+        return err(f"{person['name']} was invited a moment ago", 429)
     if not (await tg.member_status(chat_id, target, fresh=True))["member"]:
         return err(f"{person['name']} isn't in the group any more")
-    _invite_last[("by", chat_id, uid)] = _invite_last[("to", chat_id, target)] = t
-    if len(_invite_last) > 5000:
-        for k in [k for k, v in _invite_last.items() if t - v > 600]:
+    _invite_by[(chat_id, uid)] = recent + [t]
+    _invite_last[(chat_id, target)] = t
+    if len(_invite_last) > 5000 or len(_invite_by) > 5000:
+        for k in [k for k, v in _invite_last.items() if t - v > 300]:
             _invite_last.pop(k, None)
+        for k in [k for k, v in _invite_by.items() if not v or t - v[-1] > 60]:
+            _invite_by.pop(k, None)
     me = room.parts.get(uid)
     by = room.group_title if me and me.as_group else (me.name if me else "Someone")
     via = await tg.invite(chat_id, target, person["name"], by, len(room.parts))
     if not via:
-        _invite_last.pop(("to", chat_id, target), None)
-        return err("Couldn't send the invite")
+        _invite_last.pop((chat_id, target), None)
+        return err("Couldn't send the invite — try again")
     return JSONResponse({"ok": True, "via": via})
 
 

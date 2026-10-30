@@ -74,17 +74,20 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
   weak-internet warnings (yours, and a label on anyone with a weak connection), join/leave sounds, appear as the group
 - **Invite:** invite members from inside the voice chat. The bot sends them a private Join button, or mentions
   them in the group if they never started the bot. If the group hides its members, only admins are listed;
-  anonymous admins are never shown.
+  anonymous admins are never shown. Invite as many people in a row as you like (up to 10 a minute); the same
+  person can be invited again after 5 minutes.
 - **Chat:** like Telegram's voice chat: the Message button slides a message box up over the room, messages pop up for
-  a few seconds and disappear, tap one to reply, floating reactions. Only admins can read back recent messages
-  (kept 48 hours). Message reactions, delete
+  a few seconds and disappear, tap one to reply, floating reactions. Everyone can read back the messages sent
+  since they joined (leaving and coming back starts over; a quick reconnect doesn't count as leaving); admins can
+  read back the last 48 hours. Message reactions, delete
 - **Music:** YouTube search, links and playlists, synced for everyone, queue, repeat, shuffle, autoplay (only when on),
   vote skip, audio-only/video switch, audio and video quality (Auto adapts to the connection), lyrics,
   Liked Songs and playlists, history, "Made for you" picks from what each person listens to and likes.
   The music keeps going for 10 minutes after the last person leaves, so minimizing Telegram doesn't rewind it.
   Tapping a song gives three clear choices: Play now, Play next, Add to queue. A song is never queued twice.
-  Audio and video stay in step with each other and with the room; a song that goes silent restarts by itself,
-  and if the phone blocks the sound the player shows a "sound off" button that turns it back on
+  Audio and video stay in step with each other and with the room (phones within a few hundredths of a second);
+  a song that goes silent restarts by itself, a video that fails to load retries by itself, the next song starts
+  even while Telegram is minimized, and if the phone holds the sound back any tap brings it back
 - **Sound:** Bass Boost, 8D, Concert Hall, Vocal, Slowed + Reverb, Nightcore, plus EQ, reverb and speed.
   Everyone hears the same effect in sync; only admins or the person who added the song can change it.
 - **Soundboard:** sounds everyone hears (admins can switch it off)

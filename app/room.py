@@ -39,7 +39,8 @@ DENY = {"add": "add songs", "next": "play songs next", "vote": "vote to skip", "
         "playback": "control playback", "queue": "change the queue", "modes": "change repeat and autoplay",
         "fx_own": "change the sound", "fx": "change the sound", "video": "turn on video for everyone",
         "stop": "stop the music"}
-CHAT_KEEP = 48 * 3600  # recent messages are kept 48 hours, and only admins can read them back
+CHAT_KEEP = 48 * 3600  # recent messages are kept 48 hours; admins can read all of them back
+REJOIN_GRACE = 45  # a dropped connection that comes back this fast is not "leaving" (chat history stays)
 EMPTY_GRACE = 600  # keep the music running this long after the last person leaves (minimized apps reconnect)
 FX_DEFAULT = {"preset": "normal", "bass": 0, "mid": 0, "treble": 0, "reverb": 0.0, "rate": 1.0, "mode": "none"}
 DEFAULT_SETTINGS = {"title": "", "description": "", "locked": False, "new_can_speak": True,
@@ -82,6 +83,7 @@ class Participant:
         self.screen = False
         self.as_group = False
         self.joined = now()
+        self.chat_since = self.joined  # members read back the chat from here (this visit)
         self.conns: set["Conn"] = set()
         self.session_id = 0
         self.mic_since = 0.0
@@ -178,6 +180,7 @@ class Room:
         self.votes: set[int] = set()
         self.recent: deque[str] = deque(maxlen=60)
         self.history: deque[dict] = deque(maxlen=50)  # played tracks, for "previous"
+        self._left: dict[int, tuple[float, float]] = {}  # uid -> (left at, chat_since) for quick reconnects
         # sound effects are shared: everyone hears the same effect, in sync (speed changes the timeline)
         self.fx: dict = dict(FX_DEFAULT)
         self.fx_by_admin = False
@@ -254,6 +257,9 @@ class Room:
                 p.force_muted = self.sticky[uid].get("force_muted", False)
                 p.role = self.sticky[uid].get("role", p.role)
             self.parts[uid] = p
+            prev = self._left.pop(uid, None)
+            if prev and now() - prev[0] < REJOIN_GRACE:  # only the connection dropped: keep their chat
+                p.chat_since = prev[1]
             if not admin:
                 self._detect(p)
             p.session_id = await db.x(
@@ -265,10 +271,11 @@ class Room:
             self._idle.cancel()
             self._idle = None
         everyone = [self.pub(q, admin) for q in self.parts.values()]
-        # Like Telegram's voice chat, messages just pop up and disappear. Admins can read back the last 48 hours.
-        since = now() - CHAT_KEEP
+        # Messages pop up and disappear, like Telegram's voice chat. Everyone can read back what was said since
+        # they joined (leaving and coming back starts over); admins can read back the last 48 hours.
+        since = now() - CHAT_KEEP if admin else max(p.chat_since, now() - CHAT_KEEP)
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
-                         "music": self.music_state(), "chat": [m for m in self.chat if m["ts"] >= since] if admin else [],
+                         "music": self.music_state(), "chat": [m for m in self.chat if m["ts"] >= since],
                          "admin": admin,
                          "group": self.group_title})
         if first:
@@ -296,6 +303,10 @@ class Room:
         # Remove from the room before any await, so a quick rejoin creates a fresh participant
         # instead of being dropped by this (late) leave.
         self.parts.pop(p.uid, None)
+        self._left[p.uid] = (now(), p.chat_since)
+        if len(self._left) > 500:
+            cut = now() - REJOIN_GRACE
+            self._left = {k: v for k, v in self._left.items() if v[0] >= cut}
         self.votes.discard(p.uid)
         self._mic_flush(p)
         t = now()

@@ -29,7 +29,7 @@ let lastSync = 0;
 // changed or reloaded (AbortError) used to light up the "sound off" button on new songs for no reason.
 function tryPlay() {
   return audio.play().then(() => setBlocked(false), (e) => {
-    if (e?.name === 'NotAllowedError') { setBlocked(true); report('music-blocked', `unlocked=${!!audio.__ok}`); }
+    if (e?.name === 'NotAllowedError') { setBlocked(true); report('music-blocked', `unlocked=${!!audio.__ok}`); waEnter(); }
   });
 }
 // The phone switched its audio between media and call mode (mic on/off, joining voice, new speaker). iPhone and
@@ -165,7 +165,7 @@ function onAudioError() {
   const n = errCount;
   setTimeout(() => { if (P.loadedQid === t.qid && audio.error) { audio.src = audioSrc(t) + '&try=' + n; audio.load(); tryPlay(); } }, [600, 1500, 3000, 5000][n - 1]);
 }
-video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused) video.play().catch(() => {}); });
+video.addEventListener('loadedmetadata', () => { seekVideo(); if (!soundPaused()) video.play().catch(() => {}); });
 // A video that fails to load (network blip, expired link) is retried by itself; before, it stayed blank until
 // you switched to audio and back.
 let vErr = 0;
@@ -181,7 +181,7 @@ function seekVideo() {
   // Aim ahead by as long as the last seek took: after a seek the video needs a moment before it moves again,
   // so aiming at "now" left it behind the sound every time.
   try {
-    video.currentTime = Math.min(audio.currentTime + seekCost * (audio.playbackRate || 1), video.duration || Infinity);
+    video.currentTime = Math.min(soundTime() + seekCost * soundRate(), video.duration || Infinity);
     lastVideoSeek = seekAt = Date.now();
   } catch {}
 }
@@ -208,13 +208,15 @@ function sync(force = false) {
     const c = cur();
     if (c?.duration && playing() && !P.localPaused && P.loadedQid === c.qid && expectedPos() >= endOf(c) - 0.3) { P.endedQid = c.qid; pr = predicted(); }
   }
-  if (pr?.ended) { if (!audio.paused) audio.pause(); return; } // song over, nothing queued: wait, don't replay it
+  if (pr?.ended) { if (!audio.paused) audio.pause(); waStopSong(); return; } // song over, nothing queued: wait, don't replay it
   const t = pr ? pr.track : cur();
-  if (!t) { if (!audio.paused) audio.pause(); return; }
+  if (!t) { if (!audio.paused) audio.pause(); waStopSong(); return; }
   if (t.qid !== P.loadedQid) load(t);
   const want = playing() && !P.localPaused;
   const exp = pr ? pr.pos : expectedPos();
   const r = pr ? 1 : rate();
+  // Web Audio mode: the <audio> element stays paused (the phone won't let it play yet); only the video follows.
+  if (WA.on) { if (!audio.paused && !WA.leaving) audio.pause(); waSync(t, exp, want, r); syncVideo(); return; }
   // Slowed / Nightcore change the pitch on purpose; otherwise keep the pitch when we fine-tune the speed
   const keepPitch = r === 1;
   if (audio.preservesPitch !== keepPitch) audio.preservesPitch = audio.mozPreservesPitch = audio.webkitPreservesPitch = keepPitch;
@@ -257,10 +259,10 @@ let vStuck = { t: -1, since: 0 };
 function syncVideo() {
   if (document.hidden) { if (!video.paused) video.pause(); return; } // nobody sees it: save the phone's power for the sound
   if (!video.dataset.src || video.readyState < 1) return;
-  const r = audio.playbackRate || 1;
-  if (!audio.paused && video.paused && video.isConnected) video.play().catch(() => {});
-  if (audio.paused && !video.paused) video.pause();
-  const vd = shownVideoTime() - audio.currentTime;
+  const r = soundRate();
+  if (!soundPaused() && video.paused && video.isConnected) video.play().catch(() => {});
+  if (soundPaused() && !video.paused) video.pause();
+  const vd = shownVideoTime() - soundTime();
   let vr = r;
   if (Math.abs(vd) > 0.8) {
     if (!video.seeking && video.readyState >= 2 && Date.now() - lastVideoSeek > 2000) seekVideo();
@@ -270,7 +272,7 @@ function syncVideo() {
   }
   if (Math.abs(video.playbackRate - vr) > 0.001) video.playbackRate = vr;
   // the picture froze while the sound plays (stalled download): reload it at the right spot
-  if (!audio.paused && !video.paused && !video.seeking && video.isConnected) {
+  if (!soundPaused() && !video.paused && !video.seeking && video.isConnected) {
     const now = Date.now();
     if (Math.abs(video.currentTime - vStuck.t) > 0.05) vStuck = { t: video.currentTime, since: now };
     else if (now - vStuck.since > 6000) { vStuck.since = now; const t = P.loadedTrack; if (t) { delete video.dataset.src; loadVideo(t); } }
@@ -314,10 +316,10 @@ function reviveDead(want) {
   audio.load(); tryPlay();
 }
 // coming back to the app: jump to where the room is now (not where it was when you left)
-const back = () => { G?.c.resume().catch(() => {}); sync(true); emit('app:back'); };
+const back = () => { G?.c.resume().catch(() => {}); if (WA.on) getCtx(); sync(true); emit('app:back'); }; // (getCtx wakes the Web Audio mode's context)
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) return back();
-  if (!G) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
+  if (!G && !WA.on) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
 });
 window.addEventListener('focus', back);
 try { tg?.onEvent?.('activated', back); } catch {}
@@ -349,6 +351,7 @@ export const musicBlocked = () => P.blocked;
 // Called on every tap (touchend / click count as a "user gesture" on phones; pointerdown doesn't).
 export function unlockAudio() {
   getCtx();
+  if (WA.on) waLeave();
   if (needGraph()) buildGraph();
   if (G && G.c.state !== 'running') G.c.resume().then(() => { if (G?.c.state === 'running' && !audio.paused) setBlocked(false); }, () => {});
   // (sync decides: it never replays a song that's already over, which a bare play() would restart from 0)
@@ -394,6 +397,130 @@ function primeSpare() {
     a.pause(); a.__ok = true; spare = a;
     if (G && !needGraph()) releaseGraph(); // effects were switched off while no spare was ready: finish that now
   }, () => {}).finally(() => { priming = false; });
+}
+
+// ======================= Web Audio mode =======================
+// Telegram on Android keeps every <audio> element silent until the first tap (one listener sat 15 minutes without
+// sound). Web Audio isn't held back there: a page that isn't inside another site's frame may start it without a
+// tap. So when the phone refuses play(), the song comes as short pieces from the server (/piece, 10 s each on a fixed
+// grid), is decoded and played on the room's clock. The first tap moves it back to the <audio> element, which keeps
+// playing better in the background. If Web Audio is held back too, the "Tap to hear" hint stays as before.
+const PIECE = 10;
+const WA = { on: false, leaving: false, broken: false, song: null, vol: null, bufs: new Map(), loading: new Set(), fails: 0, failAt: 0 };
+const soundTime = () => WA.on && WA.song ? waPos(WA.song) : audio.currentTime;
+const soundPaused = () => WA.on ? !WA.song : audio.paused;
+const soundRate = () => WA.on && WA.song ? WA.song.rate : audio.playbackRate || 1;
+export const webAudioState = () => ({ on: WA.on, broken: WA.broken, id: WA.song?.track.id, pos: WA.song ? waPos(WA.song) : null });
+function waEnter() {
+  if (WA.on || WA.broken || isApple || !playing()) return;
+  const c = getCtx(); if (!c?.decodeAudioData) return;
+  const go = () => {
+    if (WA.on || c.state !== 'running' || !playing() || !audio.paused) return;
+    WA.on = true;
+    console.info('music: the phone blocks <audio> until a tap, playing through Web Audio');
+    report('music-webaudio', 'on');
+    setBlocked(false);
+    sync();
+  };
+  if (c.state === 'running') go();
+  else c.resume().then(go, () => {});
+}
+// where the room's song is on our clock
+function waPos(s) { return s.pos + (s.gain.context.currentTime - s.at) * s.rate; }
+// effects on: through the effects graph (it sets the volume); else our own volume
+function waOut(c) {
+  if (G) return G.bass;
+  if (!WA.vol) { WA.vol = c.createGain(); WA.vol.gain.value = P.vol; WA.vol.connect(c.destination); }
+  return WA.vol;
+}
+function waSync(t, exp, want, r) {
+  const c = getCtx(); if (!c) return;
+  let s = WA.song;
+  if (!want || !t?.duration) return waStopSong();
+  if (s && s.qid !== t.qid) { waStopSong(crossfadeOn() && s.track.xf ? Math.min(s.track.xf, 6) : 0.05); s = null; } // the next song: blend
+  if (s && (Math.abs(s.rate - r) > 0.001 || Math.abs(waPos(s) - exp) > (document.hidden ? 4 : 0.35))) { waStopSong(); s = null; }
+  if (!s) {
+    s = WA.song = { qid: t.qid, track: t, rate: r, at: c.currentTime, pos: exp, gain: c.createGain(), out: null, nodes: new Map() };
+  }
+  if (needGraph() && !G) buildGraph();
+  const out = waOut(c);
+  if (s.out !== out) { try { s.gain.disconnect(); } catch {} s.gain.connect(out); s.out = out; }
+  // the piece playing now and the two after it
+  const k0 = Math.floor(waPos(s) / PIECE);
+  for (let k = k0; k <= k0 + 2 && k * PIECE < t.duration; k++) waPiece(s, k);
+  // near the end: get the next song's first piece ready
+  const nx = S.music?.queue?.[0];
+  if (nx?.duration && endOf(t) - waPos(s) < 15) waLoad(nx, Math.floor(startOf(nx) / PIECE));
+}
+function waPiece(s, k) {
+  if (s.nodes.has(k)) return;
+  const buf = waLoad(s.track, k);
+  if (!buf) return;
+  const c = s.gain.context;
+  if (buf === 'end') { s.nodes.set(k, null); return; }
+  const T = s.at + (k * PIECE - s.pos) / s.rate; // when this piece starts on our clock
+  const now = c.currentTime + 0.03;
+  const when = Math.max(T, now), off = (when - T) * s.rate;
+  s.nodes.set(k, null);
+  if (off >= buf.duration - 0.05) return; // already over
+  const src = c.createBufferSource(), g = c.createGain();
+  src.buffer = buf; src.playbackRate.value = s.rate;
+  // pieces overlap a little: the next one fades in while this one fades out, so the joins can't click
+  const next = T + PIECE / s.rate;
+  g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(1, when + 0.02);
+  if (next > when + 0.02) { g.gain.setValueAtTime(1, next); g.gain.linearRampToValueAtTime(0, next + 0.02); }
+  src.connect(g).connect(s.gain);
+  src.start(when, off);
+  s.nodes.set(k, src);
+}
+// The decoded piece, or null while it loads (a finished load runs sync() at once, so it starts without waiting).
+function waLoad(t, k) {
+  const key = `${t.id}:${k}:${P.aq}`;
+  if (WA.bufs.has(key)) { const b = WA.bufs.get(key); WA.bufs.delete(key); WA.bufs.set(key, b); return b; }
+  if (WA.loading.has(key) || Date.now() - WA.failAt < 1500) return null;
+  WA.loading.add(key);
+  fetch(media(`/api/stream/${t.id}/piece?k=${k}&q=${P.aq}`))
+    .then((r) => { if (!r.ok) throw new Error('status ' + r.status); return r.arrayBuffer(); })
+    .then((b) => b.byteLength < 400 ? 'end' : getCtx().decodeAudioData(b)) // an empty piece: past the song's end
+    .then((buf) => {
+      WA.bufs.set(key, buf); WA.fails = 0;
+      while (WA.bufs.size > 8) WA.bufs.delete(WA.bufs.keys().next().value);
+      if (WA.on) sync();
+    }, (e) => {
+      WA.failAt = Date.now();
+      report('music-wa-fail', `piece failed: ${e?.message || e} song=${t.id} k=${k} try=${++WA.fails}`);
+      if (WA.fails >= 6 && WA.on) waGiveUp(); // it isn't working here: back to waiting for a tap
+    })
+    .finally(() => WA.loading.delete(key));
+  return null;
+}
+function waStopSong(fade = 0.05) {
+  const s = WA.song; if (!s) return;
+  WA.song = null;
+  const t = s.gain.context.currentTime, g = s.gain.gain;
+  g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(0, t + fade);
+  s.nodes.forEach((src) => { try { src?.stop(t + fade + 0.05); } catch {} });
+  setTimeout(() => { try { s.gain.disconnect(); } catch {} }, fade * 1000 + 300);
+}
+function waGiveUp() {
+  WA.on = false; WA.broken = true; waStopSong();
+  setBlocked(true);
+}
+// A tap: start the <audio> element at the same spot (inside the tap, so the phone allows it), then stop Web Audio.
+function waLeave() {
+  if (WA.leaving) return;
+  const s = WA.song;
+  if (!s || !playing() || P.localPaused || !audio.getAttribute('src') || P.loadedQid !== s.qid) { WA.on = false; waStopSong(); return; }
+  WA.leaving = true;
+  try { audio.currentTime = waPos(s) + 0.1; } catch {}
+  audio.playbackRate = s.rate;
+  audio.play().then(() => {
+    WA.leaving = false;
+    if (!WA.on) return;
+    WA.on = false; audio.__ok = true;
+    waStopSong(0.15);
+    sync(true);
+  }, () => { WA.leaving = false; if (WA.on && !audio.paused) audio.pause(); }); // not a real tap (a scroll): stay
 }
 
 // ======================= crossfade =======================
@@ -538,6 +665,7 @@ function setVol(v) {
   if (!G && isApple && v < 0.99) buildGraph();
   if (G) G.master.gain.setTargetAtTime(v, G.c.currentTime, 0.05);
   else audio.volume = v;
+  if (WA.vol) WA.vol.gain.setTargetAtTime(v, WA.vol.context.currentTime, 0.05);
 }
 export const getMusicVolume = () => P.vol;
 export const setMusicVolume = (v) => setVol(v);

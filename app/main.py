@@ -122,8 +122,14 @@ async def api_auth(request: Request):
         except ValueError:
             return err("Invalid link", 403)
         g = await db.get_group(chat_id)
-        if version != g["link_version"]:
+        if version < g["link_version"]:
             return err("This link was reset by an admin. Ask for the new link (/vc in the group)", 403)
+        if version > g["link_version"]:
+            # A newer link than we know about: our database was lost (a redeploy without a volume) and started
+            # over at 1, which made every pinned JOIN button fail with 403. The link is genuine (it's signed), so
+            # carry on from its number.
+            await db.x("UPDATE groups SET link_version=? WHERE chat_id=?", (version, chat_id))
+            log.info("group %s: link version restored to %s", chat_id, version)
     st = await tg.member_status(chat_id, uid, fresh=True)
     if not st["member"]:
         return err("Only members of this group can join", 403)
@@ -169,13 +175,16 @@ async def api_search(request: Request, uid, chat_id, st):
     q = (request.query_params.get("q") or "").strip()[:200]
     if not q:
         return JSONResponse({"tracks": []})
-    if sp := music.parse_spotify(q):
+    sp, sc = music.parse_spotify(q), music.parse_soundcloud(q)
+    if sp or sc:  # Spotify / SoundCloud: show what's in the link; adding finds each song on YouTube
+        source = "Spotify" if sp else "SoundCloud"
         try:
-            name, songs = await music.spotify(*sp)
+            name, songs = await (music.spotify(*sp) if sp else music.soundcloud(sc))
         except Exception as e:
-            log.info("spotify preview failed: %s", e)
-            return err("Couldn't read that Spotify link — is it public?")
-        return JSONResponse({"spotify": {"url": q, "kind": sp[0], "title": name, "count": len(songs), "songs": songs[:50]}})
+            log.info("%s preview failed: %s", source, e)
+            return err(f"Couldn't read that {source} link — is it public?")
+        kind = sp[0] if sp else ("song" if len(songs) == 1 else "playlist")
+        return JSONResponse({"import": {"source": source, "url": q, "kind": kind, "title": name, "count": len(songs), "songs": songs[:50]}})
     vid, pl = music.parse_youtube(q)
     if pl:
         title, tracks = await music.playlist(pl)
@@ -686,6 +695,8 @@ async def api_health(request: Request, uid, chat_id, st):
     items.append({"name": "YouTube", "ok": None if not (ms["yt_ok_at"] or ms["yt_err_at"]) else yt_ok, "test": "youtube",
                   "detail": (f"Last song found {_ago(ms['yt_ok_at'])}" if yt_ok and ms["yt_ok_at"] else
                              f"Last failure {_ago(ms['yt_err_at'])}: {ms['yt_err'][:160]}" if ms["yt_err_at"] else "No songs played yet")
+                  + (" · PO token: " + ("plugin ready" if music.POT_PLUGIN else "plugin missing")
+                     + (", provider set" if config.POT_PROVIDER_URL else ", POT_PROVIDER_URL not set"))
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
     lkc = await lk.check()
     items.append({"name": "Voice (LiveKit)", **lkc})

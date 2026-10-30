@@ -21,6 +21,21 @@ try:
 except ImportError:  # pragma: no cover
     yt_dlp = None
 
+# yt-dlp loads its plugins (the PO-token provider YouTube needs) the first time a YoutubeDL is created, and that
+# check isn't thread-safe. Two songs resolved at once in two threads loaded the plugin twice ("BgUtilHTTP already
+# registered"), and that lookup went without a PO token: YouTube answered 403 to its stream links. Load them once,
+# here, before any thread runs.
+POT_PLUGIN = False
+if yt_dlp is not None:
+    try:
+        from yt_dlp.plugins import all_plugins_loaded, load_all_plugins
+        if not all_plugins_loaded.value:
+            load_all_plugins()
+        import importlib.util
+        POT_PLUGIN = importlib.util.find_spec("yt_dlp_plugins.extractor.getpot_bgutil_http") is not None
+    except Exception as e:  # pragma: no cover
+        log.warning("yt-dlp plugins failed to load: %s", e)
+
 CACHE_DIR = os.path.join(config.DATA_DIR, "audio")
 os.makedirs(CACHE_DIR, exist_ok=True)
 COOKIE_FILE = os.path.join(config.DATA_DIR, "cookies.txt")
@@ -197,6 +212,48 @@ async def spotify(kind: str, sid: str, limit: int = 200) -> tuple[str, list[dict
     return name, tracks[:limit]
 
 
+# ---- SoundCloud links: same idea as Spotify (song names from SoundCloud, the songs themselves from YouTube) ----
+SC_RE = re.compile(r"https?://(?:on\.|m\.|www\.)?soundcloud\.com/[^\s]+", re.I)
+
+
+def parse_soundcloud(text: str) -> str | None:
+    m = SC_RE.search(text or "")
+    return m.group(0).split("?")[0] if m else None
+
+
+def _sc_song(e: dict) -> dict:
+    title = (e.get("title") or "").strip()
+    artist = (e.get("artist") or e.get("uploader") or "").strip()
+    if " - " in title and not e.get("artist"):  # "Artist - Song" is the usual SoundCloud way of naming uploads
+        artist, title = [x.strip() for x in title.split(" - ", 1)]
+    return {"title": title, "artist": artist, "duration": round(e.get("duration") or 0)}
+
+
+async def soundcloud(url: str, limit: int = 100) -> tuple[str, list[dict]]:
+    """(name, [{title, artist, duration}]) for a SoundCloud song, playlist / album or profile."""
+    if "on.soundcloud.com" in url:  # short share link: find where it points
+        r = await http().get(url, headers={"User-Agent": "Mozilla/5.0"})
+        url = str(r.url).split("?")[0]
+        if "soundcloud.com" not in url:
+            raise ValueError("SoundCloud link not understood")
+    info = await asyncio.to_thread(_extract, url, extract_flat="in_playlist", noplaylist=False, playlistend=limit)
+    if info.get("_type") != "playlist" and not info.get("entries"):
+        return info.get("title") or "SoundCloud", [_sc_song(info)]
+    entries = [e for e in info.get("entries") or [] if e][:limit]
+    sem = asyncio.Semaphore(4)
+
+    async def full(e):  # a playlist may list only links: look those songs up one by one
+        if e.get("title"):
+            return _sc_song(e)
+        async with sem:
+            try:
+                return _sc_song(await asyncio.to_thread(_extract, e.get("url") or e.get("webpage_url")))
+            except Exception:
+                return None
+    songs = [x for x in await asyncio.gather(*(full(e) for e in entries)) if x and x["title"]]
+    return info.get("title") or "SoundCloud", songs
+
+
 async def match(song: dict) -> dict | None:
     """The YouTube upload that best fits a song name (+ artist), preferring the same length."""
     q = f"{song['title']} {song['artist']}".strip()
@@ -222,9 +279,23 @@ def _extract(url: str, **extra) -> dict:
         return y.extract_info(url, download=False)
 
 
+_searches: "OrderedDict[tuple, tuple[float, list[dict]]]" = OrderedDict()
+
+
 async def search(query: str, limit: int = 15) -> list[dict]:
+    """YouTube search. Results are kept 10 minutes: people type a word a letter at a time and search the same
+    things again, and every search sent to YouTube adds to the chance it starts blocking the server."""
+    key = (" ".join(query.lower().split()), limit)
+    hit = _searches.get(key)
+    if hit and time.time() - hit[0] < 600:
+        _searches.move_to_end(key)
+        return hit[1]
     info = await asyncio.to_thread(_extract, f"ytsearch{limit}:{query}", extract_flat="in_playlist")
-    return [t for e in info.get("entries") or [] if (t := _track(e))]
+    res = [t for e in info.get("entries") or [] if (t := _track(e))]
+    _searches[key] = (time.time(), res)
+    while len(_searches) > 500:
+        _searches.popitem(last=False)
+    return res
 
 
 async def playlist(pid: str, limit: int = 200) -> tuple[str, list[dict]]:
@@ -319,7 +390,7 @@ def _cache_path(vid: str, fid: str) -> str:
     return os.path.join(CACHE_DIR, f"{vid}_{safe}.bin")
 
 
-async def _download(vid: str, fmt: dict):
+async def _download(vid: str, fmt: dict, retry: bool = True):
     path = _cache_path(vid, fmt["id"])
     tmp = path + ".part"
     try:
@@ -327,6 +398,8 @@ async def _download(vid: str, fmt: dict):
         with open(tmp, "wb") as fh:
             while True:
                 r = await http().get(fmt["url"], headers={**fmt["headers"], "Range": f"bytes={pos}-{pos + CHUNK - 1}"})
+                if r.status_code in (403, 410) and retry:
+                    raise _Expired()
                 if r.status_code not in (200, 206):
                     raise RuntimeError(f"status {r.status_code}")
                 fh.write(r.content)
@@ -337,10 +410,24 @@ async def _download(vid: str, fmt: dict):
         os.replace(tmp, path)
         _trim_cache()
         spawn_analyze(vid, path)
+    except _Expired:  # the link went stale (or came without a PO token): get a fresh one and try once more
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        try:
+            info = await resolve(vid, force=True)
+            same = [f for f in info["formats"] if f["id"] == fmt["id"]]
+            if same:
+                return await _download(vid, same[0], retry=False)
+        except Exception as e:
+            log.info("cache download retry failed %s: %s", vid, e)
     except Exception as e:
         log.info("cache download failed %s: %s", vid, e)
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+class _Expired(Exception):
+    pass
 
 
 def _trim_cache():
@@ -487,12 +574,17 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
         await r.aclose()
         info = await resolve(vid, force=True)
         same = [f for f in info["formats"] if f["id"] == fmt["id"]]
+        if not same:  # that format is gone: the closest one of the same kind
+            kind = "video" if fmt["vcodec"] != "none" else "audio"
+            same = [f for f in info["formats"] if (f["vcodec"] != "none") == (kind == "video") and f["acodec"] == fmt["acodec"]]
         if same:
             return await _proxy(request, vid, same[0], retry=False)
-        return Response("expired", status_code=502)
+        return Response("expired", status_code=503, headers={"Retry-After": "1"})
     if r.status_code not in (200, 206):
         await r.aclose()
-        return Response("upstream error", status_code=502)
+        log.info("stream %s: YouTube answered %s", vid, r.status_code)
+        STATS["yt_err"], STATS["yt_err_at"] = f"stream answered {r.status_code}", time.time()
+        return Response("upstream error", status_code=503, headers={"Retry-After": "1"})
     headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
     for h in ("content-length", "content-range"):
         if h in r.headers:

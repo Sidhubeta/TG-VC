@@ -803,7 +803,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;

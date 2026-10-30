@@ -200,9 +200,11 @@ export function report(kind, detail = '') {
   const now = Date.now();
   if (reportCount > 40 || now - (reported[kind] || 0) < 30000) return;
   reported[kind] = now; reportCount++;
-  send({ t: 'diag', kind: String(kind).slice(0, 40), detail: String(detail).slice(0, 300) });
+  send({ t: 'diag', kind: String(kind).slice(0, 40), detail: String(detail).slice(0, 300), app: `${tg?.platform || ''} ${tg?.version || ''}`.trim() });
 }
-window.addEventListener('error', (e) => report('js', `${e.message} @${(e.filename || '').split('/').pop()}:${e.lineno}`));
+// "Script error." with no file is an error inside a script from another site (Telegram's own telegram-web-app.js):
+// the browser hides everything about it, it isn't ours and it doesn't touch the app, so it isn't reported.
+window.addEventListener('error', (e) => { if (e.filename && !/^Script error\.?$/.test(e.message || '')) report('js', `${e.message} @${e.filename.split('/').pop()}:${e.lineno}`); });
 window.addEventListener('unhandledrejection', (e) => report('promise', e.reason?.message || String(e.reason)));
 
 // ---------- toasts ----------

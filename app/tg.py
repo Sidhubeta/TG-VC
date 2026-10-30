@@ -214,6 +214,36 @@ async def chat_title(chat_id: int) -> str:
         return "Group"
 
 
+_play_help_at: dict[int, float] = {}
+
+
+async def play_help(chat_id: int, msg: dict, song: str = ""):
+    """Someone typed /play (like with other music bots): music happens inside the voice chat, so show how to get there."""
+    if time.time() - _play_help_at.get(chat_id, 0) < 20:  # don't flood the group if people spam /play
+        return
+    _play_help_at[chat_id] = time.time()
+    url = await group_link(chat_id)
+    asked = f"To play <b>{_esc(song)}</b>, join the voice chat and search for it there.\n\n" if song else ""
+    text = (f"🎧 <b>Music plays in the voice chat!</b>\n{asked}"
+            "Tap the pinned <b>Voice Chat</b> message at the top of this group, or the button below, to join.\n\n"
+            "<b>Inside the voice chat you can:</b>\n"
+            "🎵 Play any song — search, or paste a YouTube or Spotify link\n"
+            "⏭ Queue songs, play next, skip, repeat, autoplay\n"
+            "🎤 Read synced lyrics, watch the music video\n"
+            "🎚 Add sound effects for everyone: Bass Boost, 8D, Slowed + Reverb…\n"
+            "🎙 Talk with your mic or camera, chat and send reactions\n"
+            "❤️ Like songs and save playlists\n\n"
+            "Everyone hears the same song at the same moment.")
+    params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": join_button(url),
+              "reply_parameters": {"message_id": msg["message_id"], "allow_sending_without_reply": True}}
+    if msg.get("is_topic_message") and msg.get("message_thread_id"):
+        params["message_thread_id"] = msg["message_thread_id"]
+    try:
+        await call("sendMessage", **params)
+    except Exception as e:
+        log.info("play help failed: %s", e)
+
+
 def join_button(url: str, text: str = "🎧 Join Voice Chat"):
     return {"inline_keyboard": [[{"text": text, "url": url}]]}
 
@@ -303,6 +333,8 @@ async def _handle(upd: dict):
         except Exception as e:
             log.warning("pin post failed: %s", e)
             await send_join_message(cid, f"🎙 <b>{_esc(chat.get('title', 'Voice Chat'))}</b>\nTap below to join the voice chat.")
+    elif cmd in ("/play", "/song", "/music", "/p", "/help", "/queue"):
+        await play_help(cid, msg, " ".join(words[1:])[:80])
     elif cmd == "/resetlink":
         if not msg.get("from"):
             return
@@ -319,6 +351,7 @@ def _esc(s: str) -> str:
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+STATS: dict = {"poll_ok_at": 0.0, "poll_err_at": 0.0, "poll_err": ""}  # for the admins' Health page
 PRIVACY_ON = False  # privacy mode on = the bot doesn't see normal group messages (set from getMe)
 
 
@@ -337,6 +370,7 @@ async def run_polling():
                             "up slowly. Turn it off: @BotFather -> /setprivacy -> your bot -> Disable")
             await call("setMyCommands", commands=[
                 {"command": "vc", "description": "Open the voice chat"},
+                {"command": "play", "description": "How to play music in the voice chat"},
                 {"command": "resetlink", "description": "Admins: make a new private link"},
             ])
             break
@@ -348,6 +382,7 @@ async def run_polling():
     while True:
         try:
             ups = await call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "edited_message", "my_chat_member", "chat_member", "message_reaction"])
+            STATS["poll_ok_at"] = time.time()
             for u in ups:
                 offset = u["update_id"] + 1
                 try:
@@ -357,6 +392,7 @@ async def run_polling():
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            STATS["poll_err"], STATS["poll_err_at"] = str(e)[:200], time.time()
             log.warning("polling error: %s", e)
             await asyncio.sleep(3)
 

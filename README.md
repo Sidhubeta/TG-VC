@@ -41,6 +41,11 @@ secret into the app variables. Voice works over TCP, just with a little more del
   (`base64 -w0 cookies.txt`) and put it in `YT_COOKIES_B64`.
 - yt-dlp updates itself on every restart.
 
+### 4a. Spotify links (optional)
+Pasting a Spotify playlist / album / song link works out of the box (read from Spotify's public page, up to about
+100 songs; each song is found on YouTube). For whole playlists, create a free app at https://developer.spotify.com
+and set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`.
+
 ### 4b. Full member list for invites (recommended)
 Telegram's Bot API can't list a group's members, so by default the Invite list only shows admins and the people
 the bot has seen (chatting, reacting, joining the voice chat). To list **everyone** in the group:
@@ -98,9 +103,20 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
   Audio and video stay in step with each other and with the room (phones within a few hundredths of a second);
   a song that goes silent restarts by itself, a video that fails to load retries by itself, the next song starts
   even while Telegram is minimized, and if the phone holds the sound back any tap brings it back
+- **Crossfade & no silence:** songs start where the sound starts and end where it ends (silent intros and tails are
+  skipped), and blend into each other over 4 seconds. Crossfade is on by default; anyone can switch it off for
+  themselves (Queue → Crossfade). iPhone switches songs without blending (it can't fade web audio players).
+- **Spotify:** paste a Spotify playlist, album or song link; the songs are found on YouTube and queued in order.
+- **Play history:** what played in the voice chat, who added it and when (More → Play history, or in the queue).
+- **/play in the group:** the bot replies with how to join the voice chat and what you can do there.
 - **Sound:** Bass Boost, 8D, Concert Hall, Vocal, Slowed + Reverb, Nightcore, plus EQ, reverb and speed.
   Everyone hears the same effect in sync; only admins or the person who added the song can change it.
 - **Soundboard:** sounds everyone hears (admins can switch it off)
+- **Team:** admins can make people **moderators** (mute / unmute, listener / speaker, remove from the voice chat,
+  delete messages — no bans, settings or recording) and **music DJs** (the music rights you choose).
+- **Health page** (Manage → Health): bot, YouTube (with a Test button), voice, member list, storage and server at a
+  glance, plus problems people's phones reported in the last 24 hours (also written to the server log).
+- **Recording chapters:** with each recording the bot also sends who spoke when, the songs, and everyone's talk time.
 - **Music auth:** admins choose what everyone may do with the music (add, play next, vote skip, skip own songs,
   playback, queue, repeat/autoplay, effects on own / any song, video for everyone, stop) and can make chosen people
   music DJs with their own rights. The server enforces it; anything you can't use tells you why in red.

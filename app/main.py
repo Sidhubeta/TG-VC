@@ -169,6 +169,13 @@ async def api_search(request: Request, uid, chat_id, st):
     q = (request.query_params.get("q") or "").strip()[:200]
     if not q:
         return JSONResponse({"tracks": []})
+    if sp := music.parse_spotify(q):
+        try:
+            name, songs = await music.spotify(*sp)
+        except Exception as e:
+            log.info("spotify preview failed: %s", e)
+            return err("Couldn't read that Spotify link — is it public?")
+        return JSONResponse({"spotify": {"url": q, "kind": sp[0], "title": name, "count": len(songs), "songs": songs[:50]}})
     vid, pl = music.parse_youtube(q)
     if pl:
         title, tracks = await music.playlist(pl)
@@ -264,10 +271,18 @@ async def api_lyrics(request: Request, uid, chat_id, st):
 
 @guarded()
 async def api_history(request: Request, uid, chat_id, st):
-    rows = await db.q("SELECT vid as id,title,artist,duration,by_name,ts FROM plays WHERE chat_id=? ORDER BY id DESC LIMIT 100", (chat_id,))
+    """Play history of this voice chat: what played, who added it, when. ?offset= for more, ?mine=1 for my songs."""
+    offset = max(0, int(_num(request.query_params.get("offset"), 0)))
+    limit = max(10, min(100, int(_num(request.query_params.get("limit"), 50))))
+    mine = request.query_params.get("mine") == "1"
+    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts FROM plays WHERE chat_id=?"
+                      + (" AND by_uid=?" if mine else "") + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                      (chat_id, uid, limit + 1, offset) if mine else (chat_id, limit + 1, offset))
+    more = len(rows) > limit
+    rows = rows[:limit]
     for r in rows:
         r["thumb"] = f"/api/thumb/{r['id']}"
-    return JSONResponse({"tracks": rows})
+    return JSONResponse({"tracks": rows, "more": more, "next": offset + limit})
 
 
 @guarded()
@@ -495,6 +510,12 @@ async def api_recording(request: Request, uid, chat_id, st):
     name = f"{custom}.{ext}" if custom else f"{title[:40]} {time.strftime('%Y-%m-%d %H-%M')}.{ext}"
     if not await tg.send_recording(uid, data, name, f"🎙 {custom or 'Recording'} — {title}"):
         return err("Couldn't send the recording to your private chat. Open the bot, press Start, and try again.")
+    chapters = str(form.get("chapters") or "")[:3800].strip()
+    if chapters:  # who spoke when + the songs, so the recording is easy to jump around in
+        try:
+            await tg.call("sendMessage", chat_id=uid, text=f"📑 {custom or 'Recording'} — {chapters}")
+        except Exception as e:
+            log.info("chapters not sent: %s", e)
     return JSONResponse({"ok": True, "to": "dm"})
 
 
@@ -619,6 +640,69 @@ async def api_invite(request: Request, uid, chat_id, st):
     return JSONResponse({"ok": True, "via": via, "name": name})
 
 
+# ---------------- health (admins) ----------------
+_started = time.time()
+
+
+def _ago(ts: float) -> str:
+    if not ts:
+        return "never"
+    s = int(time.time() - ts)
+    return f"{s}s ago" if s < 120 else f"{s // 60} min ago" if s < 7200 else f"{s // 3600} h ago"
+
+
+@guarded(need_admin=True)
+async def api_health(request: Request, uid, chat_id, st):
+    """Is everything working? One look for admins: bot, YouTube, LiveKit, member lists, storage, phones' problems."""
+    import shutil
+    from .room import DIAG
+    if request.method == "POST":  # "Test YouTube now"
+        t = time.time()
+        try:
+            await music.resolve("jNQXAC9IVRw", force=True)  # a tiny public video
+            return JSONResponse({"ok": True, "detail": f"YouTube works ({time.time() - t:.1f} s)"})
+        except Exception as e:
+            return JSONResponse({"ok": False, "detail": f"YouTube failed: {str(e)[:200]}"})
+    items = []
+    tgs = tg.STATS
+    if not config.BOT_TOKEN:
+        items.append({"name": "Telegram bot", "ok": False, "detail": "BOT_TOKEN is not set"})
+    else:
+        ok = tgs["poll_ok_at"] and time.time() - tgs["poll_ok_at"] < 180
+        items.append({"name": "Telegram bot", "ok": bool(ok), "detail": f"@{tg.BOT_USERNAME} · last update check {_ago(tgs['poll_ok_at'])}"
+                      + (f" · last error {_ago(tgs['poll_err_at'])}: {tgs['poll_err']}" if tgs["poll_err_at"] > tgs["poll_ok_at"] else "")})
+        items.append({"name": "Bot privacy mode", "ok": not tg.PRIVACY_ON,
+                      "detail": "On: the bot doesn't see group messages (@BotFather → /setprivacy → Disable)" if tg.PRIVACY_ON else "Off: the bot sees who chats"})
+    ms = music.STATS
+    yt_ok = ms["yt_ok_at"] >= ms["yt_err_at"]
+    items.append({"name": "YouTube", "ok": None if not (ms["yt_ok_at"] or ms["yt_err_at"]) else yt_ok, "test": "youtube",
+                  "detail": (f"Last song found {_ago(ms['yt_ok_at'])}" if yt_ok and ms["yt_ok_at"] else
+                             f"Last failure {_ago(ms['yt_err_at'])}: {ms['yt_err'][:160]}" if ms["yt_err_at"] else "No songs played yet")
+                  + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
+    lkc = await lk.check()
+    items.append({"name": "Voice (LiveKit)", **lkc})
+    items.append({"name": "Full member list", **members.status()})
+    items.append({"name": "Spotify links", "ok": True, "detail": "Official API (whole playlists)" if config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET
+                  else "Public page (up to ~100 songs) · set SPOTIFY_CLIENT_ID / SECRET for more"})
+    try:
+        du = shutil.disk_usage(config.DATA_DIR)
+        cache = sum(os.path.getsize(os.path.join(music.CACHE_DIR, f)) for f in os.listdir(music.CACHE_DIR))
+        items.append({"name": "Storage", "ok": du.free > 300 * 1024 * 1024,
+                      "detail": f"{du.free // 2**20} MB free · song cache {cache // 2**20} MB of {config.AUDIO_CACHE_MB} MB"
+                      + ("" if os.path.ismount(config.DATA_DIR) or config.DEV_MODE else " · no volume at /data: data is lost on redeploy")})
+    except Exception as e:
+        items.append({"name": "Storage", "ok": False, "detail": str(e)[:150]})
+    online = sum(len(r.parts) for r in ROOMS.values())
+    items.append({"name": "Server", "ok": True, "detail": f"Up {_ago(_started).replace(' ago', '')} · {len(ROOMS)} voice chat{'s' if len(ROOMS) != 1 else ''} · {online} people online"})
+    day = time.time() - 86400
+    probs = [d for d in DIAG if d["chat"] == chat_id and d["ts"] > day]
+    kinds: dict[str, int] = {}
+    for d in probs:
+        kinds[d["kind"]] = kinds.get(d["kind"], 0) + 1
+    return JSONResponse({"items": items, "problems": {"counts": kinds, "latest": [
+        {k: d[k] for k in ("ts", "name", "device", "kind", "detail")} for d in list(probs)[-25:][::-1]]}})
+
+
 # ---------------- websocket ----------------
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -732,6 +816,7 @@ routes = [
     Route("/api/recording", api_recording, methods=["POST"]),
     Route("/api/dmcheck", api_dm_check),
     Route("/api/invite", api_invite, methods=["GET", "POST"]),
+    Route("/api/health", api_health, methods=["GET", "POST"]),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),
     Mount("/static", StaticFiles(directory=WEB), name="static"),

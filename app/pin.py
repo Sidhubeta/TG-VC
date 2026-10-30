@@ -67,6 +67,15 @@ def _circle(im: Image.Image, size: int, ring: int, ring_color) -> Image.Image:
     return out
 
 
+def _more_bubble(n: int, size: int, ring: int) -> Image.Image:
+    out = Image.new("RGBA", (size + ring * 2, size + ring * 2), (0, 0, 0, 0))
+    d = ImageDraw.Draw(out)
+    d.ellipse([0, 0, size + ring * 2 - 1, size + ring * 2 - 1], fill=(18, 24, 31, 255))
+    d.ellipse([ring, ring, ring + size - 1, ring + size - 1], fill=(43, 143, 232))
+    d.text((ring + size / 2, ring + size / 2), f"+{n}" if n < 100 else "99+", font=_font(int(size * 0.34)), fill="white", anchor="mm")
+    return out
+
+
 def _mic_icon(size: int) -> Image.Image:
     im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
@@ -122,30 +131,40 @@ def _avatar_src(path: str | None, p: dict, size: int) -> Image.Image:
 
 def _render_sync(people: list[dict], paths: list, count: int, sub: str) -> bytes:
     bg = _background(bool(count)).copy()
-    size, ring = 210, 12
-    cy = 250
+    # Big faces, side by side (no overlap): Telegram shows only a small square from the middle of this picture in
+    # the pinned bar, so the people in the voice chat have to fill that square to be recognisable there.
+    ring = 10
+    cy = 236
     if people:
-        tiles = []
-        for p, path in zip(people, paths):
-            tiles.append(_circle(_avatar_src(path, p, size), size, ring, (18, 24, 31, 255)))
-        step = int(size * 0.68)
-        total = size + ring * 2 + step * (len(tiles) - 1)
-        x0 = (W - total) // 2
-        for i, t in enumerate(reversed(tiles)):  # first person on top, like Telegram
-            idx = len(tiles) - 1 - i
-            bg.alpha_composite(t, (x0 + idx * step, cy - (size + ring * 2) // 2))
+        extra = count - len(people)
+        n = len(people) + (1 if extra > 0 else 0)
+        size = {1: 380, 2: 270}.get(n, 196)
+        tiles = [_circle(_avatar_src(path, p, size), size, ring, (18, 24, 31, 255)) for p, path in zip(people, paths)]
+        if extra > 0:  # "+5": how many more are in the voice chat
+            tiles.append(_more_bubble(extra, size, ring))
+        t = size + ring * 2
+        gap = 8
+        if n <= 2:
+            spots = [((W - (t * n + gap * (n - 1))) // 2 + i * (t + gap), cy - t // 2) for i in range(n)]
+        else:  # two rows: 2 on top, then 1 or 2 below
+            top = [((W - 2 * t - gap) // 2 + i * (t + gap), cy - t - gap // 2) for i in range(2)]
+            low = n - 2
+            bottom = [((W - (t * low + gap * (low - 1))) // 2 + i * (t + gap), cy + gap // 2) for i in range(low)]
+            spots = top + bottom
+        for tile, (x, y) in zip(tiles, spots):
+            bg.alpha_composite(tile, (x, y))
     else:
         icon = _mic_icon(200)
         bg.alpha_composite(icon, ((W - 200) // 2, cy - 100))
 
     d = ImageDraw.Draw(bg)
-    d.text((W / 2, 455), LABEL, font=_font(64), fill="white", anchor="mm")
+    d.text((W / 2, 508), LABEL, font=_font(60), fill="white", anchor="mm")
     sub_col = (77, 162, 241) if count else (131, 148, 166)
-    d.text((W / 2, 530), sub, font=_font(40, bold=False), fill=sub_col, anchor="mm")
+    d.text((W / 2, 574), sub, font=_font(40, bold=False), fill=sub_col, anchor="mm")
     if count:  # live dot
         tw = d.textlength(sub, font=_font(40, bold=False))
         x = W / 2 - tw / 2 - 30
-        d.ellipse([x - 10, 520, x + 10, 540], fill=(79, 209, 122))
+        d.ellipse([x - 10, 564, x + 10, 584], fill=(79, 209, 122))
     out = io.BytesIO()
     bg.convert("RGB").save(out, "JPEG", quality=88)
     return out.getvalue()

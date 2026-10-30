@@ -37,6 +37,11 @@ AUDIO_CACHE_MB = int(_env("AUDIO_CACHE_MB", "800"))
 TG_API_ID = _env("TG_API_ID")
 TG_API_HASH = _env("TG_API_HASH")
 
+# Optional: Spotify links. Without these, playlists/albums are read from Spotify's public embed page (up to ~100
+# songs); with a free app from https://developer.spotify.com the whole playlist is read.
+SPOTIFY_CLIENT_ID = _env("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = _env("SPOTIFY_CLIENT_SECRET")
+
 # Open the Mini App in fullscreen from group links (Telegram 8.0+; older apps just open normally)
 FULLSCREEN = _env("FULLSCREEN", "1") == "1"
 

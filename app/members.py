@@ -99,3 +99,13 @@ async def page(chat_id: int, q: str = "", offset: int = 0, limit: int = 50) -> d
         for k in [k for k, v in _cache.items() if time.time() - v[0] > 60]:
             _cache.pop(k, None)
     return out
+
+
+def status() -> dict:
+    if not enabled():
+        return {"ok": None, "detail": "Off — set TG_API_ID and TG_API_HASH to list every member"}
+    if _client is not None and _client.is_connected():
+        return {"ok": True, "detail": "Connected: invite lists show every member"}
+    if _failed_at:
+        return {"ok": False, "detail": "Login to Telegram failed — check TG_API_ID / TG_API_HASH (see the server log)"}
+    return {"ok": None, "detail": "Set up; connects the first time someone opens Invite"}

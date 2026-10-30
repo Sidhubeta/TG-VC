@@ -961,3 +961,16 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
 /* invite list */
 .inv-foot { min-height: 8px; }
 .inv-hint { display: block; margin-top: 6px; color: var(--fg2); }
+/* queue buttons: Shuffle / Repeat / Autoplay / Crossfade in a 2×2 grid */
+.np .qv .qbtns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.pl-card.spotify .sp-logo { display: grid; place-items: center; background: #1db954; color: #000; }
+.tag.mod { background: rgba(48, 209, 88, .16); color: var(--tg-green, #30d158); }
+/* admin tabs: six of them fit by scrolling sideways on small phones */
+.sheet .seg { overflow-x: auto; scrollbar-width: none; }
+.sheet .seg::-webkit-scrollbar { display: none; }
+.sheet .seg button { min-width: 64px; }
+/* health page */
+.row.health { align-items: flex-start; }
+.row.health .lab small { white-space: normal; }
+.hdot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin: 6px 4px 0 2px; background: var(--fg3); }
+.hdot.ok { background: #30d158; } .hdot.bad { background: #ff453a; box-shadow: 0 0 0 4px rgba(255, 69, 58, .18); }

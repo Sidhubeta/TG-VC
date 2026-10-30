@@ -50,6 +50,7 @@ async function connect() {
     await room.connect(info.url, info.token, { autoSubscribe: true });
     V.ready = true;
     emit('voice', { state: 'ready' });
+    emit('voice:session', 'joined');
     if (!room.canPlaybackAudio) emit('voice:blocked', true);
     room.remoteParticipants.forEach(applyVolume);
   } catch (e) {
@@ -268,7 +269,12 @@ document.addEventListener('pointerdown', () => { if (nsC && nsC.state !== 'runni
 // iPhone: tell iOS up front whether we record. Otherwise it flips the audio session between "playback" and
 // "voice call" as mics start and stop, and the volume jumps up and down (and music gets ducked).
 function iosSession(recording) {
-  try { if (navigator.audioSession) navigator.audioSession.type = recording ? 'play-and-record' : 'playback'; } catch {}
+  try {
+    if (navigator.audioSession && navigator.audioSession.type !== (recording ? 'play-and-record' : 'playback')) {
+      navigator.audioSession.type = recording ? 'play-and-record' : 'playback';
+      emit('voice:session', recording ? 'record' : 'play');
+    }
+  } catch {}
 }
 iosSession(false);
 
@@ -283,6 +289,9 @@ export async function setMic(on) {
     V.mic = on;
     send({ t: 'mic', on });
     if (!on) iosSession(false);
+    // the phone switches its audio between "media" and "call" mode as the mic starts/stops (Android too):
+    // a playing song can go silent right then, so the music player gets a nudge
+    emit('voice:session', on ? 'record' : 'play');
     return true;
   } catch (e) {
     console.error(e);

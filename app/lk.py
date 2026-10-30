@@ -66,3 +66,19 @@ async def set_publish(chat_id: int, uid: int, allowed: bool):
 
 async def remove(chat_id: int, uid: int):
     await _twirp("RemoveParticipant", {"room": room_name(chat_id), "identity": str(uid)})
+
+
+async def check() -> dict:
+    """For the admins' Health page: can the server talk to LiveKit?"""
+    if not enabled():
+        return {"ok": False, "detail": "Not set up (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)"}
+    t = time.time()
+    try:
+        r = await _http().post(f"{config.LIVEKIT_HTTP_URL}/twirp/livekit.RoomService/ListRooms", json={},
+                               headers={"Authorization": f"Bearer {_admin_token('')}"})
+        if r.status_code >= 400:
+            return {"ok": False, "detail": f"LiveKit answered {r.status_code}: {r.text[:120]} (check the key and secret)"}
+        n = len(r.json().get("rooms") or [])
+        return {"ok": True, "detail": f"Reachable in {int((time.time() - t) * 1000)} ms · {n} active room{'s' if n != 1 else ''}"}
+    except Exception as e:
+        return {"ok": False, "detail": f"Can't reach {config.LIVEKIT_HTTP_URL}: {e}"[:200]}

@@ -144,7 +144,8 @@ function tileFor(p) {
   if (t._key !== key) { t._key = key; t._av = avatarEl(p); }
   const [st, cls] = statusOf(p);
   // rebuilding a row costs layout + emoji scanning; only do it when something visible changed
-  const sig = [st, cls, live, p.hand, p.admin, p.mod, p.asGroup, p.flags?.length, S.admin, t._key, weak].join('|');
+  const bad = badgesOf(p.uid);
+  const sig = [st, cls, live, p.hand, p.admin, p.mod, p.asGroup, p.flags?.length, S.admin, t._key, weak, bad.map(b => b.id).join()].join('|');
   if (t._sig === sig) return t;
   t._sig = sig;
   t.replaceChildren(
@@ -153,6 +154,7 @@ function tileFor(p) {
       h('div', { class: 'pname' }, h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, p.name), p.uid === S.uid ? h('span', { class: 'you' }, '(you)') : null,
         p.admin && !p.asGroup ? h('span', { class: 'tag' }, 'admin') : null,
         p.mod ? h('span', { class: 'tag mod' }, 'mod') : null,
+        bad.length && !p.asGroup ? h('span', { class: 'pbadges', title: bad.map(b => b.name).join(', ') }, bad.slice(0, 2).map(b => b.e).join('')) : null,
         S.admin && p.flags?.length ? h('span', { class: 'tag warn', title: p.flags.join('\n') }, 'check') : null),
       h('div', { class: 'psub ' + cls }, st)),
     weak ? h('span', { class: 'pnet', title: 'Weak internet' }, icon('signal')) : null,
@@ -207,6 +209,34 @@ on('voice:quality', ({ uid, q }) => {
   }
 });
 
+// ======================= badges =======================
+// Earned in this voice chat (Top DJ, Night owl, Regular…). Shown next to names and in profiles; a new one of your
+// own pops up once.
+let BADGES = {}, ALL_BADGES = [];
+const badgesOf = (uid) => (S.parts.get(uid)?.asGroup ? [] : BADGES[String(uid)] || []);
+async function loadBadges() {
+  try {
+    const r = await api('/api/badges');
+    BADGES = r.badges; ALL_BADGES = r.all;
+    renderGrid(true);
+    const mine = badgesOf(S.uid), key = 'badges:' + S.chat, seen = store.get(key, null);
+    const fresh = seen ? mine.filter(b => !seen.includes(b.id)) : [];
+    store.set(key, mine.map(b => b.id));
+    if (fresh.length) { toast(`🎉 New badge: ${fresh[0].e} ${fresh[0].name} — ${fresh[0].why}`, 5000); haptic('success'); }
+  } catch {}
+}
+on('ws:init', loadBadges);
+setInterval(() => { if (!document.hidden && S.session) loadBadges(); }, 5 * 60e3);
+function badgeSheet(uid) {
+  const own = badgesOf(uid).map(b => b.id), p = S.parts.get(uid);
+  const body = h('div', null,
+    h('p', { class: 'muted note' }, uid === S.uid ? 'Badges you can earn in this voice chat:' : `${p?.name || 'They'} ${own.length ? 'earned:' : 'haven’t earned a badge yet.'}`),
+    h('div', { class: 'list' }, ...ALL_BADGES.filter(b => uid === S.uid || own.includes(b.id)).map(b =>
+      h('div', { class: 'row badge-row' + (own.includes(b.id) ? ' got' : '') }, h('span', { class: 'bdg' }, b.e),
+        h('span', { class: 'lab' }, b.name, h('small', null, b.why)), own.includes(b.id) ? icon('check') : null))));
+  sheet({ title: 'Badges', body });
+}
+
 // moderators (made by admins): can mute, move and remove people who aren't admins or moderators
 const isMod = () => !!S.parts.get(S.uid)?.mod;
 // participant action sheet
@@ -226,6 +256,8 @@ function openParticipant(uid) {
         h('p', null, [p.username ? '@' + p.username : null, p.realName ? `real: ${p.realName}` : null, p.admin ? 'admin' : null, p.mod ? 'moderator' : null,
           S.room.settings?.music_dj?.[String(p.uid)] ? 'music DJ' : null].filter(Boolean).join('  ·  ')),
         p.bio ? h('div', { class: 'bio' }, p.bio) : null,
+        badgesOf(uid).length || me ? h('button', { class: 'badge-chips', onclick: () => badgeSheet(uid) },
+          ...badgesOf(uid).map(b => h('span', { class: 'chip' }, b.e, ' ', b.name)), me && !badgesOf(uid).length ? h('span', { class: 'chip ghost' }, '🏅 See badges you can earn') : null) : null,
         h('p', { style: { marginTop: '6px' } }, p.forceMuted ? 'muted by admin' : p.hand ? 'wants to speak' : (p.mic && p.canSpeak) ? 'unmuted' : 'listening')),
       (S.admin || isMod()) && p.flags?.length ? h('div', null, ...p.flags.map(f => h('div', { class: 'flag' }, '⚠️', h('span', null, f)))) : null,
       !me ? h('div', { class: 'list' },

@@ -9,7 +9,7 @@ from collections import deque
 
 from starlette.websockets import WebSocket
 
-from . import db, lk, music, pin, tg
+from . import badges, db, lk, music, pin, tg
 
 log = logging.getLogger("room")
 ROOMS: dict[int, "Room"] = {}
@@ -293,6 +293,7 @@ class Room:
             p.session_id = await db.x(
                 "INSERT INTO sessions(chat_id,uid,name,username,joined,last_seen) VALUES(?,?,?,?,?,?)",
                 (self.chat_id, uid, p.name, p.username, p.joined, p.joined))
+            badges.joined(self.chat_id, uid)
         p.admin = admin
         p.conns.add(conn)
         if self._idle:

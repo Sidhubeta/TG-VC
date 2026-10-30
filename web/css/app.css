@@ -974,3 +974,11 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
 .row.health .lab small { white-space: normal; }
 .hdot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin: 6px 4px 0 2px; background: var(--fg3); }
 .hdot.ok { background: #30d158; } .hdot.bad { background: #ff453a; box-shadow: 0 0 0 4px rgba(255, 69, 58, .18); }
+/* badges */
+.pbadges { font-size: 14px; margin-left: 4px; flex: none; letter-spacing: 1px; }
+.badge-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 8px auto 0; }
+.badge-chips .chip { padding: 4px 10px; border-radius: 14px; background: var(--glass2); font-size: 13px; font-weight: 600; }
+.badge-chips .chip.ghost { background: none; color: var(--accent); }
+.badge-row .bdg { font-size: 24px; width: 30px; text-align: center; }
+.badge-row:not(.got) { opacity: .55; }
+.badge-row.got .ico { color: var(--tg-green, #30d158); }

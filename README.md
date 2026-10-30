@@ -106,7 +106,8 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 - **Crossfade & no silence:** songs start where the sound starts and end where it ends (silent intros and tails are
   skipped), and blend into each other over 4 seconds. Crossfade is on by default; anyone can switch it off for
   themselves (Queue → Crossfade). iPhone switches songs without blending (it can't fade web audio players).
-- **Spotify:** paste a Spotify playlist, album or song link; the songs are found on YouTube and queued in order.
+- **Spotify & SoundCloud:** paste a Spotify playlist / album / song link or a SoundCloud song / playlist link (short
+  `on.soundcloud.com` links too); the songs are found on YouTube and queued in order.
 - **Play history:** what played in the voice chat, who added it and when (More → Play history, or in the queue).
 - **/play in the group:** the bot replies with how to join the voice chat and what you can do there.
 - **Sound:** Bass Boost, 8D, Concert Hall, Vocal, Slowed + Reverb, Nightcore, plus EQ, reverb and speed.

@@ -982,3 +982,11 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
 .badge-row .bdg { font-size: 24px; width: 30px; text-align: center; }
 .badge-row:not(.got) { opacity: .55; }
 .badge-row.got .ico { color: var(--tg-green, #30d158); }
+/* the phone holds the music's sound back until a tap: a small hint at the top */
+.tap-hint { position: fixed; z-index: 58; left: 50%; bottom: calc(150px + var(--safe-b, 0px)); transform: translate(-50%, 12px); white-space: nowrap;
+  opacity: 0; display: flex; align-items: center; gap: 8px; padding: 9px 16px; border-radius: 22px; background: #ffb340; color: #1a1300;
+  font-weight: 700; font-size: 14px; box-shadow: 0 8px 26px rgba(0, 0, 0, .35); transition: opacity .25s, transform .3s var(--spring); }
+.tap-hint.show { opacity: 1; transform: translate(-50%, 0); animation: hintpulse 2s ease-in-out .4s infinite; }
+.tap-hint .ico { width: 18px; height: 18px; }
+@keyframes hintpulse { 50% { box-shadow: 0 8px 26px rgba(0, 0, 0, .35), 0 0 0 7px rgba(255, 179, 64, .22); } }
+.pl-card.soundcloud .sp-logo { background: #ff5500; color: #fff; }

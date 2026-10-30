@@ -13,6 +13,7 @@ function makeAudio() {
   // (a spare element waiting to be used must not steer the music)
   a.addEventListener('loadedmetadata', () => a === audio && !isSilence(a) && sync(true));
   a.addEventListener('ended', () => a === audio && !isSilence(a) && onEnded());
+  a.addEventListener('playing', () => { if (a === audio) dead = { n: 0, at: 0 }; });
   a.addEventListener('error', () => a === audio && !isSilence(a) && onAudioError());
   // Minimized Telegram freezes the page's timers, but the playing song still sends time updates: use them to
   // keep the music on track in the background.
@@ -160,7 +161,9 @@ function onAudioError() {
   report('music-error', `code=${audio.error?.code} ${audio.error?.message || ''} song=${t.id} try=${errCount + 1}`);
   if (errQid !== t.qid) { errQid = t.qid; errCount = 0; }
   if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
-  setTimeout(() => { if (P.loadedQid === t.qid && audio.error) { audio.src = audioSrc(t); audio.load(); } }, 2000 * errCount);
+  // quick first retries: a refused first link is usually fine a moment later (the server gets a fresh one)
+  const n = errCount;
+  setTimeout(() => { if (P.loadedQid === t.qid && audio.error) { audio.src = audioSrc(t) + '&try=' + n; audio.load(); tryPlay(); } }, [600, 1500, 3000, 5000][n - 1]);
 }
 video.addEventListener('loadedmetadata', () => { seekVideo(); if (!audio.paused) video.play().catch(() => {}); });
 // A video that fails to load (network blip, expired link) is retried by itself; before, it stayed blank until
@@ -234,6 +237,7 @@ function sync(force = false) {
   }
   if (Math.abs(audio.playbackRate - speed) > 0.001) audio.playbackRate = speed;
   watchdog(want, exp);
+  reviveDead(want);
   // A finished <audio> restarts from 0 when played again. That was the "first 1-2 seconds on repeat" in the
   // background: never replay a song whose time is up.
   const over = !pr && t.duration && exp >= t.duration - 0.3;
@@ -276,21 +280,38 @@ setInterval(() => { if (video.dataset.src && !document.hidden) syncVideo(); }, 2
 
 // "Playing" but silent: the stream stalled and the time stopped moving (pausing and playing again fixed it by
 // hand). If it's stuck for 2.5 s, reload the stream at the right spot.
-let stuck = { t: -1, since: 0 };
+let stuck = { t: -1, since: 0 }, stallN = 0;
 function watchdog(want, exp) {
   if (!want || audio.paused || audio.seeking || P.localPaused || !audio.getAttribute('src')) { stuck.since = 0; return; }
   const now = Date.now();
   if (Math.abs(audio.currentTime - stuck.t) > 0.05) { stuck = { t: audio.currentTime, since: now }; return; }
   if (!stuck.since) { stuck.since = now; return; }
-  // has data but isn't moving: 2.5 s. Still downloading (slow internet): give it 10 s, or it would never start.
-  if (now - stuck.since > (audio.readyState >= 3 ? 2500 : 10000)) {
+  // has data but isn't moving: 2.5 s. The load failed without an "error" (iPhone does that when the server answers
+  // 502/503): 1.5 s. Nothing at all yet: 4 s. Still downloading (slow internet): 8 s, or it would never start.
+  const wait = audio.readyState >= 3 ? 2500 : audio.networkState === 3 ? 1500 : audio.readyState === 0 ? 4000 : 8000;
+  if (now - stuck.since > wait) {
     stuck.since = 0;
     console.warn('music stalled, reloading at', exp.toFixed(1));
     report('music-stall', `song=${P.loadedTrack?.id} at=${exp.toFixed(1)} ready=${audio.readyState} net=${audio.networkState}`);
-    const src = audio.getAttribute('src');
-    audio.src = src; audio.load(); // loadedmetadata -> sync(true) seeks to the room's position
+    const src = audio.getAttribute('src').replace(/&try=[^&]*/g, '');
+    audio.src = src + '&try=s' + (++stallN); audio.load(); // loadedmetadata -> sync(true) seeks to the room's position
     tryPlay();
   }
+}
+// The song's link failed and the phone gave up on it without an "error" (iPhone does this when the server answers
+// 502/503): play() then just fails, the player counts as paused, and nothing ever tried again — a listener sat
+// 20 s or more in silence. Load it again, quickly at first.
+let dead = { n: 0, at: 0 };
+function reviveDead(want) {
+  if (!want || P.localPaused || !audio.getAttribute('src') || isSilence(audio)) return;
+  if (!(audio.networkState === 3 || audio.error)) return;
+  const now = Date.now();
+  if (now - dead.at < [800, 1500, 3000, 5000, 8000][Math.min(dead.n, 4)]) return;
+  if (!dead.at) { dead.at = now; return; } // give the normal "error" retry a moment first
+  dead = { n: dead.n + 1, at: now };
+  report('music-dead', `song=${P.loadedTrack?.id} try=${dead.n} net=${audio.networkState} err=${audio.error?.code || 0}`);
+  audio.src = audio.getAttribute('src').replace(/&try=[^&]*/g, '') + '&try=d' + dead.n;
+  audio.load(); tryPlay();
 }
 // coming back to the app: jump to where the room is now (not where it was when you left)
 const back = () => { G?.c.resume().catch(() => {}); sync(true); emit('app:back'); };
@@ -307,6 +328,22 @@ function setBlocked(b) {
   P.blocked = b;
   emit('music:blocked', b);
   renderCard(); // the card's play button turns into a "sound off" button while the phone holds the sound back
+  // The yellow button alone was easy to miss (one listener sat 15 minutes without sound): if the phone keeps the
+  // sound back for more than a moment, a small hint says what to do. It goes away as soon as the sound is on.
+  clearTimeout(hintTimer);
+  if (b) hintTimer = setTimeout(() => P.blocked && playing() && tapHint(true), 2500);
+  else tapHint(false);
+}
+let hintTimer = null, hintEl = null;
+function tapHint(on) {
+  if (on && !hintEl) {
+    hintEl = h('button', { class: 'tap-hint', onclick: () => unlockAudio() }, icon('vol-x'), 'Tap to hear the music');
+    document.body.append(hintEl);
+    requestAnimationFrame(() => hintEl?.classList.add('show'));
+  } else if (!on && hintEl) {
+    const el = hintEl; hintEl = null;
+    el.classList.remove('show'); setTimeout(() => el.remove(), 300);
+  }
 }
 export const musicBlocked = () => P.blocked;
 // Called on every tap (touchend / click count as a "user gesture" on phones; pointerdown doesn't).
@@ -353,7 +390,10 @@ function primeSpare() {
   priming = true;
   const a = makeAudio();
   a.src = SILENCE;
-  a.play().then(() => { a.pause(); spare = a; }, () => {}).finally(() => { priming = false; });
+  a.play().then(() => {
+    a.pause(); a.__ok = true; spare = a;
+    if (G && !needGraph()) releaseGraph(); // effects were switched off while no spare was ready: finish that now
+  }, () => {}).finally(() => { priming = false; });
 }
 
 // ======================= crossfade =======================
@@ -366,13 +406,15 @@ const canFade = () => !isApple && !G;
 let fade = null; // { old, t0, len }
 function startFade(secs) {
   if (fade) endFade();
+  if (!spare?.__ok) return false; // no player unlocked by a tap yet: a fresh one could stay silent, so just switch
   const old = audio;
-  audio = spare || makeAudio(); spare = null; // the spare was unlocked by a tap already
+  audio = spare; spare = null; // the spare was unlocked by a tap already
   audio.removeAttribute('src');
   audio.volume = 0;
   const sink = store.get('dev:audiooutput', '');
   if (sink && audio.setSinkId) audio.setSinkId(sink).catch(() => {});
   fade = { old, t0: performance.now(), len: secs * 1000 };
+  return true;
 }
 function stepFade() {
   if (!fade) return;
@@ -386,7 +428,7 @@ function endFade() {
   const old = fade.old; fade = null;
   audio.volume = P.vol;
   old.pause(); old.removeAttribute('src'); old.load(); old.volume = P.vol;
-  if (!spare) spare = old; // already unlocked: ready for the next crossfade
+  if (!spare) { old.__ok = true; spare = old; } // it was playing, so it's unlocked: ready for the next crossfade
 }
 setInterval(stepFade, 50);
 document.addEventListener('visibilitychange', () => { if (document.hidden) endFade(); }); // background: just switch
@@ -428,9 +470,12 @@ const needGraph = () => {
 // effects switched off: move the song back to a plain <audio> element (keeps playing where it was)
 function releaseGraph() {
   if (!G || needGraph()) return;
+  // Moving the song to a fresh <audio> needs one a tap has unlocked (else it's silent on iPhone / Telegram Android).
+  // Without one, the song stays on the effects graph (now set flat) until the next tap brings a spare.
+  if (!spare?.__ok) { applyFx(FX_NONE); return; }
   const old = audio, src = old.getAttribute('src'), was = !old.paused;
   // a fresh element would need a new tap on iPhone: use the spare one that a tap already unlocked
-  audio = spare || makeAudio(); spare = null;
+  audio = spare; spare = null;
   audio.removeAttribute('src');
   audio.volume = P.vol;
   audio.playbackRate = rate();
@@ -575,7 +620,7 @@ export function renderCard() {
   if (!t) {
     el.onclick = () => openSearch('home');
     el.append(h('div', { class: 'art' }, icon('music')),
-      h('div', { class: 'meta' }, h('div', { class: 'ttl' }, 'Nothing playing'), h('div', { class: 'art-sub' }, canAdd() ? 'Tap to search songs or paste a YouTube / Spotify link' : 'Admins will play music here')),
+      h('div', { class: 'meta' }, h('div', { class: 'ttl' }, 'Nothing playing'), h('div', { class: 'art-sub' }, canAdd() ? 'Tap to search, or paste a YouTube, Spotify or SoundCloud link' : 'Admins will play music here')),
       canAdd() ? h('div', { class: 'ctl' }, h('button', { 'aria-label': 'Search', onclick: (e) => { e.stopPropagation(); openSearch(); } }, icon('plus'))) : null);
     return;
   }
@@ -1289,28 +1334,31 @@ function renderSearchTab(sc) {
   const bar = h('div', { class: 'searchbar br-search' }, icon('search'), input);
   const results = h('div');
   sc.append(bar, results);
-  let timer = null, seq = 0;
+  let timer = null, seq = 0, lastQ = '';
   const empty = async () => {
+    lastQ = '';
     results.replaceChildren(sectionHead('Browse categories'));
     try { const b = await cachedApi('/api/browse', 60e3); results.append(h('div', { class: 'gt-grid' }, ...b.genres.map(g => genreTile(g)))); } catch {}
   };
   async function go() {
     const q = input.value.trim();
     if (!q) return empty();
+    if (q === lastQ) return; // same words as what's on screen
     const my = ++seq;
     results.replaceChildren(h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
     try {
       const r = await api('/api/search?q=' + encodeURIComponent(q));
+      lastQ = q;
       if (my !== seq) return;
-      if (r.spotify) {
-        const sp = r.spotify;
+      if (r.import) {
+        const sp = r.import;
         results.replaceChildren(
-          h('div', { class: 'pl-card spotify' },
+          h('div', { class: 'pl-card spotify ' + sp.source.toLowerCase() },
             h('div', { class: 'ta sp-logo' }, icon('music')),
             h('div', { style: { flex: 1, minWidth: 0 } },
               h('div', { style: { fontWeight: 700, fontSize: '17px' } }, sp.title),
-              h('div', { class: 'muted', style: { fontSize: '13px', margin: '2px 0 10px' } }, `Spotify ${sp.kind} · ${sp.count} song${sp.count === 1 ? '' : 's'} · each one is found on YouTube`),
-              canAdd() ? h('button', { class: 'btn sm', onclick: (e) => { send({ t: 'music.spotify', url: sp.url }); haptic('success'); e.currentTarget.disabled = true; e.currentTarget.textContent = 'Adding…'; } }, 'Add all to queue') : null)),
+              h('div', { class: 'muted', style: { fontSize: '13px', margin: '2px 0 10px' } }, `${sp.source} ${sp.kind} · ${sp.count} song${sp.count === 1 ? '' : 's'} · each one is found on YouTube`),
+              canAdd() ? h('button', { class: 'btn sm', onclick: (e) => { send({ t: 'music.import', url: sp.url }); haptic('success'); e.currentTarget.disabled = true; e.currentTarget.textContent = 'Adding…'; } }, 'Add all to queue') : null)),
           ...sp.songs.map(t => h('div', { class: 'trk' }, h('div', { class: 'tm' }, h('div', { class: 'tt' }, t.title), h('div', { class: 'ts' }, `${t.artist}${t.duration ? ' · ' + fmtTime(t.duration) : ''}`)))));
       } else if (r.playlist) {
         const pl = r.playlist;
@@ -1338,7 +1386,8 @@ function renderSearchTab(sc) {
       }
     } catch (e) { if (my === seq) results.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
   }
-  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(go, 800); });
+  // wait until typing pauses (each search goes to YouTube); one letter isn't a search
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { const q = input.value.trim(); if (!q || q.length >= 2) go(); }, 1100); });
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { clearTimeout(timer); go(); input.blur(); } });
   empty();
   setTimeout(() => input.focus(), 450);

@@ -430,9 +430,12 @@ class Room:
             elif t == "diag":
                 kind, detail = str(msg.get("kind", ""))[:40], str(msg.get("detail", ""))[:300]
                 cur = (self.current or {}).get("id", "-")
-                log.warning("client problem [%s] %s (%s) on %s: %s | song %s %s", kind, p.name, p.uid, conn.device, detail,
+                # Telegram says which app it is ("ios 8.0"); iPhone's Telegram doesn't put that in its user agent
+                app = re.sub(r"[^\w. -]", "", str(msg.get("app", "")))[:24]
+                device = conn.device.replace(" browser", "").replace(" WebView", "").replace(" Telegram", "") + (f" · Telegram {app}" if app else "")
+                log.warning("client problem [%s] %s (%s) on %s: %s | song %s %s", kind, p.name, p.uid, device, detail,
                             cur, self.status)
-                DIAG.append({"ts": now(), "chat": self.chat_id, "uid": p.uid, "name": p.name, "device": conn.device,
+                DIAG.append({"ts": now(), "chat": self.chat_id, "uid": p.uid, "name": p.name, "device": device,
                              "kind": kind, "detail": detail})
             elif t == "mic":
                 await self.set_mic(p, bool(msg.get("on")))
@@ -677,17 +680,17 @@ class Room:
                 self._arm_timer()
                 await self.push_music()
 
-    async def _spotify_job(self, p: Participant, kind: str, sid: str):
-        """Find each Spotify song on YouTube and queue them in order, a few at a time (the first ones play while
-        the rest are still being looked up)."""
+    async def _import_job(self, p: Participant, source: str, fetch):
+        """Find each Spotify / SoundCloud song on YouTube and queue them in order, a few at a time (the first ones
+        play while the rest are still being looked up)."""
         try:
             try:
-                name, songs = await music.spotify(kind, sid)
+                name, songs = await fetch()
             except Exception as e:
-                log.info("spotify %s/%s failed: %s", kind, sid, e)
-                return await self.toast(p.uid, "Couldn't read that Spotify link — is it public?")
+                log.info("%s import failed: %s", source, e)
+                return await self.toast(p.uid, f"Couldn't read that {source} link — is it public?")
             if not songs:
-                return await self.toast(p.uid, "That Spotify link has no songs")
+                return await self.toast(p.uid, f"That {source} link has no songs")
             await self.toast(p.uid, f"Adding {len(songs)} song{'s' if len(songs) > 1 else ''} from “{name[:40]}”…")
             sem, found, missed = asyncio.Semaphore(4), 0, 0
 
@@ -703,7 +706,7 @@ class Room:
                     found += len(batch)
                     async with self._lock:
                         await self.on_music(p, "addMany", {"tracks": batch, "quiet": True})
-            await self.toast(p.uid, f"Added {found} song{'s' if found != 1 else ''} from Spotify"
+            await self.toast(p.uid, f"Added {found} song{'s' if found != 1 else ''} from {source}"
                              + (f" ({missed} not found on YouTube)" if missed else ""))
         finally:
             self._spotify_busy.pop(p.uid, None)
@@ -849,16 +852,20 @@ class Room:
             if not msg.get("quiet"):
                 await self.toast(p.uid, text)
             return
-        if cmd == "spotify":
+        if cmd in ("spotify", "import"):  # a Spotify or SoundCloud link: find its songs on YouTube and queue them
             if not self.can(p, "add"):
                 return await self.deny(p, "add")
             if self._spotify_busy.get(p.uid):
-                return await self.toast(p.uid, "Still adding your last Spotify link…")
-            sp = music.parse_spotify(str(msg.get("url", "")))
-            if not sp:
-                return await self.toast(p.uid, "That's not a Spotify playlist, album or song link")
+                return await self.toast(p.uid, "Still adding your last link…")
+            url = str(msg.get("url", ""))
+            if sp := music.parse_spotify(url):
+                source, fetch = "Spotify", (lambda: music.spotify(*sp))
+            elif sc := music.parse_soundcloud(url):
+                source, fetch = "SoundCloud", (lambda: music.soundcloud(sc))
+            else:
+                return await self.toast(p.uid, "That's not a Spotify or SoundCloud link")
             self._spotify_busy[p.uid] = True
-            spawn(self._spotify_job(p, *sp))
+            spawn(self._import_job(p, source, fetch))
             return
         if cmd == "fx":
             return await self.set_fx(p, msg.get("fx") or {})

@@ -600,6 +600,84 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
     return StreamingResponse(body(), status_code=r.status_code, media_type=_mime(fmt), headers=headers)
 
 
+# ---- the song in short pieces, for Web Audio --------------------------------------------------------------------
+# Telegram on Android won't let an <audio> element make a sound before the first tap, but Web Audio may play right
+# away. Phones that are held back fetch the song as short Ogg Opus pieces, decode them and play them on the room's
+# clock. Pieces sit on a fixed 10 s grid (and run a little past it, so the player can blend one into the next), so
+# everyone held back shares them.
+PIECE = 10.0
+PIECE_OVERLAP = 0.3
+PIECE_KBPS = {"low": 64, "medium": 128, "high": 160}
+_pieces: "OrderedDict[tuple, bytes]" = OrderedDict()
+_piece_jobs: dict[tuple, asyncio.Task] = {}
+_piece_sem = asyncio.Semaphore(3)
+
+
+def _piece_source(info: dict, vid: str) -> tuple[str, dict]:
+    """The cached file if there is one (no YouTube request), else the stream link."""
+    fmts = [pick_audio(info, c, q) for c in ("opus", "aac") for q in ("medium", "high", "low")]
+    for f in fmts:
+        if f and os.path.exists(_cache_path(vid, f["id"])):
+            return _cache_path(vid, f["id"]), {}
+    f = next((f for f in fmts if f), None)
+    if not f:
+        raise LookupError("no audio")
+    return f["url"], f["headers"]
+
+
+async def _encode_piece(src: str, headers: dict, at: float, kbps: int) -> bytes:
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if headers:
+        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+    args += ["-ss", f"{at:.3f}", "-i", src, "-t", f"{PIECE + PIECE_OVERLAP:.3f}", "-vn", "-ac", "2", "-ar", "48000",
+             "-c:a", "libopus", "-b:a", f"{kbps}k", "-f", "ogg", "pipe:1"]
+    async with _piece_sem:
+        p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(p.communicate(), 25)
+        except asyncio.TimeoutError:
+            p.kill()
+            raise RuntimeError("ffmpeg timed out")
+    if p.returncode != 0:
+        raise RuntimeError(err.decode(errors="replace")[-300:])
+    return out
+
+
+async def piece(vid: str, k: int, quality: str) -> Response:
+    if not 0 <= k < 2000:
+        return Response("bad piece", status_code=400)
+    key = (vid, k, quality if quality in PIECE_KBPS else "medium")
+    data = _pieces.get(key)
+    if data is None:
+        job = _piece_jobs.get(key)
+        if not job:
+            async def make():
+                info = await resolve(vid)
+                src, headers = _piece_source(info, vid)
+                try:
+                    return await _encode_piece(src, headers, k * PIECE, PIECE_KBPS[key[2]])
+                except RuntimeError:
+                    if not src.startswith("http"):
+                        raise
+                    info = await resolve(vid, force=True)  # the link may have gone stale: once more with a fresh one
+                    src, headers = _piece_source(info, vid)
+                    return await _encode_piece(src, headers, k * PIECE, PIECE_KBPS[key[2]])
+            job = _piece_jobs[key] = asyncio.get_running_loop().create_task(make())
+            job.add_done_callback(lambda _t: _piece_jobs.pop(key, None))
+        try:
+            data = await asyncio.shield(job)
+        except Exception as e:
+            log.info("piece %s/%s failed: %s", vid, k, str(e)[:200])
+            return Response("unavailable", status_code=503, headers={"Retry-After": "1"})
+        _pieces[key] = data
+        while len(_pieces) > 60:  # ~10 MB of pieces at most
+            _pieces.popitem(last=False)
+    else:
+        _pieces.move_to_end(key)
+    # an empty piece means the song is over
+    return Response(data, media_type="audio/ogg", headers={"Cache-Control": "private, max-age=3600"})
+
+
 _thumbs: "OrderedDict[str, bytes | None]" = OrderedDict()  # small in-memory LRU so ytimg isn't hit on every view
 
 

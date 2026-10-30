@@ -202,8 +202,14 @@ async def api_stream(request: Request):
         return Response(d.msg, status_code=d.code)
     vid = request.path_params["vid"]
     kind = request.path_params["kind"]
-    if kind not in ("audio", "video") or not music.valid_id(vid):
+    if kind not in ("audio", "video", "piece") or not music.valid_id(vid):
         return Response(status_code=404)
+    if kind == "piece":
+        try:
+            k = int(request.query_params.get("k", ""))
+        except ValueError:
+            return Response("bad piece", status_code=400)
+        return await music.piece(vid, k, request.query_params.get("q", "medium"))
     return await music.stream(request, vid, kind, request.query_params.get("c", "aac"),
                               request.query_params.get("q", "medium"))
 

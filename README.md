@@ -114,6 +114,9 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 - **Soundboard:** sounds everyone hears (admins can switch it off)
 - **Team:** admins can make people **moderators** (mute / unmute, listener / speaker, remove from the voice chat,
   delete messages — no bans, settings or recording) and **music DJs** (the music rights you choose).
+- **Badges:** 🎧 Top DJ, 🎤 Voice of the week, 💬 Chatterbox, 🦉 Night owl, 🌅 Early bird, 🔥 Regular, ⏱ Marathon,
+  💿 Music lover, 🌱 New here — earned in each voice chat, shown next to names and in profiles (a new one pops up).
+  Times follow `TIMEZONE` (default `Asia/Kolkata`).
 - **Health page** (Manage → Health): bot, YouTube (with a Test button), voice, member list, storage and server at a
   glance, plus problems people's phones reported in the last 24 hours (also written to the server log).
 - **Recording chapters:** with each recording the bot also sends who spoke when, the songs, and everyone's talk time.

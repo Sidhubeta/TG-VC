@@ -42,6 +42,9 @@ TG_API_HASH = _env("TG_API_HASH")
 SPOTIFY_CLIENT_ID = _env("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = _env("SPOTIFY_CLIENT_SECRET")
 
+# Time zone for badges like "Night owl" (people's local time)
+TIMEZONE = _env("TIMEZONE", "Asia/Kolkata")
+
 # Open the Mini App in fullscreen from group links (Telegram 8.0+; older apps just open normally)
 FULLSCREEN = _env("FULLSCREEN", "1") == "1"
 

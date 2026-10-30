@@ -14,7 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, config, db, lk, members, music, pin, tg
+from . import auth, badges, config, db, lk, members, music, pin, tg
 from .room import Conn, ROOMS, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -640,6 +640,14 @@ async def api_invite(request: Request, uid, chat_id, st):
     return JSONResponse({"ok": True, "via": via, "name": name})
 
 
+# ---------------- badges ----------------
+@guarded()
+async def api_badges(request: Request, uid, chat_id, st):
+    got = await badges.for_group(chat_id)
+    return JSONResponse({"badges": {str(u): badges.describe(ids) for u, ids in got.items()},
+                         "all": badges.describe(badges.ORDER)})
+
+
 # ---------------- health (admins) ----------------
 _started = time.time()
 
@@ -817,6 +825,7 @@ routes = [
     Route("/api/dmcheck", api_dm_check),
     Route("/api/invite", api_invite, methods=["GET", "POST"]),
     Route("/api/health", api_health, methods=["GET", "POST"]),
+    Route("/api/badges", api_badges),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),
     Mount("/static", StaticFiles(directory=WEB), name="static"),

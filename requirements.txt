@@ -9,3 +9,5 @@ bgutil-ytdlp-pot-provider>=1.2.0
 Pillow>=10.0
 telethon>=1.36
 tzdata
+livekit>=1.0
+numpy>=1.26

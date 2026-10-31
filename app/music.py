@@ -40,12 +40,15 @@ if yt_dlp is not None:
 CACHE_DIR = os.path.join(config.DATA_DIR, "audio")
 os.makedirs(CACHE_DIR, exist_ok=True)
 COOKIE_FILE = os.path.join(config.DATA_DIR, "cookies.txt")
-if config.YT_COOKIES_B64:
-    with open(COOKIE_FILE, "wb") as _fh:
-        _fh.write(base64.b64decode(config.YT_COOKIES_B64))
-elif config.YT_COOKIES:
-    with open(COOKIE_FILE, "w") as _fh:
-        _fh.write(config.YT_COOKIES.replace("\\n", "\n"))
+try:
+    if config.YT_COOKIES_B64:
+        with open(COOKIE_FILE, "wb") as _fh:
+            _fh.write(base64.b64decode(config.YT_COOKIES_B64.strip().strip('"\'')))
+    elif config.YT_COOKIES:
+        with open(COOKIE_FILE, "w") as _fh:
+            _fh.write(config.YT_COOKIES.replace("\\n", "\n"))
+except Exception as _e:  # a broken value: say so and go on without cookies (it used to stop the server starting)
+    log.error("YT_COOKIES_B64 / YT_COOKIES couldn't be read, going on without cookies: %s", _e)
 
 _info_cache: dict[str, tuple[float, dict]] = {}
 STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": ""}  # for the admins' Health page
@@ -494,6 +497,19 @@ def _disk_free() -> int:
         return 1 << 40
 
 
+def _caps() -> tuple[int, int, int]:
+    """(song cache, video cache, keep free) in bytes, fitted to the disk: on a small volume the old fixed numbers
+    (800 MB + 600 MB, 600 MB free) could never be met, so every download wiped the cache again."""
+    try:
+        import shutil
+        total = shutil.disk_usage(CACHE_DIR).total
+    except OSError:
+        total = 1 << 40
+    mb = 1024 * 1024
+    return (min(config.AUDIO_CACHE_MB * mb, int(total * 0.45)), min(config.VIDEO_CACHE_MB * mb, int(total * 0.25)),
+            min(MIN_FREE, int(total * 0.1)))
+
+
 def cacheable(info: dict, fmt: dict) -> bool:
     video = fmt["vcodec"] != "none"
     dur = ((info.get("track") or {}).get("duration")) or 0
@@ -501,9 +517,10 @@ def cacheable(info: dict, fmt: dict) -> bool:
         return False
     if dur and dur > (20 * 60 if video else 60 * 60):
         return False
-    if _disk_free() < MIN_FREE:
+    keep = _caps()[2]
+    if _disk_free() < keep:
         _trim_cache(squeeze=True)
-        return _disk_free() >= MIN_FREE
+        return _disk_free() >= keep
     return True
 
 
@@ -539,6 +556,10 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
         try:
             info = await resolve(vid, force=True)
             same = [f for f in info["formats"] if f["id"] == fmt["id"]]
+            if not same:  # (that format is gone: the closest one of the same kind is cached instead)
+                kind_v = fmt["vcodec"] != "none"
+                same = sorted([f for f in info["formats"] if (f["vcodec"] != "none") == kind_v and f["acodec"] == fmt["acodec"]],
+                              key=lambda f: abs((f["abr"] or f["tbr"] or 0) - (fmt["abr"] or fmt["tbr"] or 0)))
             if same:
                 return await _download(vid, same[0], retry=False)
         except Exception as e:
@@ -565,11 +586,12 @@ def _trim_cache(squeeze: bool = False, startup: bool = False):
             except OSError:
                 pass
     # songs and videos have their own room, so a few videos can't push every song out
-    for ext, mb in ((".bin", config.AUDIO_CACHE_MB), (".vbin", config.VIDEO_CACHE_MB)):
+    audio_cap, video_cap, _ = _caps()
+    for ext, cap in ((".bin", audio_cap), (".vbin", video_cap)):
         files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(ext)]
         files.sort(key=os.path.getmtime)
         total = sum(os.path.getsize(f) for f in files)
-        cap = mb * 1024 * 1024 // (2 if squeeze else 1)
+        cap = cap // (2 if squeeze else 1)
         while files and total > cap:
             f = files.pop(0)
             try:
@@ -604,6 +626,22 @@ async def prefetch(vid: str):
 _asked: dict[tuple[str, str], float] = {}  # (codec, quality) -> last asked for
 
 
+async def wait_cached(vid: str, timeout: float) -> bool:
+    """Wait (up to timeout) until the song's usual files are downloaded. True if they're on disk."""
+    try:
+        info = await resolve(vid)
+    except Exception:
+        return False
+    fmts = [f for f in (pick_audio(info, "aac", "medium"), pick_audio(info, "opus", "medium")) if f and cacheable(info, f)]
+    jobs = [_start_download(vid, f) for f in fmts if not os.path.exists(_cache_path(vid, f["id"]))]
+    if jobs:
+        try:
+            await asyncio.wait_for(asyncio.gather(*(asyncio.shield(j) for j in jobs), return_exceptions=True), timeout)
+        except asyncio.TimeoutError:
+            pass
+    return all(os.path.exists(_cache_path(vid, f["id"])) for f in fmts)
+
+
 def _start_download(vid: str, f: dict) -> asyncio.Task:
     key = f"{vid}_{f['id']}"
     t = _downloads.get(key)
@@ -613,7 +651,9 @@ def _start_download(vid: str, f: dict) -> asyncio.Task:
     return t
 
 
-_served_as: dict[tuple[str, str], str] = {}  # (song, format asked for) -> format whose file is served
+# (song, format asked for) -> [format whose file is served, last used]. Forgotten 30 minutes after the song's last
+# piece (the next time it plays, "High" gets its own file if that's cached by then).
+_served_as: dict[tuple[str, str], list] = {}
 
 
 def _cached_alternative(info: dict, vid: str, fmt: dict) -> dict | None:
@@ -721,10 +761,13 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         # Videos are cached too (each viewer used to pull the whole video from YouTube). The download runs in the
         # background; until it's done this request goes to YouTube as before (same file, so pieces always match).
         _start_download(vid, fmt)
+    if key in _served_as and time.time() - _served_as[key][1] > 1800:
+        _served_as.pop(key, None)
     if kind == "audio" and key in _served_as:
         # Pieces of this song were served from that format before: keep to it. If its file has left the cache
         # meanwhile, the same format comes from YouTube (the same bytes) instead of another file.
-        sub = [f for f in info["formats"] if f["id"] == _served_as[key]]
+        _served_as[key][1] = time.time()
+        sub = [f for f in info["formats"] if f["id"] == _served_as[key][0]]
         if sub:
             fmt, path = sub[0], _cache_path(vid, sub[0]["id"])
     elif kind == "audio" and not os.path.exists(path):
@@ -734,10 +777,10 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         # The choice is remembered: a player asks for a file in pieces, and every piece must come from the same file.
         alt = _cached_alternative(info, vid, fmt)
         if alt:
-            _served_as[key] = alt["id"]
+            _served_as[key] = [alt["id"], time.time()]
             fmt, path = alt, _cache_path(vid, alt["id"])
         else:
-            _served_as[key] = fmt["id"]
+            _served_as[key] = [fmt["id"], time.time()]
             if cacheable(info, fmt):
                 try:
                     # (under 4 s: a phone waiting longer than that for its first bytes reloads the song)
@@ -762,10 +805,13 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
 async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response:
     rng = request.headers.get("range", "bytes=0-")
     m = re.match(r"bytes=(\d*)-(\d*)", rng)
-    start = int(m.group(1) or 0) if m else 0
-    end = int(m.group(2)) if m and m.group(2) else start + CHUNK - 1
-    end = min(end, start + CHUNK - 1)
-    req = stream_http().build_request("GET", fmt["url"], headers={**fmt["headers"], "Range": f"bytes={start}-{end}"})
+    if m and not m.group(1) and m.group(2):
+        want = f"bytes=-{min(int(m.group(2)), CHUNK)}"  # the last N bytes (it was read as the first N)
+    else:
+        start = int(m.group(1) or 0) if m else 0
+        end = int(m.group(2)) if m and m.group(2) else start + CHUNK - 1
+        want = f"bytes={start}-{min(end, start + CHUNK - 1)}"
+    req = stream_http().build_request("GET", fmt["url"], headers={**fmt["headers"], "Range": want})
     r = await stream_http().send(req, stream=True)
     if r.status_code in (403, 410):
         REFUSED.append(time.time())

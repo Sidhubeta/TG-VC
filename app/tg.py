@@ -137,7 +137,7 @@ async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0)
     if g.get("pin_thread"):
         params["message_thread_id"] = g["pin_thread"]
     try:
-        await call("sendMessage", **params)
+        sent = await call("sendMessage", **params)
     except Exception as e:
         if "message_thread_id" not in params:
             log.info("invite failed: %s", e)
@@ -145,11 +145,23 @@ async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0)
         # the topic may be closed or gone: mention them in the main chat instead
         params.pop("message_thread_id")
         try:
-            await call("sendMessage", **params)
+            sent = await call("sendMessage", **params)
         except Exception as e2:
             log.info("invite failed: %s / %s", e, e2)
             return None
+    # Invites are only posted in the group now: they clean up after themselves, so a busy evening doesn't leave
+    # the chat full of mentions (the person was notified when it was posted).
+    if isinstance(sent, dict) and sent.get("message_id"):
+        asyncio.get_running_loop().create_task(_delete_later(chat_id, sent["message_id"], 15 * 60))
     return "group"
+
+
+async def _delete_later(chat_id: int, message_id: int, delay: float):
+    await asyncio.sleep(delay)
+    try:
+        await call("deleteMessage", chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
 
 
 
@@ -263,8 +275,17 @@ def join_button(url: str, text: str = "🎧 Join Voice Chat"):
 
 
 async def send_join_message(chat_id: int, text: str):
+    """A message with the Join button — in the voice chat's topic in groups with topics (it used to land in
+    General), falling back to the main chat if that topic is closed or gone."""
     url = await group_link(chat_id)
-    await call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=join_button(url))
+    params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": join_button(url)}
+    g = await db.get_group(chat_id)
+    if g.get("pin_thread"):
+        try:
+            return await call("sendMessage", **params, message_thread_id=g["pin_thread"])
+        except ApiError:
+            pass
+    return await call("sendMessage", **params)
 
 
 async def send_recording(uid: int, data: bytes, filename: str, caption: str) -> bool:
@@ -367,6 +388,7 @@ async def _handle(upd: dict):
 
 
 _vc_last: dict[int, float] = {}
+_id_last: dict[int, float] = {}
 
 
 async def _sudo_cmd(msg: dict, cmd: str, arg: str):
@@ -377,6 +399,9 @@ async def _sudo_cmd(msg: dict, cmd: str, arg: str):
     say = lambda text: call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
                             reply_parameters={"message_id": msg["message_id"], "allow_sending_without_reply": True})
     if cmd == "/id":
+        if time.time() - _id_last.get(chat_id, 0) < 5:  # (no flood of answers)
+            return
+        _id_last[chat_id] = time.time()
         target = (msg.get("reply_to_message") or {}).get("from") or frm
         return await say(f"🆔 <b>{_esc(_full_name(target))}</b>: <code>{target.get('id')}</code>")
     if not sudo.is_owner(frm.get("id", 0)):
@@ -385,7 +410,7 @@ async def _sudo_cmd(msg: dict, cmd: str, arg: str):
                       f"No owner is set yet. Put your Telegram id in the <code>OWNER_ID</code> variable on Railway: "
                       f"<code>{frm.get('id')}</code>")
         return
-    if cmd in ("/sudolist", "/sudo") and not arg and not msg.get("reply_to_message"):
+    if cmd in ("/sudolist", "/sudo"):  # (only ever lists: with a reply or a name it used to remove someone)
         rows = await sudo.listing()
         if not rows:
             return await say("No sudo users yet. Add one: <code>/addsudo @username</code>, a user id, or reply to "

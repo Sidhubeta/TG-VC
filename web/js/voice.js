@@ -37,6 +37,7 @@ async function connect() {
     const mic = store.get('dev:audioinput', ''), out = store.get('dev:audiooutput', '');
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
+
       audioCaptureDefaults: {
         echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
         ...(mic ? { deviceId: mic } : {}),
@@ -55,7 +56,7 @@ async function connect() {
     emit('voice', { state: 'ready' });
     emit('voice:session', 'joined');
     if (!room.canPlaybackAudio) emit('voice:blocked', true);
-    room.remoteParticipants.forEach(applyVolume);
+    room.remoteParticipants.forEach(p => (isMusic(p) ? applyMusic(p) : applyVolume(p)));
   } catch (e) {
     console.error(e);
     V.ready = false;
@@ -99,9 +100,36 @@ function videoEvent(pub, p, on) {
   emit('voice:video', { uid: local ? S.uid : uidOf(p), track: pub.track, source: pub.source, on: on && !!pub.track, local });
 }
 
+// ---- the music: the server plays it into the voice chat as the participant "music" ----
+// It's not a person (no tile, no speaking ring); its volume is the music volume and "pause for me" mutes it here.
+const MUSIC = 'music';
+const isMusic = (p) => p?.identity === MUSIC;
+let musicVol = 1, musicPaused = false;
+function applyMusic(p = room?.remoteParticipants.get(MUSIC)) {
+  if (!p) return;
+  try { p.setVolume(musicPaused ? 0 : Math.min(1, musicVol)); } catch {}
+  p.audioTrackPublications?.forEach(pub => { try { pub.setEnabled(!musicPaused); } catch {} });
+}
+export function setMusicVoice({ vol, paused }) {
+  if (vol != null) musicVol = vol;
+  if (paused != null) musicPaused = paused;
+  applyMusic();
+}
+export const musicInVoice = () => !!room?.remoteParticipants.get(MUSIC)?.audioTrackPublications?.size;
+
 function wire(r) {
   const E = LK.RoomEvent;
   r.on(E.TrackSubscribed, (track, pub, p) => {
+    if (isMusic(p)) {
+      if (track.kind !== 'audio') return;
+      const el = track.attach();
+      el.style.display = 'none';
+      document.body.append(el);
+      applyMusic(p);
+      emit('voice:music', true);
+      emit('voice:audio-track', { uid: null, track }); // (recordings take the music in too)
+      return;
+    }
     if (track.kind === 'audio') {
       const el = track.attach();
       el.dataset.uid = uidOf(p);
@@ -115,12 +143,13 @@ function wire(r) {
   });
   r.on(E.TrackUnsubscribed, (track, pub, p) => {
     track.detach().forEach(el => el.remove());
+    if (isMusic(p)) return emit('voice:music', false);
     if (track.kind === 'video') videoEvent(pub, p, false);
   });
   // A muted camera keeps its publication but sends no frames: hide the tile instead of showing a black box.
   r.on(E.TrackMuted, (pub, p) => { if (pub.kind === 'video') videoEvent(pub, p, false); });
   r.on(E.TrackUnmuted, (pub, p) => { if (pub.kind === 'video') videoEvent(pub, p, true); });
-  r.on(E.TrackPublished, (pub, p) => { if (pub.kind === 'audio') applyVolume(p); });
+  r.on(E.TrackPublished, (pub, p) => { if (pub.kind === 'audio') (isMusic(p) ? applyMusic(p) : applyVolume(p)); });
   r.on(E.LocalTrackPublished, (pub) => {
     const p = r.localParticipant;
     if (pub.kind === 'video' && !pub.isMuted) videoEvent(pub, p, true);
@@ -131,14 +160,15 @@ function wire(r) {
     if (pub.source === LK.Track.Source.ScreenShare && V.screen) { V.screen = false; send({ t: 'screen', on: false }); emit('voice:local'); }
   });
   r.on(E.ActiveSpeakersChanged, (speakers) => {
-    V.speaking = new Set(speakers.map(uidOf));
+    V.speaking = new Set(speakers.filter(p => !isMusic(p)).map(uidOf));
     emit('voice:speaking', V.speaking);
   });
   r.on(E.AudioPlaybackStatusChanged, () => emit('voice:blocked', !r.canPlaybackAudio));
-  r.on(E.ParticipantConnected, applyVolume);
+  r.on(E.ParticipantConnected, (p) => (isMusic(p) ? applyMusic(p) : applyVolume(p)));
+  r.on(E.ParticipantDisconnected, (p) => { if (isMusic(p)) emit('voice:music', false); });
   r.on(E.MediaDevicesChanged, () => emit('voice:devices'));
   // excellent / good / poor / lost, for every participant (LiveKit measures it for everyone)
-  r.on(E.ConnectionQualityChanged, (q, p) => emit('voice:quality', { uid: p === r.localParticipant ? S.uid : uidOf(p), q }));
+  r.on(E.ConnectionQualityChanged, (q, p) => { if (!isMusic(p)) emit('voice:quality', { uid: p === r.localParticipant ? S.uid : uidOf(p), q }); });
   r.on(E.ParticipantPermissionsChanged, (prev, p) => {
     if (p === r.localParticipant && !p.permissions?.canPublish) {
       V.mic = V.cam = V.screen = false;
@@ -288,8 +318,24 @@ function iosSession(recording) {
 }
 iosSession(false);
 
+// A mic that's off is let go after a little while. While a phone records it keeps all its sound in "call" mode, so a
+// muted-but-open mic sent the music out of the call's speaker at the call's volume. Not at once: reopening the mic
+// takes a moment and cut the first word off when someone just paused for a second.
+const MIC_RELEASE = 20000;
+let micReleaseTimer = null;
+function releaseMicLater() {
+  clearTimeout(micReleaseTimer);
+  micReleaseTimer = setTimeout(async () => {
+    if (V.mic || !room) return;
+    const pub = room.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone);
+    if (!pub?.track) return;
+    try { await room.localParticipant.unpublishTrack(pub.track, true); } catch (e) { console.warn(e); }
+    emit('voice:session', 'play'); // (the phone goes back to media sound: nudge the music)
+  }, MIC_RELEASE);
+}
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }
+  clearTimeout(micReleaseTimer);
   if (on) iosSession(true);
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
@@ -298,7 +344,7 @@ export async function setMic(on) {
     if (on) await applyNoise();
     V.mic = on;
     send({ t: 'mic', on });
-    if (!on) iosSession(false);
+    if (!on) { iosSession(false); releaseMicLater(); }
     // the phone switches its audio between "media" and "call" mode as the mic starts/stops (Android too):
     // a playing song can go silent right then, so the music player gets a nudge
     emit('voice:session', on ? 'record' : 'play');
@@ -388,7 +434,7 @@ export const getRoomVolume = () => roomVol;
 export function setRoomVolume(v) {
   roomVol = v;
   store.set('roomVol', v);
-  room?.remoteParticipants.forEach(applyVolume);
+  room?.remoteParticipants.forEach(p => { if (!isMusic(p)) applyVolume(p); });
 }
 
 // ---------------- audio devices (speaker / Bluetooth / mic) ----------------
@@ -425,6 +471,9 @@ export async function restartVoice(lk) {
   V.mic = V.cam = V.screen = false;
   if (was) send({ t: 'mic', on: false });
   await startVoice(lk);
+  // (the mic was on: it stays on under the new identity — it used to go off without a word)
+  if (was && V.ready) { if (!(await setMic(true))) toast('Your mic was turned off — tap it to speak again'); }
+  else if (was) toast('Your mic was turned off — tap it to speak again');
 }
 
 // for the recorder

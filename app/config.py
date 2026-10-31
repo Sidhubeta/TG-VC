@@ -10,11 +10,20 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _int(name: str, default: int) -> int:
+    """A number from the environment; set but empty (or not a number) means the default, not a crash at start."""
+    v = _env(name).strip().strip('"\'')
+    try:
+        return int(v) if v else default
+    except ValueError:
+        return default
+
+
 BOT_TOKEN = _env("BOT_TOKEN")
 # Short name of the Mini App created in @BotFather (/newapp). Link: t.me/<bot>/<APP_SHORT_NAME>
 APP_SHORT_NAME = _env("APP_SHORT_NAME", "vc")
 PUBLIC_URL = _env("PUBLIC_URL").rstrip("/")  # https://your-app.up.railway.app
-PORT = int(_env("PORT", "8000"))
+PORT = _int("PORT", 8000)
 DATA_DIR = _env("DATA_DIR", "./data")
 SECRET_KEY = _env("SECRET_KEY") or hashlib.sha256(("vc-secret:" + BOT_TOKEN).encode()).hexdigest()
 
@@ -29,9 +38,11 @@ LIVEKIT_HTTP_URL = (_env("LIVEKIT_HTTP_URL") or LIVEKIT_URL.replace("wss://", "h
 YT_COOKIES = _env("YT_COOKIES")            # contents of cookies.txt (Netscape format), optional
 YT_COOKIES_B64 = _env("YT_COOKIES_B64")    # same, base64 encoded (easier for Railway vars)
 POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. http://bgutil.railway.internal:4416
-AUDIO_CACHE_MB = int(_env("AUDIO_CACHE_MB", "800"))
-VIDEO_CACHE_MB = int(_env("VIDEO_CACHE_MB", "600"))  # 0 = don't cache videos
+AUDIO_CACHE_MB = _int("AUDIO_CACHE_MB", 800)
+VIDEO_CACHE_MB = _int("VIDEO_CACHE_MB", 600)  # 0 = don't cache videos
 # The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)
+# The music played into the voice chat by the server (one way for every phone: no tap, goes on in the background)
+MUSIC_IN_VOICE = _env("MUSIC_IN_VOICE").lower() in ("1", "true", "yes", "on")
 _owner = _env("OWNER_ID").strip()
 OWNER_ID = int(_owner) if _owner.isdigit() else 0
 

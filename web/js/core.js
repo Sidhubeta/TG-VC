@@ -117,7 +117,7 @@ export async function api(path, opts = {}) {
   const r = await fetch(path, init);
   let data = {};
   try { data = await r.json(); } catch {}
-  if (!r.ok) throw new Error(data.error || `Request failed (${r.status})`);
+  if (!r.ok) throw Object.assign(new Error(data.error || `Request failed (${r.status})`), { api: true });
   return data;
 }
 
@@ -216,7 +216,11 @@ export function report(kind, detail = '') {
 // "Script error." with no file is an error inside a script from another site (Telegram's own telegram-web-app.js):
 // the browser hides everything about it, it isn't ours and it doesn't touch the app, so it isn't reported.
 window.addEventListener('error', (e) => { if (e.filename && !/^Script error\.?$/.test(e.message || '')) report('js', `${e.message} @${e.filename.split('/').pop()}:${e.lineno}`); });
-window.addEventListener('unhandledrejection', (e) => report('promise', e.reason?.message || String(e.reason)));
+window.addEventListener('unhandledrejection', (e) => {
+  // an API call that failed where nobody caught it: say what went wrong instead of nothing happening
+  if (e.reason?.api) { toast(e.reason.message, 3000, 'err'); return; }
+  report('promise', e.reason?.message || String(e.reason));
+});
 
 // ---------- toasts ----------
 export function toast(text, ms = 2600, kind = '') {

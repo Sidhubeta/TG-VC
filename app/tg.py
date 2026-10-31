@@ -344,6 +344,8 @@ async def _handle(upd: dict):
     cmd = text.split("@")[0]
     if "@" in text and text.split("@")[1] != BOT_USERNAME.lower():
         return
+    if cmd in ("/addsudo", "/delsudo", "/rmsudo", "/sudolist", "/sudo", "/id"):
+        return await _sudo_cmd(msg, cmd, " ".join(words[1:]))
     if chat["type"] == "private":
         if cmd == "/start":
             await call("sendMessage", chat_id=chat["id"], parse_mode="HTML", text=(
@@ -384,6 +386,54 @@ async def _handle(upd: dict):
 _vc_last: dict[int, float] = {}
 
 
+async def _sudo_cmd(msg: dict, cmd: str, arg: str):
+    """The owner's commands: /addsudo and /delsudo (a user id, an @username, a mention, or as a reply), /sudolist.
+    /id tells anyone their own Telegram id (to put in OWNER_ID)."""
+    from . import sudo
+    chat_id, frm = msg["chat"]["id"], msg.get("from") or {}
+    say = lambda text: call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                            reply_parameters={"message_id": msg["message_id"], "allow_sending_without_reply": True})
+    if cmd == "/id":
+        target = (msg.get("reply_to_message") or {}).get("from") or frm
+        return await say(f"🆔 <b>{_esc(_full_name(target))}</b>: <code>{target.get('id')}</code>")
+    if not sudo.is_owner(frm.get("id", 0)):
+        if msg["chat"]["type"] == "private":  # (in groups: no reply, nobody else needs to see it)
+            await say("Only the bot's owner can manage sudo users." if config.OWNER_ID else
+                      f"No owner is set yet. Put your Telegram id in the <code>OWNER_ID</code> variable on Railway: "
+                      f"<code>{frm.get('id')}</code>")
+        return
+    if cmd in ("/sudolist", "/sudo") and not arg and not msg.get("reply_to_message"):
+        rows = await sudo.listing()
+        if not rows:
+            return await say("No sudo users yet. Add one: <code>/addsudo @username</code>, a user id, or reply to "
+                             "their message with /addsudo")
+        lines = [f"• {_esc(r['name'] or 'User')}" + (f" @{_esc(r['username'])}" if r["username"] else "")
+                 + f" — <code>{r['uid']}</code>" for r in rows]
+        return await say(f"🛡 <b>Sudo users ({len(rows)})</b>\n" + "\n".join(lines))
+    # who: a reply, a mention without a username (text_mention), else what was typed
+    who = None
+    if (rep := msg.get("reply_to_message")) and (u := rep.get("from")) and not u.get("is_bot"):
+        who = {"uid": u["id"], "name": _full_name(u), "username": u.get("username") or ""}
+    for e in msg.get("entities") or []:
+        if not who and e.get("type") == "text_mention" and e.get("user"):
+            u = e["user"]
+            who = {"uid": u["id"], "name": _full_name(u), "username": u.get("username") or ""}
+    if not who and arg:
+        who = await sudo.find(arg.split()[0])
+    if not who:
+        return await say("Who? Send <code>/addsudo @username</code> or a user id, or reply to their message."
+                         if arg == "" else "I don't know that username yet — ask them to open the voice chat once (or "
+                         "write in a group with me), or use their numeric id (they can send me /id).")
+    label = f"<b>{_esc(who.get('name') or 'User')}</b>" + (f" @{_esc(who['username'])}" if who.get("username") else "")
+    if cmd == "/addsudo":
+        if sudo.is_owner(who["uid"]):
+            return await say("That's you — the owner always has access.")
+        await sudo.add(who["uid"], who.get("name") or "", who.get("username") or "", frm["id"])
+        return await say(f"✅ {label} is a sudo user now (they see the Health page)")
+    gone = await sudo.remove(who["uid"])
+    await say(f"🗑 {label} is no longer a sudo user" if gone else f"{label} wasn't a sudo user")
+
+
 def _esc(s: str) -> str:
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -405,11 +455,22 @@ async def run_polling():
             if PRIVACY_ON:
                 log.warning("Bot privacy mode is ON: the bot can't see group messages, so the invite list only fills "
                             "up slowly. Turn it off: @BotFather -> /setprivacy -> your bot -> Disable")
-            await call("setMyCommands", commands=[
+            base = [
                 {"command": "vc", "description": "Open the voice chat"},
                 {"command": "play", "description": "How to play music in the voice chat"},
                 {"command": "resetlink", "description": "Admins: make a new private link"},
-            ])
+            ]
+            await call("setMyCommands", commands=base)
+            if config.OWNER_ID:  # the owner's own chat with the bot also lists the sudo commands
+                try:
+                    await call("setMyCommands", scope={"type": "chat", "chat_id": config.OWNER_ID}, commands=base + [
+                        {"command": "addsudo", "description": "Add a sudo user (id, @username or reply)"},
+                        {"command": "delsudo", "description": "Remove a sudo user"},
+                        {"command": "sudolist", "description": "List sudo users"},
+                        {"command": "id", "description": "Show a Telegram id"},
+                    ])
+                except Exception as e:
+                    log.info("owner commands: %s", e)
             break
         except Exception as e:
             log.error("getMe failed: %s (retrying)", e)

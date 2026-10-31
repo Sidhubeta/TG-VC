@@ -457,7 +457,8 @@ class Room:
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
                          "music": self.music_state(), "chat": [self.chat_view(m, p) for m in self.chat if m["ts"] >= since],
                          "admin": admin,
-                         "sudo": bool(getattr(conn, "sudo", False)),  # (owner / SUDO_USERS: sees the Health tab)
+                         "sudo": bool(getattr(conn, "sudo", False)),  # (bot owner / sudo user: sees the Health tab)
+                         "owner": bool(getattr(conn, "owner", False)),  # (the bot's owner: manages sudo users)
                          "group": self.group_title,
                          # a fresh session: one opened 12 hours ago would otherwise expire (and the song links with it)
                          "session": auth.make_session(uid, self.chat_id),

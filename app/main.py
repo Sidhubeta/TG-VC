@@ -14,7 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, badges, config, db, lk, members, music, pin, tg
+from . import auth, badges, config, db, lk, members, music, pin, sudo, tg
 from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -73,9 +73,12 @@ async def _json(request: Request) -> dict:
     return body
 
 
-def is_sudo(uid: int, st: dict) -> bool:
-    """The group's owner, or someone in SUDO_USERS: the only ones who see the Health page (not every admin)."""
-    return uid in config.SUDO_USERS or bool(st.get("owner")) or (config.DEV_MODE and uid == -1)
+sudo.load()
+
+
+def is_sudo(uid: int, st: dict | None = None) -> bool:
+    """The bot's owner (OWNER_ID) or a sudo user they added: the only ones who see the Health page."""
+    return sudo.is_sudo(uid)
 
 
 async def is_banned(chat_id: int, uid: int) -> bool:
@@ -690,7 +693,28 @@ async def api_badges(request: Request, uid, chat_id, st):
                          "all": badges.describe(badges.ORDER)})
 
 
-# ---------------- health (the group's owner and SUDO_USERS) ----------------
+# ---------------- sudo users (the owner manages them) ----------------
+@guarded()
+async def api_sudo(request: Request, uid, chat_id, st):
+    """GET: the list. POST {"who": "<id or @username>"} adds, {"remove": uid} removes. The owner only."""
+    if not sudo.is_owner(uid):
+        return err("Only the bot's owner can change sudo users", 403)
+    if request.method == "POST":
+        body = await _json(request)
+        if "remove" in body:
+            await sudo.remove(int(_num(body.get("remove"))))
+        else:
+            who = await sudo.find(str(body.get("who", ""))[:64])
+            if not who:
+                return err("I don't know that username yet. Ask them to open the voice chat once (or write in a "
+                           "group with the bot), or use their numeric Telegram id.")
+            if sudo.is_owner(who["uid"]):
+                return err("That's you — the owner always has access")
+            await sudo.add(who["uid"], who.get("name") or "", who.get("username") or "", uid)
+    return JSONResponse({"users": await sudo.listing()})
+
+
+# ---------------- health (the bot's owner and sudo users) ----------------
 _started = time.time()
 
 
@@ -707,7 +731,7 @@ async def api_health(request: Request, uid, chat_id, st):
     import shutil
     from .room import DIAG
     if not is_sudo(uid, st):
-        return err("Only the group owner can see this", 403)
+        return err("Only the bot's owner and sudo users can see this", 403)
     if request.method == "POST":  # "Test YouTube now"
         t = time.time()
         try:
@@ -793,6 +817,7 @@ async def ws_endpoint(ws: WebSocket):
     conn = Conn(ws, uid)
     conn.cid = ws.query_params.get("c", "")[:40]
     conn.sudo = is_sudo(uid, st)
+    conn.owner = sudo.is_owner(uid)
     try:
         await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
         while True:
@@ -907,6 +932,7 @@ routes = [
     Route("/api/dmcheck", api_dm_check),
     Route("/api/invite", api_invite, methods=["GET", "POST"]),
     Route("/api/health", api_health, methods=["GET", "POST"]),
+    Route("/api/sudo", api_sudo, methods=["GET", "POST"]),
     Route("/api/badges", api_badges),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),

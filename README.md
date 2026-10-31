@@ -118,7 +118,7 @@ The bot needs the **Pin messages** admin right. Set `VC_LABEL=Video Chat` if you
 - **Badges:** 🎧 Top DJ, 🎤 Voice of the week, 💬 Chatterbox, 🦉 Night owl, 🌅 Early bird, 🔥 Regular, ⏱ Marathon,
   💿 Music lover, 🌱 New here — earned in each voice chat, shown next to names and in profiles (a new one pops up).
   Times follow `TIMEZONE` (default `Asia/Kolkata`).
-- **Health page** (Manage → Health, only for the group's owner and the ids in `SUDO_USERS`): bot, YouTube (with a Test button), voice, member list, storage and server at a
+- **Health page** (Manage → Health, only for the bot's owner — `OWNER_ID` — and the sudo users they add with `/addsudo` or on that page): bot, YouTube (with a Test button), voice, member list, storage and server at a
   glance, plus problems people's phones reported in the last 24 hours (also written to the server log).
 - **Recording chapters:** with each recording the bot also sends who spoke when, the songs, and everyone's talk time.
 - **Music auth:** admins choose what everyone may do with the music (add, play next, vote skip, skip own songs,

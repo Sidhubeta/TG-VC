@@ -73,6 +73,11 @@ async def _json(request: Request) -> dict:
     return body
 
 
+def is_sudo(uid: int, st: dict) -> bool:
+    """The group's owner, or someone in SUDO_USERS: the only ones who see the Health page (not every admin)."""
+    return uid in config.SUDO_USERS or bool(st.get("owner")) or (config.DEV_MODE and uid == -1)
+
+
 async def is_banned(chat_id: int, uid: int) -> bool:
     return bool(await db.q1("SELECT 1 FROM bans WHERE chat_id=? AND uid=?", (chat_id, uid)))
 
@@ -685,7 +690,7 @@ async def api_badges(request: Request, uid, chat_id, st):
                          "all": badges.describe(badges.ORDER)})
 
 
-# ---------------- health (admins) ----------------
+# ---------------- health (the group's owner and SUDO_USERS) ----------------
 _started = time.time()
 
 
@@ -696,11 +701,13 @@ def _ago(ts: float) -> str:
     return f"{s}s ago" if s < 120 else f"{s // 60} min ago" if s < 7200 else f"{s // 3600} h ago"
 
 
-@guarded(need_admin=True)
+@guarded()
 async def api_health(request: Request, uid, chat_id, st):
-    """Is everything working? One look for admins: bot, YouTube, LiveKit, member lists, storage, phones' problems."""
+    """Is everything working? One look for the owner: bot, YouTube, LiveKit, member lists, storage, phones' problems."""
     import shutil
     from .room import DIAG
+    if not is_sudo(uid, st):
+        return err("Only the group owner can see this", 403)
     if request.method == "POST":  # "Test YouTube now"
         t = time.time()
         try:
@@ -785,6 +792,7 @@ async def ws_endpoint(ws: WebSocket):
     user = await db.q1("SELECT * FROM users WHERE uid=?", (uid,)) or {}
     conn = Conn(ws, uid)
     conn.cid = ws.query_params.get("c", "")[:40]
+    conn.sudo = is_sudo(uid, st)
     try:
         await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
         while True:

@@ -210,6 +210,7 @@ async def _member_lookup(chat_id: int, uid: int) -> dict:
         res = {
             "member": st in ("creator", "administrator", "member") or (st == "restricted" and bool(m.get("is_member"))),
             "admin": st in ("creator", "administrator"),
+            "owner": st == "creator",
             "name": _full_name(u)[:64], "username": u.get("username") or "", "bot": bool(u.get("is_bot")),
         }
     except ApiError as e:

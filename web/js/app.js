@@ -81,7 +81,7 @@ function goFullscreen() {
 
 let started = false;
 on('ws:init', (m) => {
-  S.admin = m.admin; S.room = m.room; S.group = m.group;
+  S.admin = m.admin; S.sudo = !!m.sudo; S.room = m.room; S.group = m.group;
   // appearing as the group: members know us by a stand-in id, and the voice uses it too
   S.pid = m.pid || null;
   // the voice identity changed (switched to appearing as the group, or back): join the voice again under it
@@ -482,6 +482,14 @@ function openMore() {
   const body = h('div',
     S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Manage voice chat', () => { s.close(); openAdmin(); }, 'acc',
       adminAlerts ? `${adminAlerts} new alert${adminAlerts > 1 ? 's' : ''}` : 'Settings, logs, safety, recording')) : null,
+    // a sudo user who isn't an admin of this group: just the Health page
+    S.sudo && !S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Health', () => {
+      s.close();
+      const body = h('div');
+      let stop = null;
+      sheet({ title: 'Health', body, tall: true, onClose: () => stop?.() });
+      stop = adminHealth(body);
+    }, 'acc', 'Is everything working?')) : null,
     h('div', { class: 'list' },
       p && !p.canSpeak ? actionRow('hand', p.hand ? 'Lower hand' : 'Raise hand', () => { send({ t: 'hand', up: !p.hand }); s.close(); }) : null,
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
@@ -715,7 +723,8 @@ function openAdmin(tab = 'room') {
   const body = h('div', null, tabs, content);
   let cleanup = null;
   const s = sheet({ title: 'Manage', body, tall: true, onClose: () => cleanup?.() });
-  const TABS = [['room', 'Room'], ['music', 'Music'], ['team', 'Team'], ['logs', 'Logs'], ['safety', 'Safety'], ['health', 'Health']];
+  // Health only for the group's owner and the bot's sudo users, not every admin
+  const TABS = [['room', 'Room'], ['music', 'Music'], ['team', 'Team'], ['logs', 'Logs'], ['safety', 'Safety'], ...(S.sudo ? [['health', 'Health']] : [])];
   const go = (k) => {
     tab = k; cleanup?.(); cleanup = null;
     tabs.replaceChildren(...TABS.map(([id, l]) => h('button', { class: id === k ? 'on' : '', onclick: () => go(id) }, l)));

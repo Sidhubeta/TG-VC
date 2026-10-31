@@ -14,7 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, badges, config, db, lk, members, music, pin, radio, sudo, tg
+from . import auth, badges, config, db, lk, members, music, pin, radio, sudo, tg, voicemusic
 from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -806,6 +806,7 @@ async def api_health(request: Request, uid, chat_id, st):
                      + (", provider set" if config.POT_PROVIDER_URL else ", POT_PROVIDER_URL not set"))
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
     items.append({"name": "PO token provider", **(await music.pot_check())})
+    items.append({"name": "Music in the voice chat", **voicemusic.status()})
     n403 = music.refused_last_hour()
     items.append({"name": "YouTube song links", "ok": n403 < 10,
                   "detail": "No refused links in the last hour" if not n403 else

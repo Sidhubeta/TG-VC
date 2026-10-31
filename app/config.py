@@ -41,6 +41,8 @@ POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. ht
 AUDIO_CACHE_MB = _int("AUDIO_CACHE_MB", 800)
 VIDEO_CACHE_MB = _int("VIDEO_CACHE_MB", 600)  # 0 = don't cache videos
 # The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)
+# The music played into the voice chat by the server (one way for every phone: no tap, goes on in the background)
+MUSIC_IN_VOICE = _env("MUSIC_IN_VOICE").lower() in ("1", "true", "yes", "on")
 _owner = _env("OWNER_ID").strip()
 OWNER_ID = int(_owner) if _owner.isdigit() else 0
 

@@ -10,7 +10,7 @@ from collections import deque
 
 from starlette.websockets import WebSocket
 
-from . import auth, badges, db, lk, music, pin, tg
+from . import auth, badges, db, lk, music, pin, tg, voicemusic
 
 log = logging.getLogger("room")
 ROOMS: dict[int, "Room"] = {}
@@ -406,6 +406,7 @@ class Room:
                 "need": need, "fx": self.fx, "rate": self.fx["rate"], "xfade": XFADE}
 
     async def push_music(self):
+        voicemusic.ensure(self)
         # The queue goes out only when it changed. Most updates (a vote, the song's silence info, crossfade being
         # set up every few seconds) used to carry the whole queue — up to hundreds of songs — to every phone.
         st = self.music_state()
@@ -461,6 +462,7 @@ class Room:
                 (self.chat_id, uid, p.name, p.username, p.joined, p.joined))
             badges.joined(self.chat_id, uid)
         p.admin = admin
+        voicemusic.ensure(self) if self.parts else None  # (the music player for the voice chat, once someone's in)
         toggled = not first and p.as_group != (as_group and admin)
         if toggled:
             # Switched "appear as the group" on or off: the app reconnects within a moment, while it still counts
@@ -478,6 +480,7 @@ class Room:
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
                          "music": self.music_state(), "chat": [self.chat_view(m, p) for m in self.chat if m["ts"] >= since],
                          "admin": admin,
+                         "musicVoice": voicemusic.enabled(),  # (the music comes through the voice chat)
                          "sudo": bool(getattr(conn, "sudo", False)),  # (bot owner / sudo user: sees the Health tab)
                          "owner": bool(getattr(conn, "owner", False)),  # (the bot's owner: manages sudo users)
                          "group": self.group_title,
@@ -945,7 +948,8 @@ class Room:
         # Crossfade only when every phone in the room blends songs. The room moves on XFADE seconds early for
         # everyone; a phone that can't blend (iPhone, crossfade switched off, an effect on) used to lose the last
         # seconds of every song in a hard cut.
-        blend = self._blend_ok() and self.loop != "one" and nxt and music.is_ready(nxt["id"])
+        # (with the music in the voice chat the server blends for everyone)
+        blend = (voicemusic.enabled() or self._blend_ok()) and self.loop != "one" and nxt and music.is_ready(nxt["id"])
         xf = min(XFADE, max(0.0, left - 0.5), length * 0.15) if blend else 0.0
         xf = round(xf, 2) if xf >= 1 else 0.0  # (re-armed every few seconds: keep the same switch point to the end)
         self.current["xf"] = xf

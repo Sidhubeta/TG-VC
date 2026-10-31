@@ -141,3 +141,10 @@ DEV_MODE=1 BOT_TOKEN=1:x python -m app.main
 # open http://localhost:8000/?dev=1&uid=1  (admin)   and  ?dev=1&uid=2  (member)
 ```
 Never set `DEV_MODE=1` on Railway.
+
+## Music in the voice chat (MUSIC_IN_VOICE=1)
+With `MUSIC_IN_VOICE=1` the server joins each voice chat as **Music** and plays the songs there, like a music bot:
+the same moment for everyone, no "tap to hear", and it keeps playing with Telegram minimized (like the voices do).
+Effects, crossfade, skip, seek and pause are made on the server. Each phone's volume slider and "pause for me" still
+work. If a phone's voice isn't connected, that phone plays the music itself as before. The Health page shows
+whether it's on and working.

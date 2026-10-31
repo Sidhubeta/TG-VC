@@ -1,6 +1,7 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
 import { $, S, actionRow, api, can, report, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
+import { musicInVoice, setMusicVoice } from './voice.js';
 
 // ======================= engine =======================
 // The song plays from a plain <audio> element. It only goes through Web Audio (our effects graph) while an
@@ -219,8 +220,33 @@ function reportCaps() {
   const xf = crossfadeOn() && (WA.on || (!document.hidden && canFade() && !!spare?.__ok));
   if (xf !== P.caps) { P.caps = xf; send({ t: 'caps', xfade: xf }); }
 }
+// ---- the music through the voice chat ----
+// When the server plays the music into the voice chat (MUSIC_IN_VOICE), this phone doesn't play it at all: no
+// player, no Web Audio, no stream, no tap. Only the video (muted) follows the room's clock. If this phone's voice
+// isn't connected (or the server's music isn't there), the phone plays the music itself as before.
+const VOICE_LAG = 0.15; // the voice chat's own delay: the video waits for the sound by that much
+const viaVoice = () => !!P.voiceMode && musicInVoice();
+on('voice:music', () => { lastViaVoice = null; sync(true); });
+let lastViaVoice = null;
+function voiceSync() {
+  if (lastViaVoice !== true) {
+    lastViaVoice = true;
+    // the phone's own player stops (the voice chat has the music now)
+    endFade(); stopRadio();
+    if (WA.on) { WA.on = false; waStopSong(); }
+    if (G && !tapped) releaseGraph(true);
+    if (audio.getAttribute('src')) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
+    P.loadedQid = null; P.loadedTrack = null;
+    setBlocked(false); tapHint(false);
+    console.info('music: playing through the voice chat');
+  }
+  setMusicVoice({ vol: P.vol, paused: P.localPaused });
+  syncVideo();
+}
 function sync(force = false) {
   lastSync = Date.now();
+  if (viaVoice()) return voiceSync();
+  if (lastViaVoice) { lastViaVoice = false; console.info('music: the voice chat has no music, playing it here'); }
   reportCaps();
   if (P.radio) { if (audio.error || audio.networkState === 3) radioRetry(); return; } // (the server plays the room)
   let pr = predicted();
@@ -363,7 +389,7 @@ on('ws:init', () => { if (document.hidden) tellBg(); });
 // the app is opened again. The plain player takes over only once it really plays; if the phone won't let it, the
 // song stays on the effect.
 function effectsToBackground() {
-  if (!G || tapped || isApple || WA.on || !spare?.__ok || audio.paused || !audio.getAttribute('src') || isSilence(audio)) return;
+  if (viaVoice() || !G || tapped || isApple || WA.on || !spare?.__ok || audio.paused || !audio.getAttribute('src') || isSilence(audio)) return;
   const old = audio, a = spare, src = old.getAttribute('src');
   a.muted = true; a.src = src; a.playbackRate = old.playbackRate;
   try { a.currentTime = old.currentTime + 0.25; } catch {}
@@ -415,7 +441,7 @@ function effectsBack() {
 // plays the room's stream from the server (/api/radio): the server goes from song to song, follows skips, seeks
 // and pauses, and the phone only has to keep playing. Opened again, it's back on its own synced player.
 function startRadio() {
-  if (P.radio || WA.on || G || isApple || P.localPaused || !playing() || audio.paused || isSilence(audio) || !audio.getAttribute('src')) return;
+  if (viaVoice() || P.radio || WA.on || G || isApple || P.localPaused || !playing() || audio.paused || isSilence(audio) || !audio.getAttribute('src')) return;
   endFade();
   P.radio = { fails: 0 }; P.radioUsed = true;
   audio.playbackRate = 1;
@@ -536,12 +562,12 @@ function primeSpare() {
 // playing better in the background. If Web Audio is held back too, the "Tap to hear" hint stays as before.
 const PIECE = 10;
 const WA = { on: false, leaving: false, broken: false, song: null, vol: null, bufs: new Map(), loading: new Set(), fails: 0, failAt: 0 };
-const soundTime = () => WA.on && WA.song ? waPos(WA.song) : audio.currentTime;
-const soundPaused = () => WA.on ? !WA.song : audio.paused;
-const soundRate = () => WA.on && WA.song ? WA.song.rate : audio.playbackRate || 1;
+const soundTime = () => viaVoice() ? Math.max(0, expectedPos() - VOICE_LAG * rate()) : WA.on && WA.song ? waPos(WA.song) : audio.currentTime;
+const soundPaused = () => viaVoice() ? !playing() || P.localPaused : WA.on ? !WA.song : audio.paused;
+const soundRate = () => viaVoice() ? rate() : WA.on && WA.song ? WA.song.rate : audio.playbackRate || 1;
 export const webAudioState = () => ({ on: WA.on, broken: WA.broken, id: WA.song?.track.id, pos: WA.song ? waPos(WA.song) : null });
 function waEnter() {
-  if (WA.on || WA.broken || isApple || !playing()) return;
+  if (viaVoice() || WA.on || WA.broken || isApple || !playing()) return;
   const c = getCtx(); if (!c?.decodeAudioData) return;
   const go = () => {
     if (WA.on || c.state !== 'running' || !playing() || !audio.paused) return;
@@ -724,6 +750,7 @@ function impulse(c, secs, decay) {
 }
 let tapped = false;
 const needGraph = () => {
+  if (viaVoice()) return false; // (the server makes the effects for everyone)
   const f = fx();
   return tapped || f.mode !== 'none' || !!(f.bass || f.mid || f.treble || f.reverb) || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
 };
@@ -794,6 +821,7 @@ function applyFx(f = fx()) {
 }
 function setVol(v) {
   P.vol = v; store.set('vol', v);
+  if (viaVoice()) return setMusicVoice({ vol: v });
   if (fade) return stepFade();
   if (!G && isApple && v < 0.99) buildGraph();
   if (G) G.master.gain.setTargetAtTime(v, G.c.currentTime, 0.05);
@@ -811,7 +839,10 @@ async function setMusicSink(id) {
 }
 on('voice:sink', (id) => { setMusicSink(id); kickAudio('speaker'); });
 // the recorder needs the music as Web Audio
-export function musicTap() { tapped = true; buildGraph(); return G ? { ctx: G.c, node: G.master } : null; }
+export function musicTap() {
+  if (viaVoice()) return null; // (the recording takes the music from the voice chat, like the voices)
+  tapped = true; buildGraph(); return G ? { ctx: G.c, node: G.master } : null;
+}
 export function musicUntap() { tapped = false; if (G && !needGraph()) releaseGraph(); }
 
 // ======================= colors from artwork =======================
@@ -1113,7 +1144,7 @@ const queueSig = () => { const m = S.music; return [m.loop, m.autoplay, can('que
 // ======================= server updates =======================
 let lastQid = null, lastTimeline = '', lastFx = '';
 on('ws:music', (m) => onMusic(m.m));
-on('ws:init', (m) => { P.caps = null; onMusic(m.music); reportCaps(); }); // (a new connection starts as "can't blend")
+on('ws:init', (m) => { P.caps = null; P.voiceMode = !!m.musicVoice; onMusic(m.music); reportCaps(); }); // (a new connection starts as "can't blend")
 function onMusic(m) {
   if (m.queueSame) m.queue = S.music?.queue || []; // (the server leaves the queue out when it didn't change)
   S.music = m;

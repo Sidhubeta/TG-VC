@@ -1,7 +1,7 @@
 // Admin recording: mixes everyone's voice + the music on the admin's device, then the bot sends the file.
 import { S, api, h, off, on, send, sheet, toast } from './core.js';
 import { musicTap, musicUntap } from './player.js';
-import { getCtx } from './sounds.js';
+import { getCtx, holdCtx } from './sounds.js';
 import { audioTracks } from './voice.js';
 
 let rec = null, recName = '';
@@ -48,6 +48,7 @@ export const recorder = {
       try { ctx.createMediaStreamSource(new MediaStream([t])).connect(dest); } catch (e) { console.warn(e); }
     };
     audioTracks().forEach(addTrack);
+    holdCtx(true); // (minimized, the shared context was put to sleep: the recording went silent until the app was opened)
     const tap = musicTap();
     if (tap && tap.ctx === ctx) tap.node.connect(dest);
     const onTrack = on('voice:audio-track', ({ track }) => addTrack(track.mediaStreamTrack));
@@ -63,30 +64,48 @@ export const recorder = {
       samples.push({ who, song: m?.status === 'playing' && m.current ? `${m.current.title}${m.current.artist ? ' — ' + m.current.artist : ''}` : null });
     }, 1000);
     const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported?.(t)) || '';
-    const mr = new MediaRecorder(dest.stream, type ? { mimeType: type, audioBitsPerSecond: 96000 } : undefined);
-    const chunks = [];
-    mr.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-    mr.onstop = async () => {
+    // Telegram takes files up to 50 MB (about 70 minutes): a longer recording goes in parts, one after the other
+    // without a gap (it used to fail at the end and could only be saved on the phone).
+    const PART_MAX = 45 * 1024 * 1024;
+    let parts = 0;
+    const cleanup = () => {
       off('voice:audio-track', onTrack);
-      off('voice:speaking', onSpeak); clearInterval(tick);
-      let chapters = '';
-      try { chapters = buildChapters(samples, names); } catch (e) { console.warn(e); }
+      off('voice:speaking', onSpeak); clearInterval(tick); holdCtx(false);
       if (tap) try { tap.node.disconnect(dest); } catch {}
       musicUntap(); // the music goes back to the plain player (Web Audio crackles in the background)
-      const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
-      const ext = (mr.mimeType || '').includes('mp4') ? 'm4a' : (mr.mimeType || '').includes('ogg') ? 'ogg' : 'webm';
-      toast('Uploading recording…', 4000);
-      const fd = new FormData();
-      fd.append('file', blob, 'recording.' + ext);
-      fd.append('ext', ext);
-      fd.append('name', recName);
-      if (chapters) fd.append('chapters', chapters.slice(0, 3800));
-      try {
-        await api('/api/recording', { body: fd });
-        toast('Recording sent to your private chat with the bot', 4000);
-      } catch (e) { toast(e.message, 5000); offerDownload(blob, ext); }
     };
-    mr.start(5000);
+    const startPart = () => {
+      const no = ++parts, from = samples.length;
+      const mr = new MediaRecorder(dest.stream, type ? { mimeType: type, audioBitsPerSecond: 96000 } : undefined);
+      const chunks = [];
+      let bytes = 0;
+      mr.ondataavailable = (e) => {
+        if (!e.data.size) return;
+        chunks.push(e.data); bytes += e.data.size;
+        if (bytes > PART_MAX && rec?.mr === mr) { rec.mr = startPart(); try { mr.stop(); } catch {} }
+      };
+      mr.onstop = async () => {
+        if (mr._final) cleanup();
+        let chapters = '';
+        try { chapters = buildChapters(samples.slice(from), names); } catch (e) { console.warn(e); }
+        const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
+        const ext = (mr.mimeType || '').includes('mp4') ? 'm4a' : (mr.mimeType || '').includes('ogg') ? 'ogg' : 'webm';
+        const label = no > 1 || !mr._final ? ` (part ${no})` : '';
+        toast(`Uploading recording${label}…`, 4000);
+        const fd = new FormData();
+        fd.append('file', blob, 'recording.' + ext);
+        fd.append('ext', ext);
+        fd.append('name', recName ? (recName.slice(0, 50) + label) : (label ? 'Recording' + label : ''));
+        if (chapters) fd.append('chapters', chapters.slice(0, 3800));
+        try {
+          await api('/api/recording', { body: fd });
+          toast(`Recording${label} sent to your private chat with the bot`, 4000);
+        } catch (e) { toast(e.message, 5000); offerDownload(blob, ext); }
+      };
+      mr.start(5000);
+      return mr;
+    };
+    const mr = startPart();
     rec = { mr, since: Date.now() / 1000 };
     send({ t: 'rec.start' });
     toast('Recording started');
@@ -96,6 +115,7 @@ export const recorder = {
   stop(name = '') {
     recName = String(name || '').trim().slice(0, 60);
     if (!rec) return send({ t: 'rec.stop' });
+    rec.mr._final = true;
     try { rec.mr.stop(); } catch {}
     rec = null;
     send({ t: 'rec.stop' });

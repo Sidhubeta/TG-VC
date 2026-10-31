@@ -49,7 +49,7 @@ async def for_group(chat_id: int, ttl: float = 300) -> dict[int, list[str]]:
                          AND COALESCE(asg,0)=0 GROUP BY by_uid ORDER BY n DESC LIMIT 1""", (chat_id, week))
     if top and top["n"] >= 5:
         give(top["uid"], "dj")
-    top = await db.q1("""SELECT uid, SUM(mic_secs) AS s FROM sessions WHERE chat_id=? AND joined>?
+    top = await db.q1("""SELECT uid, SUM(mic_secs) AS s FROM sessions WHERE chat_id=? AND joined>? AND COALESCE(asg,0)=0
                          GROUP BY uid ORDER BY s DESC LIMIT 1""", (chat_id, week))
     if top and (top["s"] or 0) >= 600:
         give(top["uid"], "voice")
@@ -62,7 +62,7 @@ async def for_group(chat_id: int, ttl: float = 300) -> dict[int, list[str]]:
     mornings: dict[int, set] = {}
     days: dict[int, set] = {}
     marathon = set()
-    for s in await db.q("SELECT uid, joined, last_seen FROM sessions WHERE chat_id=? AND joined>? AND uid!=0",
+    for s in await db.q("SELECT uid, joined, last_seen FROM sessions WHERE chat_id=? AND joined>? AND uid!=0 AND COALESCE(asg,0)=0",
                         (chat_id, month)):
         start, end = s["joined"], max(s["joined"], s["last_seen"] or s["joined"])
         if end - start >= 3 * 3600:

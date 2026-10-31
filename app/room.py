@@ -159,7 +159,8 @@ class Conn:
             self.device = _device(ws.headers.get("user-agent", ""))
         except Exception:
             self.device = "?"
-        self.hits: deque[float] = deque(maxlen=40)
+        self.hits: deque[float] = deque(maxlen=60)  # (at most 60 messages in 5 s: see the socket loop)
+        self.flood_told = 0.0
         self.xfade = False  # this phone blends songs (crossfade on, and it can): see Room._blend_ok
         self.bg = False     # the app is minimized: see bg_tick_loop
         self.alive = True
@@ -458,8 +459,8 @@ class Room:
             if not admin:
                 self._detect(p)
             p.session_id = await db.x(
-                "INSERT INTO sessions(chat_id,uid,name,username,joined,last_seen) VALUES(?,?,?,?,?,?)",
-                (self.chat_id, uid, p.name, p.username, p.joined, p.joined))
+                "INSERT INTO sessions(chat_id,uid,name,username,joined,last_seen,asg) VALUES(?,?,?,?,?,?,?)",
+                (self.chat_id, uid, p.name, p.username, p.joined, p.joined, int(p.as_group)))
             badges.joined(self.chat_id, uid)
         p.admin = admin
         voicemusic.ensure(self) if self.parts else None  # (the music player for the voice chat, once someone's in)
@@ -469,6 +470,8 @@ class Room:
             # as here (LINGER) — so the switch is made on the same participant (it used to be ignored).
             seen_as = {q.uid: self.vis_uid(p, q) for q in self.parts.values() if q.uid != uid}
             p.as_group = as_group and admin
+            if p.as_group and p.session_id:  # (this visit was partly "as the group": not for their own badges)
+                await db.x("UPDATE sessions SET asg=1 WHERE id=?", (p.session_id,))
         p.conns.add(conn)
         if self._idle:
             self._idle.cancel()
@@ -821,7 +824,7 @@ class Room:
             await db.x("INSERT INTO chat_stats(chat_id,uid,day,n) VALUES(?,?,?,1) "
                        "ON CONFLICT(chat_id,uid,day) DO UPDATE SET n=n+1", (self.chat_id, p.uid, int(ts // 86400)))
         m = {"id": mid, "uid": p.uid, "name": name, "photo": f"/api/avatar/{self.chat_id}" if p.as_group else p.photo, "text": text,
-             "reply": reply, "reactions": {}, "ts": ts}
+             "reply": reply, "reactions": {}, "ts": ts, "adm": p.admin}  # (adm: moderators can't delete it)
         if p.as_group:
             m["asg"] = True
         self.chat.append(m)
@@ -878,6 +881,8 @@ class Room:
                 self.chat.remove(m)
             await db.x("DELETE FROM messages WHERE id=?", (m["id"],))
             await self.broadcast({"t": "chat.del", "id": m["id"]})
+        else:
+            await self.toast(p.uid, "Moderators can't delete an admin's message")
 
     async def on_sound(self, p: Participant, msg: dict):
         sid = msg.get("id")
@@ -1011,7 +1016,9 @@ class Room:
             # Finding the stream on YouTube can take several seconds. The room's clock used to start at once, so
             # everyone joined the song a few seconds in (or heard nothing at first). Now it waits ("loading") and
             # starts at 0 the moment the song can be played.
-            if music.is_ready(item["id"]):
+            # With the music in the voice chat the server plays it from its own copy: a song whose link is known
+            # but whose file is still downloading (quick skips) waits too, or its first seconds were lost.
+            if music.is_ready(item["id"]) and (music.is_cached(item["id"]) or not voicemusic.enabled()):
                 self.status = "playing"
             else:
                 self.status = "loading"
@@ -1057,7 +1064,7 @@ class Room:
             # Wait a few seconds for the song's files (the usual two kinds: iPhone and Android) while it's
             # "loading". Started before they were on disk, every phone pulled it from YouTube by itself, and an
             # iPhone often heard nothing for the first 5–15 seconds.
-            await music.wait_cached(vid, 6)
+            await music.wait_cached(vid, 12 if voicemusic.enabled() else 6)
         except Exception:
             pass
         try:
@@ -1459,7 +1466,11 @@ class Room:
             self.queue.clear()
             await self.push_music()
         elif cmd == "move":
-            qid, to = msg.get("qid"), int(msg.get("to", 0))
+            qid = msg.get("qid")
+            try:
+                to = int(msg.get("to", 0))
+            except (TypeError, ValueError):
+                return
             for i, q in enumerate(self.queue):
                 if q["qid"] == qid:
                     self.queue.insert(max(0, min(to, len(self.queue) - 1)), self.queue.pop(i))
@@ -1812,6 +1823,8 @@ async def bg_tick_loop():
     while True:
         await asyncio.sleep(3)
         for r in list(ROOMS.values()):
+            if r.parts:
+                voicemusic.ensure(r)  # (the voice chat's music player came back after a failure, or never started)
             if r.status not in ("playing", "loading"):
                 continue
             for p in list(r.parts.values()):

@@ -231,7 +231,8 @@ async function restoreMic() {
 // Back in the app (or the page unfrozen): if the voice chat is down, join now instead of after the retry wait.
 function wake() {
   if (document.hidden || stopped || !info) return;
-  if (!V.ready && !connecting) { clearTimeout(retryTimer); connect(); }
+  // (with a fresh token: the one we have lives 20 minutes, and an app minimized longer failed its first try)
+  if (!V.ready && !connecting) { clearTimeout(retryTimer); retry(); }
   else restoreMic();
 }
 document.addEventListener('visibilitychange', wake);

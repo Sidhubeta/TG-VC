@@ -22,6 +22,7 @@ W, H = 1200, 630
 _pending: dict[int, asyncio.Task] = {}
 _last: dict[int, tuple] = {}
 _edit_lock: dict[int, asyncio.Lock] = {}
+_edited_at: dict[int, float] = {}
 
 FONT_DIRS = ["/usr/share/fonts/opentype/inter", "/usr/share/fonts/truetype/inter", "/usr/share/fonts/truetype/dejavu"]
 
@@ -276,6 +277,7 @@ async def refresh(chat_id: int, force: bool = False):
                                                          "reply_markup": json.dumps(await _keyboard(chat_id))},
                                     {"photo": ("voicechat.jpg", img, "image/jpeg")})
             _last[chat_id] = key
+            _edited_at[chat_id] = time.time()
         except Exception as e:
             msg = str(e)
             if "not modified" in msg:
@@ -291,6 +293,8 @@ def schedule(chat_id: int, delay: float = 3.0):
     t = _pending.get(chat_id)
     if t and not t.done():
         return
+    # at most one new picture every 8 s per group: a busy room (joins, leaves, mics) hit Telegram's limits
+    delay = max(delay, 8 - (time.time() - _edited_at.get(chat_id, 0)))
 
     async def run():
         await asyncio.sleep(delay)

@@ -21,7 +21,7 @@ BPS = KBPS * 1000 // 8
 # How far ahead of real time the music is made and sent. Minimized, Telegram can slow the app's network down: a
 # few seconds ahead stopped the music shortly after minimizing. Silence (pause, between songs) only just ahead, so
 # the music coming back isn't stuck behind queued silence.
-LEAD = 30.0
+LEAD = 12.0  # (also how late a skip can be heard in the background: 30 s was too long)
 LEAD_SILENT = 2.0
 MAX_LISTENERS = 200
 _stations: dict[int, "Station"] = {}

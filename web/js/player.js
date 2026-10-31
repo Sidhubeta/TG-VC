@@ -1,6 +1,6 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
 import { $, S, actionRow, api, can, report, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
-import { getCtx } from './sounds.js';
+import { ctxHeld, getCtx } from './sounds.js';
 import { musicInVoice, setMusicVoice, voiceDiag } from './voice.js';
 
 // ======================= engine =======================
@@ -237,6 +237,17 @@ const viaVoice = () => {
   if (!voiceGoneAt) { voiceGoneAt = Date.now(); setTimeout(() => sync(true), VOICE_GRACE + 50); }
   return Date.now() - voiceGoneAt < VOICE_GRACE;
 };
+// The phone holds the voice chat's sound back until a tap (Telegram on Android does): then the music in it is
+// silent too. Say so, like for the phone's own player (the hint was hidden, and nobody knew a tap was needed).
+let voiceBlocked = false, voiceHintTimer = null;
+on('voice:blocked', (b) => {
+  voiceBlocked = !!b;
+  clearTimeout(voiceHintTimer);
+  if (viaVoice()) return setBlocked(voiceBlocked);
+  // no music through it: the voices alone are held back (only when the music isn't asking for a tap already)
+  if (voiceBlocked) voiceHintTimer = setTimeout(() => { if (voiceBlocked && !P.blocked) tapHint(true, 'Tap to hear the voice chat'); }, 2500);
+  else if (!P.blocked) tapHint(false);
+});
 on('voice:music', (here) => { if (!here && lastViaVoice) { viaVoice(); return; } lastViaVoice = null; sync(true); });
 function voiceSync() {
   if (lastViaVoice !== true) {
@@ -247,7 +258,7 @@ function voiceSync() {
     if (G && !tapped) releaseGraph(true);
     if (audio.getAttribute('src')) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
     P.loadedQid = null; P.loadedTrack = null;
-    setBlocked(false); tapHint(false);
+    setBlocked(voiceBlocked); if (!voiceBlocked) tapHint(false);
     console.info('music: playing through the voice chat');
   }
   setMusicVoice({ vol: P.vol, paused: P.localPaused });
@@ -495,7 +506,7 @@ document.addEventListener('visibilitychange', () => {
   }
   reportCaps();
   if (!document.hidden) return back();
-  if (!G && !WA.on) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
+  if (!G && !WA.on && !ctxHeld()) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it; a recording does)
 });
 window.addEventListener('focus', back);
 try { tg?.onEvent?.('activated', back); } catch {}
@@ -1128,7 +1139,8 @@ function paintScrub(ratio) {
 }
 function tickUI() {
   const t = cur();
-  const pos = t ? (P.localPaused ? audio.currentTime : expectedPos()) : 0;
+  // (paused for me: where my own player stopped; with the music in the voice chat the room's place, where it comes back)
+  const pos = t ? (P.localPaused && !viaVoice() ? audio.currentTime : expectedPos()) : 0;
   const d = t?.duration || audio.duration || 0;
   const bar = $('#np-bar'); if (bar) bar.style.width = d ? `${Math.min(100, pos / d * 100)}%` : '0';
   if (NP.open && !NP.scrubbing && d) paintScrub(Math.min(1, pos / d));
@@ -1356,8 +1368,10 @@ async function openQuality() {
       h('div', { class: 'seg', style: { margin: '8px 0 16px' } },
         ...[['audio', 'Audio only'], ['video', 'Video']].map(([k, l]) => h('button', { class: (isVideo() ? 'video' : 'audio') === k ? 'on' : '', onclick: () => { if ((k === 'video') !== isVideo()) toggleMode(); render(); } }, l))),
       h('div', { class: 'grp-h' }, 'Audio quality'),
-      h('div', { class: 'seg', style: { margin: '8px 0 16px' } },
-        ...[['low', 'Data saver'], ['medium', 'Standard'], ['high', 'High']].map(([k, l]) => h('button', { class: P.aq === k ? 'on' : '', onclick: () => setAq(k) }, l))),
+      // (with the music in the voice chat everyone gets the same high-quality sound: there's nothing to pick)
+      viaVoice() ? h('p', { class: 'muted note', style: { margin: '8px 0 16px' } }, 'The music comes through the voice chat in high quality for everyone.')
+        : h('div', { class: 'seg', style: { margin: '8px 0 16px' } },
+          ...[['low', 'Data saver'], ['medium', 'Standard'], ['high', 'High']].map(([k, l]) => h('button', { class: P.aq === k ? 'on' : '', onclick: () => setAq(k) }, l))),
       h('div', { class: 'grp-h' }, 'Video quality'),
       h('div', { class: 'list' },
         ...(P.heights.length ? P.heights : HEIGHTS).map(q =>
@@ -1384,7 +1398,9 @@ function openFx() {
   const body = h('div');
   let draft = { ...fx() }, tmr = null;
   // you hear your change at once (EQ / reverb / 8D); the server then applies it for everyone, speed included
-  const push = () => { buildGraph(); applyFx(draft); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
+  // (with the music in the voice chat the server makes the effect: nothing to preview on this phone)
+  const preview = () => { if (!viaVoice()) { buildGraph(); applyFx(draft); } };
+  const push = () => { preview(); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
   const slider = (key, label, min, max, step, fmt, allowed) => {
     const out = h('output', null, fmt(draft[key]));
     const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label });
@@ -1403,7 +1419,7 @@ function openFx() {
     body.replaceChildren(
       allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'You can’t change the sound of this song.'),
       h('div', { class: 'fx-grid' }, ...Object.entries(PRESETS).map(([k, p]) =>
-        h('button', { class: 'fx' + (draft.preset === k ? ' on' : '') + (allowed ? '' : ' locked'), onclick: (e) => { if (!allowed) return deny('fx'); draft = { ...p.v, preset: k }; if (k !== 'normal') buildGraph(); applyFx(draft); send({ t: 'music.fx', fx: draft }); haptic('select');
+        h('button', { class: 'fx' + (draft.preset === k ? ' on' : '') + (allowed ? '' : ' locked'), onclick: (e) => { if (!allowed) return deny('fx'); draft = { ...p.v, preset: k }; if (!viaVoice()) { if (k !== 'normal') buildGraph(); applyFx(draft); } send({ t: 'music.fx', fx: draft }); haptic('select');
           body.querySelectorAll('.fx').forEach(b => b.classList.toggle('on', b === e.currentTarget)); } }, h('span', null, p.e), p.label))),
       slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
       slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),

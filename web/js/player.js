@@ -109,7 +109,18 @@ function predicted() {
     if (!done) return { track: t, pos: startOf(t) + pos };
     pos = Math.max(0, pos - len - 0.8);
   }
-  return m.loop === 'all' ? { track: m.queue[0] || c, pos: startOf(m.queue[0] || c) } : { ended: true };
+  if (m.loop !== 'all') return { ended: true };
+  // repeat all: round the queue and the current song again, as far as the time has gone
+  const ring = [...m.queue, c].filter(t => t.duration);
+  const lap = ring.reduce((a, t) => a + endOf(t) - startOf(t) + 0.8, 0);
+  if (!lap) return { track: m.queue[0] || c, pos: startOf(m.queue[0] || c) };
+  pos %= lap;
+  for (const t of ring) {
+    const len = endOf(t) - startOf(t) + 0.8;
+    if (pos < len) return { track: t, pos: startOf(t) + Math.min(pos, len - 0.8) };
+    pos -= len;
+  }
+  return { track: ring[0], pos: startOf(ring[0]) };
 }
 
 function audioSrc(t) { return media(`/api/stream/${t.id}/audio?c=${CODEC}&q=${P.aq}`); }
@@ -318,7 +329,8 @@ function watchdog(want, exp) {
     stuck.since = 0;
     console.warn('music stalled, reloading at', exp.toFixed(1));
     report('music-stall', `song=${P.loadedTrack?.id} at=${exp.toFixed(1)} ready=${audio.readyState} net=${audio.networkState}`);
-    const src = audio.getAttribute('src').replace(/&try=[^&]*/g, '');
+    // (a fresh link: the one loaded hours ago carries a session that may have expired since)
+    const src = P.loadedTrack ? audioSrc(P.loadedTrack) : audio.getAttribute('src').replace(/&try=[^&]*/g, '');
     audio.src = src + '&try=s' + (++stallN); audio.load(); // loadedmetadata -> sync(true) seeks to the room's position
     tryPlay();
   }
@@ -336,7 +348,7 @@ function reviveDead(want) {
   dead = { n: dead.n + 1, at: now };
   report('music-dead', `song=${P.loadedTrack?.id} try=${dead.n} net=${audio.networkState} err=${audio.error?.code || 0}`);
   if (dead.n === 4) report('music-gaveup', `song=${P.loadedTrack?.id} link keeps failing`); // (the room skips it if half the phones say so)
-  audio.src = audio.getAttribute('src').replace(/&try=[^&]*/g, '') + '&try=d' + dead.n;
+  audio.src = (P.loadedTrack ? audioSrc(P.loadedTrack) : audio.getAttribute('src').replace(/&try=[^&]*/g, '')) + '&try=d' + dead.n;
   audio.load(); tryPlay();
 }
 // coming back to the app: jump to where the room is now (not where it was when you left)
@@ -366,6 +378,7 @@ function effectsToBackground() {
     P.fxBg = { el: old, g: G };
     G = null;
     console.info('music: minimized, playing without the effect until the app is open again');
+    startRadio(); // (with an effect on it couldn't start at the moment of minimizing: the graph was still in the way)
   }, () => { a.removeAttribute('src'); a.load(); a.muted = false; });
 }
 function effectsBack() {
@@ -417,6 +430,7 @@ function radioRetry() {
 }
 function stopRadio() {
   if (!P.radio) return;
+  P.radioPlayed = audio.currentTime; // (how much of the stream the phone really played, for the report)
   P.radio = null;
   P.loadedQid = null; P.loadedTrack = null; // the room's song again, at the room's position
   sync(true);
@@ -424,13 +438,13 @@ function stopRadio() {
 document.addEventListener('visibilitychange', () => {
   tellBg();
   if (document.hidden) {
-    P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false;
+    P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false; P.radioPlayed = 0;
     effectsToBackground(); startRadio();
   } else {
     stopRadio(); effectsBack();
     // (for the logs: how a long time in the background went, so a phone that still stops can be told apart)
     const away = (Date.now() - (P.hiddenAt || Date.now())) / 1000;
-    if (away > 90 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${!!P.radioUsed} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
+    if (away > 30 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${P.radioUsed ? Math.round(P.radioPlayed) + 's played' : 'no'} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
   }
   reportCaps();
   if (!document.hidden) return back();
@@ -452,9 +466,9 @@ function setBlocked(b) {
   else tapHint(false);
 }
 let hintTimer = null, hintEl = null;
-function tapHint(on) {
+function tapHint(on, text = 'Tap to hear the music', ic = 'vol-x') {
   if (on && !hintEl) {
-    hintEl = h('button', { class: 'tap-hint', onclick: () => unlockAudio() }, icon('vol-x'), 'Tap to hear the music');
+    hintEl = h('button', { class: 'tap-hint', onclick: () => unlockAudio() }, icon(ic), text);
     document.body.append(hintEl);
     requestAnimationFrame(() => hintEl?.classList.add('show'));
   } else if (!on && hintEl) {
@@ -536,6 +550,9 @@ function waEnter() {
     report('music-webaudio', 'on');
     setBlocked(false);
     sync();
+    // Web Audio plays without a tap, but can't go on in the background (the phone's player is still locked, so
+    // there's no stream to switch to when Telegram is minimized). One tap anywhere unlocks it: ask for it, gently.
+    setTimeout(() => { if (WA.on && !P.blocked) tapHint(true, 'Tap once to keep the music playing in the background', 'music'); }, 6000);
   };
   if (c.state === 'running') go();
   else c.resume().then(go, () => {});
@@ -625,7 +642,7 @@ function waGiveUp() {
 function waLeave() {
   if (WA.leaving) return;
   const s = WA.song;
-  if (!s || !playing() || P.localPaused || !audio.getAttribute('src') || P.loadedQid !== s.qid) { WA.on = false; waStopSong(); return; }
+  if (!s || !playing() || P.localPaused || !audio.getAttribute('src') || P.loadedQid !== s.qid) { WA.on = false; waStopSong(); tapHint(false); return; }
   WA.leaving = true;
   try { audio.currentTime = waPos(s) + 0.1; } catch {}
   audio.playbackRate = s.rate;
@@ -633,6 +650,7 @@ function waLeave() {
     WA.leaving = false;
     if (!WA.on) return;
     WA.on = false; audio.__ok = true;
+    tapHint(false);
     waStopSong(0.15);
     sync(true);
   }, () => { WA.leaving = false; if (WA.on && !audio.paused) audio.pause(); }); // not a real tap (a scroll): stay
@@ -721,7 +739,7 @@ function releaseGraph(force = false) {
   audio.removeAttribute('src');
   audio.volume = P.vol;
   audio.playbackRate = rate();
-  if (src) { audio.src = src; audio.load(); if (was) tryPlay(); }
+  if (src) { const at = old.currentTime; audio.src = src; audio.load(); try { audio.currentTime = at; } catch {} if (was) tryPlay(); }
   old.pause(); old.removeAttribute('src'); old.load();
   try { G.master.disconnect(); } catch {}
   G = null;
@@ -923,6 +941,7 @@ export function setVideo(on) {
 let lastVid = false;
 function applyVideo() {
   const v = isVideo();
+  if (!v && FV) FV.close(); // (the song went back to audio: a full-screen video would stay black)
   if (v) loadVideo(); else unloadVideo();
   if (v !== lastVid || !v) { lastVid = v; renderCard(); if (NP.open) renderStage(); refresh(); }
 }
@@ -1003,7 +1022,7 @@ export function openNP() {
   const el = buildNP();
   NP.open = true;
   requestAnimationFrame(() => el.classList.add('show'));
-  popBack = pushBack(closeNP);
+  if (!popBack) popBack = pushBack(closeNP); // (opened again while open: one Back handler, not one more each time)
   if (isVideo()) loadVideo();
   setView(NP.view);
   refresh();
@@ -1080,7 +1099,7 @@ export function refresh() {
   if (pp.getAttribute('aria-label') !== (isPlay ? 'Pause' : 'Play')) { pp.replaceChildren(icon(isPlay ? 'pause' : 'play', 'fill')); pp.setAttribute('aria-label', isPlay ? 'Pause' : 'Play'); }
   el.querySelector('#np-prev').classList.toggle('locked', !can('playback'));
   const v = S.music;
-  el.querySelector('#np-votes').textContent = !can('playback') && !mine(t) && v.votes ? `${v.votes}/${v.need}` : '';
+  el.querySelector('#np-votes').textContent = v.votes ? `${v.votes}/${v.need}` : '';
   el.querySelector('#np-scrub').classList.toggle('ro', !can('playback'));
   el.querySelector('#np-like').classList.toggle('on', S.liked.has(t.id));
   const lk = el.querySelector('#np-like'), liked = S.liked.has(t.id) ? '1' : '0';
@@ -1294,7 +1313,12 @@ async function openQuality() {
             h('span', { class: 'lab' }, `${q}p`, q === 480 ? h('small', null, 'Default') : null),
             String(P.vq) === String(q) ? icon('check') : null))));
   };
-  const setAq = (k) => { P.aq = k; store.set('aq', k); const c = P.loadedTrack; if (c) { audio.src = audioSrc(c); audio.load(); } render(); };
+  const setAq = (k) => {
+    P.aq = k; store.set('aq', k);
+    const c = P.loadedTrack;
+    if (c) { const at = audio.currentTime, was = !audio.paused; audio.src = audioSrc(c); try { audio.currentTime = at; } catch {} audio.load(); try { audio.currentTime = at; } catch {} if (was) tryPlay(); }
+    render();
+  };
   const setVq = (q) => { P.vq = Number(q); store.set('vq', P.vq); delete video.dataset.src; if (isVideo()) loadVideo(); render(); };
   render();
   if (t) { try { P.heights = (await api(`/api/formats/${t.id}`)).heights; render(); } catch {} }
@@ -1361,7 +1385,8 @@ export function openSearch(tab = 'home') {
   BR.tab = tab;
   BR.view = null;
   requestAnimationFrame(() => el.classList.add('show'));
-  BR.back = pushBack(() => (BR.view ? (BR.view = null, renderBrowse()) : closeBrowse()));
+  // Back: out of an open playlist / collection first, then the Music page (one handler, however often it's opened)
+  BR.back ||= pushBack(() => (BR.sub ? BR.sub() : BR.view ? (BR.view = null, renderBrowse()) : closeBrowse()));
   renderBrowse();
 }
 function closeBrowse() {
@@ -1383,7 +1408,7 @@ function buildBrowse() {
   BR.el = el;
   return el;
 }
-function setTab(t) { BR.tab = t; BR.view = null; haptic('select'); renderBrowse(); }
+function setTab(t) { BR.tab = t; BR.view = null; BR.sub = null; haptic('select'); renderBrowse(); }
 function renderBrowse() {
   const tabs = BR.el.querySelector('#br-tabs');
   tabs.replaceChildren(...TABS.map(([id, ic, label]) => h('button', { class: BR.tab === id ? 'on' : '', onclick: () => setTab(id) }, icon(ic), h('span', null, label))));
@@ -1401,13 +1426,14 @@ function sectionHead(title, onAll) {
 }
 let lastAdd = { id: '', at: 0 };
 function addTrack(t, el) {
-  if (!canAdd()) return deny('add');
-  if (lastAdd.id === t.id && Date.now() - lastAdd.at < 1500) return; // a double tap shouldn't queue it twice
+  if (!canAdd()) { deny('add'); return false; }
+  if (lastAdd.id === t.id && Date.now() - lastAdd.at < 1500) return false; // a double tap shouldn't queue it twice
   lastAdd = { id: t.id, at: Date.now() };
   send({ t: 'music.add', track: t });
   BR.added.add(t.id);
   haptic('success');
   el?.classList.add('added');
+  return true;
 }
 // Tapping a song: three clearly different choices, so people can read and pick (no accidental adds)
 function songMenu(t) {
@@ -1531,7 +1557,7 @@ async function renderCollection(sc, id) {
       h('button', { class: 'btn soft', onclick: () => { const sh = [...data.tracks].sort(() => Math.random() - 0.5); send({ t: 'music.addMany', tracks: sh }); haptic('success'); } }, icon('shuffle'), 'Shuffle')));
   }
   list.replaceChildren(...data.tracks.map(t => {
-    const row = trackRow(t, { btn: icon(BR.added.has(t.id) ? 'check-c' : 'plus-c'), onBtn: () => { addTrack(t, row); row.querySelector('.tb').replaceChildren(icon('check-c')); } });
+    const row = trackRow(t, { btn: icon(BR.added.has(t.id) ? 'check-c' : 'plus-c'), onBtn: () => { if (addTrack(t, row)) row.querySelector('.tb').replaceChildren(icon('check-c')); } });
     return pressable(row, () => songMenu(t), () => songMenu(t));
   }));
 }
@@ -1542,6 +1568,7 @@ async function renderLibrary(sc, openId = null) {
   const box = h('div');
   sc.append(box);
   const showList = async () => {
+    BR.sub = null;
     box.replaceChildren(h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
     let pls = [];
     try { pls = (await api('/api/playlists')).playlists; } catch (e) { box.replaceChildren(h('div', { class: 'empty-note' }, e.message)); return; }
@@ -1558,7 +1585,9 @@ async function renderLibrary(sc, openId = null) {
   };
   const backBtn = () => h('button', { class: 'br-back inline', 'aria-label': 'Back', onclick: showList }, icon('down'));
   const showPlaylist = async (id) => {
-    const p = await api('/api/playlists/' + id);
+    BR.sub = showList; // (Back goes to the library, not out of the Music page)
+    let p;
+    try { p = await api('/api/playlists/' + id); } catch (e) { toast(e.message, 3000, 'err'); return showList(); }
     const list = h('div', null, ...p.tracks.map(t => {
       const row = trackRow(t, { btn: icon('more'), onBtn: () => {
         const m = sheet({ title: t.title, body: h('div', { class: 'list' },
@@ -1598,8 +1627,8 @@ function renderSearchTab(sc) {
     results.replaceChildren(h('div', { class: 'empty-note' }, h('div', { class: 'spinner', style: { margin: '0 auto' } })));
     try {
       const r = await api('/api/search?q=' + encodeURIComponent(q));
+      if (my !== seq) return; // (a newer search started meanwhile: this answer is old)
       lastQ = q;
-      if (my !== seq) return;
       if (r.import) {
         const sp = r.import;
         results.replaceChildren(
@@ -1632,7 +1661,7 @@ function renderSearchTab(sc) {
           canAdd() ? h('button', { class: 'btn sm', onclick: (e) => { e.stopPropagation(); addTrack(top); } }, icon('plus'), 'Add') : null);
         pressable(topCard, () => songMenu(top), () => songMenu(top));
         results.replaceChildren(sectionHead('Top result'), topCard, sectionHead('Songs'),
-          ...rest.map(t => { const row = trackRow(t, { btn: icon(BR.added.has(t.id) ? 'check-c' : 'plus-c'), onBtn: () => { addTrack(t, row); row.querySelector('.tb').replaceChildren(icon('check-c')); } }); return pressable(row, () => songMenu(t), () => songMenu(t)); }));
+          ...rest.map(t => { const row = trackRow(t, { btn: icon(BR.added.has(t.id) ? 'check-c' : 'plus-c'), onBtn: () => { if (addTrack(t, row)) row.querySelector('.tb').replaceChildren(icon('check-c')); } }); return pressable(row, () => songMenu(t), () => songMenu(t)); }));
       }
     } catch (e) { if (my === seq) results.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
   }
@@ -1671,7 +1700,7 @@ export function prompt_(title, placeholder, value = '') {
     const body = h('div', { style: { display: 'grid', gap: '12px' } }, input,
       h('button', { class: 'btn block', onclick: () => { res(input.value.trim()); done = true; s.close(); } }, 'Save'));
     let done = false;
-    const s = sheet({ title, body, onClose: () => { if (!done) res(''); } });
+    const s = sheet({ title, body, onClose: () => { if (!done) res(null); } }); // (closed: null, not "nothing typed")
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { res(input.value.trim()); done = true; s.close(); } });
     setTimeout(() => input.focus(), 350);
   });

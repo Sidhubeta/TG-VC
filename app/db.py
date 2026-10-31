@@ -53,6 +53,7 @@ CREATE INDEX IF NOT EXISTS ix_sched ON schedules(sent, at);
 CREATE TABLE IF NOT EXISTS listens(
   id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, vid TEXT, title TEXT, artist TEXT, ts REAL);
 CREATE INDEX IF NOT EXISTS ix_listens_uid ON listens(uid, ts);
+CREATE TABLE IF NOT EXISTS chat_stats(chat_id INTEGER, uid INTEGER, day INTEGER, n INTEGER, PRIMARY KEY(chat_id, uid, day));
 CREATE TABLE IF NOT EXISTS sudo(uid INTEGER PRIMARY KEY, name TEXT, username TEXT, added_by INTEGER, ts REAL);
 CREATE TABLE IF NOT EXISTS room_state(chat_id INTEGER PRIMARY KEY, data TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS members(

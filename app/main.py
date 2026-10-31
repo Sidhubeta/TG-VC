@@ -77,8 +77,9 @@ sudo.load()
 
 
 def is_sudo(uid: int, st: dict | None = None) -> bool:
-    """The bot's owner (OWNER_ID) or a sudo user they added: the only ones who see the Health page."""
-    return sudo.is_sudo(uid)
+    """The bot's owner (OWNER_ID) or a sudo user they added: the only ones who see the Health page. Until OWNER_ID
+    is set, the group's own creator sees it (else nobody could, nor find out what's missing)."""
+    return sudo.is_sudo(uid) or (not config.OWNER_ID and bool((st or {}).get("owner")))
 
 
 async def is_banned(chat_id: int, uid: int) -> bool:
@@ -250,7 +251,13 @@ async def api_radio(request: Request):
     room = ROOMS.get(chat_id)
     if not room or radio.busy():
         return Response("not available", status_code=503)
-    return StreamingResponse(radio.stream(room, request), media_type="audio/mpeg",
+    p = room.parts.get(uid)
+    request.state.who = f"{p.name if p else uid} ({uid})"
+
+    async def still_allowed() -> bool:  # banned or gone from the group: the stream stops too
+        st = await tg.member_status(chat_id, uid)
+        return (st["member"] or st.get("unsure", False)) and not await is_banned(chat_id, uid)
+    return StreamingResponse(radio.stream(room, request, still_allowed), media_type="audio/mpeg",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
@@ -410,8 +417,15 @@ async def _add_items(pid: int, tracks) -> None:
     if not isinstance(tracks, list):
         return
     now = time.time()
-    await db.xmany("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)",
-                   [(pid, json.dumps(c), now) for t in tracks[:300] if (c := _clean_track(t))])
+    # a song already in the playlist isn't added again (Liked Songs got the same song twice)
+    have = {r["vid"] for r in await db.q("SELECT json_extract(track,'$.id') AS vid FROM playlist_items WHERE playlist_id=?", (pid,))}
+    rows = []
+    for t in tracks[:300]:
+        c = _clean_track(t)
+        if c and c["id"] not in have:
+            have.add(c["id"])
+            rows.append((pid, json.dumps(c), now))
+    await db.xmany("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)", rows)
 
 
 @guarded()
@@ -532,7 +546,7 @@ async def api_logs_users(request: Request, uid, chat_id, st):
     room = ROOMS.get(chat_id)
     for r in rows:
         r["online"] = bool(room and r["uid"] in room.parts)
-        if r["online"]:
+        if r["online"] and t >= time.time() - 60:  # (the live mic time belongs to now, not to an older range)
             pp = room.parts[r["uid"]]
             if pp.mic and pp.mic_since:
                 r["mic"] = (r["mic"] or 0) + (time.time() - pp.mic_since)
@@ -559,7 +573,7 @@ REC_MAX = 50 * 1024 * 1024  # Telegram bots can't upload files bigger than 50 MB
 
 @guarded(need_admin=True)
 async def api_recording(request: Request, uid, chat_id, st):
-    if int(request.headers.get("content-length") or 0) > REC_MAX + 1024 * 1024:
+    if _num(request.headers.get("content-length"), 0) > REC_MAX + 1024 * 1024:
         return err("The recording is too big for Telegram (max 50 MB). Record shorter parts.", 413)
     form = await request.form(max_part_size=REC_MAX + 1024 * 1024)
     f = form.get("file")
@@ -601,6 +615,7 @@ async def api_dm_check(request: Request, uid, chat_id, st):
 # ---------------- invites ----------------
 _invite_last: dict[tuple, float] = {}  # (chat, invited uid) -> when
 _invite_by: dict[tuple, list[float]] = {}  # (chat, inviter) -> recent invite times
+_invite_chat: dict[int, list[float]] = {}  # chat -> recent invite times (everyone's)
 
 
 @guarded()
@@ -637,6 +652,8 @@ async def api_invite(request: Request, uid, chat_id, st):
             if full is not None:
                 source = "full"
                 pool, total = full["people"], full["total"]
+                if not pool:  # Telegram gave no more people (its count can be higher than what it lists)
+                    total = offset
             else:
                 # everyone the bot has seen: admins first, then the most recently active
                 people: dict[int, dict] = {}
@@ -682,8 +699,13 @@ async def api_invite(request: Request, uid, chat_id, st):
     # Inviting several people one after another is normal: allow a burst of 10 a minute per person
     # (an old 4-second gap made every invite after the first one fail when tapped quickly).
     recent = [x for x in _invite_by.get((chat_id, uid), []) if t - x < 60]
-    if len(recent) >= 10:
+    if len(recent) >= 5:
         return err("That's a lot of invites — try again in a minute 🙂", 429)
+    # the whole group too: invites are mentions in the group now, and many at once are spam
+    group = [x for x in _invite_chat.get(chat_id, []) if t - x < 600]
+    if len(group) >= 20:
+        return err("Lots of people were invited just now — try again in a few minutes 🙂", 429)
+    _invite_chat[chat_id] = group + [t]
     info = await tg.member_status(chat_id, target, fresh=True)  # also gives the real name (not trusted from the app)
     name = info.get("name") or "Member"
     if not info["member"]:

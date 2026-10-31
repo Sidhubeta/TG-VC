@@ -37,6 +37,7 @@ async function connect() {
     const mic = store.get('dev:audioinput', ''), out = store.get('dev:audiooutput', '');
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
+
       audioCaptureDefaults: {
         echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
         ...(mic ? { deviceId: mic } : {}),
@@ -288,8 +289,24 @@ function iosSession(recording) {
 }
 iosSession(false);
 
+// A mic that's off is let go after a little while. While a phone records it keeps all its sound in "call" mode, so a
+// muted-but-open mic sent the music out of the call's speaker at the call's volume. Not at once: reopening the mic
+// takes a moment and cut the first word off when someone just paused for a second.
+const MIC_RELEASE = 20000;
+let micReleaseTimer = null;
+function releaseMicLater() {
+  clearTimeout(micReleaseTimer);
+  micReleaseTimer = setTimeout(async () => {
+    if (V.mic || !room) return;
+    const pub = room.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone);
+    if (!pub?.track) return;
+    try { await room.localParticipant.unpublishTrack(pub.track, true); } catch (e) { console.warn(e); }
+    emit('voice:session', 'play'); // (the phone goes back to media sound: nudge the music)
+  }, MIC_RELEASE);
+}
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }
+  clearTimeout(micReleaseTimer);
   if (on) iosSession(true);
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
@@ -298,7 +315,7 @@ export async function setMic(on) {
     if (on) await applyNoise();
     V.mic = on;
     send({ t: 'mic', on });
-    if (!on) iosSession(false);
+    if (!on) { iosSession(false); releaseMicLater(); }
     // the phone switches its audio between "media" and "call" mode as the mic starts/stops (Android too):
     // a playing song can go silent right then, so the music player gets a nudge
     emit('voice:session', on ? 'record' : 'play');
@@ -425,6 +442,9 @@ export async function restartVoice(lk) {
   V.mic = V.cam = V.screen = false;
   if (was) send({ t: 'mic', on: false });
   await startVoice(lk);
+  // (the mic was on: it stays on under the new identity — it used to go off without a word)
+  if (was && V.ready) { if (!(await setMic(true))) toast('Your mic was turned off — tap it to speak again'); }
+  else if (was) toast('Your mic was turned off — tap it to speak again');
 }
 
 // for the recorder

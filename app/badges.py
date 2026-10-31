@@ -44,16 +44,18 @@ async def for_group(chat_id: int, ttl: float = 300) -> dict[int, list[str]]:
         if uid:
             out.setdefault(uid, []).append(b)
 
+    # (what someone did appearing as the group isn't theirs to show off: it would give them away)
     top = await db.q1("""SELECT by_uid AS uid, COUNT(*) AS n FROM plays WHERE chat_id=? AND ts>? AND by_uid!=0
-                         GROUP BY by_uid ORDER BY n DESC LIMIT 1""", (chat_id, week))
+                         AND COALESCE(asg,0)=0 GROUP BY by_uid ORDER BY n DESC LIMIT 1""", (chat_id, week))
     if top and top["n"] >= 5:
         give(top["uid"], "dj")
     top = await db.q1("""SELECT uid, SUM(mic_secs) AS s FROM sessions WHERE chat_id=? AND joined>?
                          GROUP BY uid ORDER BY s DESC LIMIT 1""", (chat_id, week))
     if top and (top["s"] or 0) >= 600:
         give(top["uid"], "voice")
-    top = await db.q1("""SELECT uid, COUNT(*) AS n FROM messages WHERE chat_id=? AND ts>?
-                         GROUP BY uid ORDER BY n DESC LIMIT 1""", (chat_id, week))
+    # (counted per day as they're sent: the messages themselves are gone after 48 hours)
+    top = await db.q1("""SELECT uid, SUM(n) AS n FROM chat_stats WHERE chat_id=? AND day>=?
+                         GROUP BY uid ORDER BY n DESC LIMIT 1""", (chat_id, int(week // 86400)))
     if top and top["n"] >= 10:
         give(top["uid"], "chat")
     nights: dict[int, set] = {}
@@ -65,9 +67,9 @@ async def for_group(chat_id: int, ttl: float = 300) -> dict[int, list[str]]:
         start, end = s["joined"], max(s["joined"], s["last_seen"] or s["joined"])
         if end - start >= 3 * 3600:
             marathon.add(s["uid"])
-        if start < fortnight:
+        if end < fortnight:
             continue
-        t = start
+        t = max(start, fortnight)  # (a session that began before the 14 days but ran into them counts from there)
         while True:  # walk the session hour by hour, in local time
             d = _local(t)
             days.setdefault(s["uid"], set()).add(d.date())
@@ -89,7 +91,7 @@ async def for_group(chat_id: int, ttl: float = 300) -> dict[int, list[str]]:
             give(uid, "regular")
     for uid in marathon:
         give(uid, "marathon")
-    for r in await db.q("SELECT by_uid AS uid FROM plays WHERE chat_id=? AND by_uid!=0 GROUP BY by_uid HAVING COUNT(*)>=100", (chat_id,)):
+    for r in await db.q("SELECT by_uid AS uid FROM plays WHERE chat_id=? AND by_uid!=0 AND COALESCE(asg,0)=0 GROUP BY by_uid HAVING COUNT(*)>=100", (chat_id,)):
         give(r["uid"], "lover")
     for r in await db.q("SELECT uid FROM sessions WHERE chat_id=? AND uid!=0 GROUP BY uid HAVING MIN(joined)>?", (chat_id, now - 3 * DAY)):
         give(r["uid"], "new")

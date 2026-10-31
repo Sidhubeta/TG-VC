@@ -388,7 +388,8 @@ export async function setMic(on) {
   try {
     if (on) await refreshPermissions();
     await room.localParticipant.setMicrophoneEnabled(on, on ? micOpts() : undefined);
-    if (on) await applyNoise();
+    // (minimized, noise isolation crackles: it comes on when the app is open again — see the visibility handler)
+    if (on) { if (document.hidden) bgOff = true; else await applyNoise(); }
     V.mic = on;
     send({ t: 'mic', on });
     if (!on) { iosSession(false); releaseMicLater(); }

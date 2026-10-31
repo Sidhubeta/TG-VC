@@ -575,7 +575,7 @@ class Room:
         cur = self.current
         if not cur:
             return
-        if music.is_ready(cur["id"]):
+        if music.is_ready(cur["id"]) and (music.is_cached(cur["id"]) or not voicemusic.enabled()):
             self.status, self.upd = "playing", now()
             self._arm_timer()
             spawn(self.push_music())

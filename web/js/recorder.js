@@ -105,7 +105,11 @@ export const recorder = {
       mr.start(5000);
       return mr;
     };
-    const mr = startPart();
+    let mr;
+    try { mr = startPart(); } catch (e) {
+      console.warn(e); cleanup();
+      return toast('Recording couldn’t start on this device');
+    }
     rec = { mr, since: Date.now() / 1000 };
     send({ t: 'rec.start' });
     toast('Recording started');

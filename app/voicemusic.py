@@ -32,6 +32,7 @@ FRAME_BYTES = FRAME * CH * 2      # 16-bit
 # LiveKit's buffer. 200 ms was too little: a busy moment on the server (a download, a search) left it empty and the
 # music stuttered for everyone. A skip, a seek or a pause still is heard at once: the buffer is emptied for those.
 QUEUE_MS = 1000
+IDLE_LEAVE = 600                  # no music this long: the player leaves the voice chat (LiveKit counts its minutes)
 START_LAG = 0.15                  # ffmpeg's start: a new decoder's first sound comes about this much later
 _players: dict[int, "Player"] = {}
 _retry_at: dict[int, tuple[float, float]] = {}  # chat -> (don't start again before, next wait)
@@ -239,8 +240,9 @@ class Player:
 
     async def _run(self):
         self._item = None
-        sig = None
-        empty_since = None
+        sig = pend = None
+        empty_since = quiet_since = None
+        pend_at = 0.0
         try:
             await self._connect()
             _retry_at.pop(self.room.chat_id, None)
@@ -256,9 +258,24 @@ class Player:
                         return
                 else:
                     empty_since = None
+                # No music for 10 minutes: leave the voice chat (LiveKit counts every minute a participant is in
+                # it, also a silent one); the next song brings the player back.
+                if room.status in ("playing", "loading"):
+                    quiet_since = None
+                else:
+                    quiet_since = quiet_since or time.monotonic()
+                    if time.monotonic() - quiet_since > IDLE_LEAVE and not any(not v.finished() for v in self.voices):
+                        return
                 s = _sig(room)
+                if s != sig and sig and s[:4] == sig[:4]:
+                    # Only the effects changed: while someone drags a slider they change many times a second, and
+                    # each change restarted the song (it stuttered). Wait until it rests for a moment.
+                    if s != pend:
+                        pend, pend_at = s, time.monotonic()
+                    if time.monotonic() - pend_at < 0.3:
+                        s = sig
                 if s != sig:
-                    old, sig = sig, s
+                    old, sig, pend = sig, s, None
                     await self._change(old, s)
                 elif room.status == "playing" and room.current and not any(not v.done or v.frames for v in self.voices if v.target):
                     # the song's sound has all gone out; wait for the room to move on (nothing to do)
@@ -314,6 +331,8 @@ def ensure(room):
     p = _players.get(room.chat_id)
     if p and p.alive():
         return
+    if room.status not in ("playing", "loading"):
+        return  # (nothing to play: it joins with the next song)
     if time.time() < _retry_at.get(room.chat_id, (0, 0))[0]:
         return  # (it failed a moment ago)
     _players[room.chat_id] = Player(room)

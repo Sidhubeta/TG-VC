@@ -233,7 +233,10 @@ let voiceGoneAt = 0, lastViaVoice = null;
 const viaVoice = () => {
   if (!P.voiceMode) return false;
   if (musicInVoice()) { voiceGoneAt = 0; return true; }
-  if (lastViaVoice !== true) return false;
+  if (lastViaVoice === false) return false;
+  // Nothing playing: nothing to wait for (the server's player leaves the voice chat after a while without music, and
+  // comes back with the next song — the phone waits for it then, instead of starting its own player for a second)
+  if (!playing()) { voiceGoneAt = 0; return lastViaVoice === true; }
   if (!voiceGoneAt) { voiceGoneAt = Date.now(); setTimeout(() => sync(true), VOICE_GRACE + 50); }
   return Date.now() - voiceGoneAt < VOICE_GRACE;
 };
@@ -267,7 +270,7 @@ function voiceSync() {
 function sync(force = false) {
   lastSync = Date.now();
   if (viaVoice()) return voiceSync();
-  if (lastViaVoice) { lastViaVoice = false; console.info('music: the voice chat has no music, playing it here'); }
+  if (lastViaVoice !== false && P.voiceMode && playing()) { lastViaVoice = false; console.info('music: the voice chat has no music, playing it here'); }
   reportCaps();
   if (P.radio) { if (audio.error || audio.networkState === 3) radioRetry(); return; } // (the server plays the room)
   let pr = predicted();

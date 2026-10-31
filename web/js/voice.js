@@ -9,7 +9,21 @@ let roomVol = store.get('roomVol', 1);
 export const V = {
   ready: false, mic: false, cam: false, screen: false, facing: 'user',
   noise: store.get('noise', true), speaking: new Set(),
+  // HD music while talking: the phone's own echo cancelling is what switches its sound to "call" mode (thin, mono
+  // music, call volume) while the mic is on. Without it the sound stays in media mode. The browser's noise
+  // reduction and our noise isolation stay on; with the phone's speaker others may hear a little echo.
+  hdTalk: store.get('hdTalk', true),
 };
+const micOpts = () => {
+  const mic = store.get('dev:audioinput', '');
+  return { echoCancellation: !V.hdTalk, noiseSuppression: true, autoGainControl: true, channelCount: 1, ...(mic ? { deviceId: mic } : {}) };
+};
+export async function setHdTalk(on) {
+  V.hdTalk = on;
+  store.set('hdTalk', on);
+  const track = room?.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone)?.audioTrack;
+  if (track) { try { await track.restartTrack(micOpts()); await applyNoise(); } catch (e) { console.warn(e); } }
+}
 
 async function loadSDK() {
   if (LK) return LK;
@@ -34,7 +48,7 @@ async function connect() {
   const old = room; room = null;
   if (old) { try { await old.disconnect(); } catch {} old.removeAllListeners?.(); }
   try {
-    const mic = store.get('dev:audioinput', ''), out = store.get('dev:audiooutput', '');
+    const out = store.get('dev:audiooutput', '');
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
       // LiveKit leaves the voice chat by itself when the page is hidden away ("pagehide") or frozen ("freeze").
@@ -43,10 +57,7 @@ async function connect() {
       // really closes (our own pagehide handler).
       disconnectOnPageLeave: false,
 
-      audioCaptureDefaults: {
-        echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
-        ...(mic ? { deviceId: mic } : {}),
-      },
+      audioCaptureDefaults: micOpts(),
       ...(out ? { audioOutput: { deviceId: out } } : {}),
       // DTX (stop sending in silence) clips the first syllable after a pause, which sounds like the voice
       // flickering; RED resends audio so lost packets don't crackle. 48 kbps keeps voices clear.
@@ -375,7 +386,7 @@ export async function setMic(on) {
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
     if (on) await refreshPermissions();
-    await room.localParticipant.setMicrophoneEnabled(on);
+    await room.localParticipant.setMicrophoneEnabled(on, on ? micOpts() : undefined);
     if (on) await applyNoise();
     V.mic = on;
     send({ t: 'mic', on });

@@ -4,7 +4,7 @@ import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
   allowDeviceList, noiseStatus, screenSupported, setCam, setMic, setNoise, setRoomVolume, setScreen, setVolume, startVoice, toggleMuteForMe,
-  restartVoice, unblockAudio, useDevice,
+  restartVoice, setHdTalk, unblockAudio, useDevice,
 } from './voice.js';
 import { recorder } from './recorder.js';
 import { startEmoji } from './emoji.js';
@@ -476,6 +476,7 @@ function openAudio() {
       h('p', { class: 'muted note' }, 'During a call the volume buttons change the call volume, which Android never lets go fully silent. Use these sliders to make voices or music quieter.'),
       h('div', { class: 'list' },
         switchRow('Noise isolation', noiseStatus(), V.noise, (v) => { setNoise(v).then(render); }),
+        switchRow('HD music while talking', 'Music keeps full quality when your mic is on. On the phone’s speaker others may hear a little echo — turn off if they do.', V.hdTalk, (v) => { setHdTalk(v).then(render); }),
         switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
   };
   const onDev = () => render();

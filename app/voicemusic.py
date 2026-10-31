@@ -29,11 +29,13 @@ IDENTITY = "music"
 RATE, CH = 48000, 2
 FRAME = 960                       # 20 ms
 FRAME_BYTES = FRAME * CH * 2      # 16-bit
-QUEUE_MS = 200                    # LiveKit's buffer: small, so a skip or a seek is heard at once
+# LiveKit's buffer. 200 ms was too little: a busy moment on the server (a download, a search) left it empty and the
+# music stuttered for everyone. A skip, a seek or a pause still is heard at once: the buffer is emptied for those.
+QUEUE_MS = 1000
 AHEAD = QUEUE_MS / 1000           # a new song starts this much ahead, so it's heard on the room's clock
 _players: dict[int, "Player"] = {}
 _retry_at: dict[int, tuple[float, float]] = {}  # chat -> (don't start again before, next wait)
-STATS = {"errors": 0, "last_error": ""}
+STATS = {"errors": 0, "last_error": "", "underruns": 0}
 logging.getLogger("livekit").setLevel(logging.WARNING)  # (the SDK says a lot at INFO)
 
 
@@ -72,16 +74,21 @@ def _filters(fx: dict) -> list[str]:
 class _Voice:
     """One decoder (a song from a position, with the effects), read ahead into frames, with a fade in or out."""
 
-    def __init__(self, args: list[str], fade_in: float):
-        self.args = args
+    def __init__(self, args, fade_in: float):
+        self.args = args  # the ffmpeg arguments, or a coroutine that finds them (the song may still be downloading)
         self.frames: deque[bytes] = deque()
         self.done = False
+        self.started = False  # (has given frames: a gap after that is a stutter, before it the song is starting)
         self.proc = None
         self.gain, self.target, self.step = (0.0 if fade_in else 1.0), 1.0, (1.0 / max(1, fade_in / 0.02) if fade_in else 0)
         self.task = asyncio.get_running_loop().create_task(self._read())
 
     async def _read(self):
         try:
+            if asyncio.iscoroutine(self.args):
+                self.args = await self.args
+            if not self.args:
+                return
             self.proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *self.args,
                 "-vn", "-ac", str(CH), "-ar", str(RATE), "-f", "s16le", "pipe:1",
@@ -96,6 +103,7 @@ class _Voice:
                         self.frames.append(e.partial + b"\0" * (FRAME_BYTES - len(e.partial)))
                     break
                 self.frames.append(data)
+                self.started = True
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -124,6 +132,8 @@ class _Voice:
         return a
 
     def stop(self):
+        if asyncio.iscoroutine(self.args):
+            self.args.close()
         self.task.cancel()
         if self.proc and self.proc.returncode is None:
             try:
@@ -203,9 +213,9 @@ class Player:
             self.source.clear_queue()  # (a skip, a seek or a pause is heard at once, not after the buffer)
         self._item = room.current
         if playing:
-            args = await _source_args(room, AHEAD)
-            if args:
-                self.voices.append(_Voice(args, fade_in=fade if (xf or same_song) else 0.02))
+            # (found in the background: waiting here for a song still downloading starved the old one's fade-out
+            # and the buffer, which was heard as a stutter at every song change)
+            self.voices.append(_Voice(_source_args(room, AHEAD), fade_in=fade if (xf or same_song) else 0.02))
 
     async def _run(self):
         self._item = None
@@ -237,6 +247,8 @@ class Player:
                     a = v.next_frame()
                     if a is not None:
                         mix = a if mix is None else mix + a
+                if mix is None and any(v.started and not v.done and v.target for v in self.voices):
+                    STATS["underruns"] += 1  # a song is playing but its decoder had nothing ready: a gap
                 data = np.clip(mix, -32768, 32767).astype(np.int16).tobytes() if mix is not None else silence
                 if mix is None and not self.voices:
                     # nothing playing: no need to keep LiveKit's buffer full, just keep time
@@ -291,4 +303,5 @@ def status() -> dict:
     n = sum(1 for p in _players.values() if p.alive())
     return {"ok": not STATS["errors"] or n > 0,
             "detail": f"On · playing in {n} voice chat{'s' if n != 1 else ''}"
+            + (f" · {STATS['underruns']} gap(s) of 20 ms" if STATS["underruns"] else "")
             + (f" · {STATS['errors']} error(s), last: {STATS['last_error']}" if STATS["errors"] else "")}

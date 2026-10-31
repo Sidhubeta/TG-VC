@@ -225,9 +225,19 @@ function reportCaps() {
 // player, no Web Audio, no stream, no tap. Only the video (muted) follows the room's clock. If this phone's voice
 // isn't connected (or the server's music isn't there), the phone plays the music itself as before.
 const VOICE_LAG = 0.15; // the voice chat's own delay: the video waits for the sound by that much
-const viaVoice = () => !!P.voiceMode && musicInVoice();
-on('voice:music', () => { lastViaVoice = null; sync(true); });
-let lastViaVoice = null;
+// The voice chat's music can be gone for a moment: minimizing Telegram, the network, the voice chat joining again.
+// Starting the phone's own player at once made the song cut and jump (its position isn't the voice chat's), and
+// jump again when the voice music came back a second later. So for a few seconds the phone just waits for it.
+const VOICE_GRACE = 6000;
+let voiceGoneAt = 0, lastViaVoice = null;
+const viaVoice = () => {
+  if (!P.voiceMode) return false;
+  if (musicInVoice()) { voiceGoneAt = 0; return true; }
+  if (lastViaVoice !== true) return false;
+  if (!voiceGoneAt) { voiceGoneAt = Date.now(); setTimeout(() => sync(true), VOICE_GRACE + 50); }
+  return Date.now() - voiceGoneAt < VOICE_GRACE;
+};
+on('voice:music', (here) => { if (!here && lastViaVoice) { viaVoice(); return; } lastViaVoice = null; sync(true); });
 function voiceSync() {
   if (lastViaVoice !== true) {
     lastViaVoice = true;

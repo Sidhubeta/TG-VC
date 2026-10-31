@@ -68,9 +68,8 @@ window.addEventListener('beforeunload', bye);
 // Back from the browser's page cache (the page was kept, not reloaded): we had said goodbye, so join again.
 window.addEventListener('pageshow', (e) => {
   if (!e.persisted || !byeSent) return;
-  byeSent = false;
-  reconnectWS();
-  restartVoice(S.lk);
+  // We said goodbye when the page was put away; it may be hours later and the session expired. Start fresh.
+  location.reload();
 });
 
 function goFullscreen() {
@@ -114,6 +113,15 @@ on('ws:down', () => toast('Reconnecting…', 1500));
 on('ws:kicked', (m) => { closeWS(); emit('fatal', { title: m.ban ? 'Banned' : 'Removed', text: m.reason || (m.ban ? 'An admin banned you from this voice chat.' : 'An admin removed you from this voice chat.') }); });
 on('ws:locked', () => emit('fatal', { title: 'Locked', text: 'Admins locked this voice chat.' }));
 on('ws:toast', (m) => toast(m.text));
+// Back after the connection dropped long enough for the room to count us gone: it forgot our recording (no REC
+// for anyone, and it couldn't be stopped). This app is still recording, so tell the room again.
+function reclaimRecording() {
+  const a = recorder.active(), rec = S.room?.rec;
+  if (a && !(rec?.on && (rec.by === S.uid || (S.pid && rec.by === S.pid)))) send({ t: 'rec.start', since: a.since });
+}
+on('ws:init', reclaimRecording);
+on('ws:role', (m) => { S.admin = !!m.admin; renderHeader(); renderDock(); renderGrid(true); }); // (made an admin, or not one any more)
+on('ws:lk', (m) => { if (m.lkid !== (S.lkid ?? S.uid)) { S.lk = m.livekit; S.lkid = m.lkid; restartVoice(S.lk); } });
 // the room refused our mic (an admin muted us while we were away): it's off, whatever we thought
 on('ws:mic.denied', () => {
   if (V.mic) setMic(false);
@@ -305,6 +313,7 @@ function openParticipant(uid) {
           : actionRow('shield', 'Make moderator', () => { send({ t: 'admin.mod', uid }); toast(`${p.name} is now a moderator`); s.close(); }, '', 'Can mute, move and remove people')) : null,
       !me ? h('div', { class: 'list' }, actionRow('flag', 'Report to admins', async () => {
         const reason = await prompt_('Report ' + p.name, 'What happened? (optional)');
+        if (reason === null) return; // closed without sending: no report
         send({ t: 'report', uid, reason }); s.close();
       }, 'red')) : null,
       me ? h('div', { class: 'list' }, actionRow('hand', p.hand ? 'Lower hand' : 'Raise hand', () => { send({ t: 'hand', up: !p.hand }); s.close(); })) : null);
@@ -326,7 +335,7 @@ on('voice:video', ({ uid, track, source, on: isOn, local }) => {
   const label = (p?.name || '') + (screen ? ' · screen' : '');
   const tile = h('div', { class: 'vtile' + (screen ? ' screen' : '') }, el,
     h('span', { class: 'lbl' }, label),
-    h('button', { class: 'fs', 'aria-label': 'Full screen', onclick: () => fullView(el, { label }) }, icon('expand')),
+    h('button', { class: 'fs', 'aria-label': 'Full screen', onclick: () => { const v = vids.get(key); if (v) v.fv = fullView(el, { label, onClose: () => { if (v) v.fv = null; } }); } }, icon('expand')),
     pipSupported(el) ? h('button', { class: 'fs pip', 'aria-label': 'Picture in picture', onclick: () => pip(el) }, icon('pip')) : null);
   vids.set(key, { tile, uid, track, el, local: local && !screen });
   if (local && !screen) el.classList.toggle('mirror', V.facing === 'user'); // only the selfie camera is mirrored
@@ -334,7 +343,7 @@ on('voice:video', ({ uid, track, source, on: isOn, local }) => {
 });
 on('voice:facing', () => { for (const v of vids.values()) if (v.local) v.el.classList.toggle('mirror', V.facing === 'user'); });
 function removeVideo(uid, key) {
-  for (const [k, v] of vids) if ((key ? k === key : v.uid === uid)) { v.tile.remove(); try { v.track?.detach?.(v.el); } catch {} vids.delete(k); }
+  for (const [k, v] of vids) if ((key ? k === key : v.uid === uid)) { v.fv?.close(); v.tile.remove(); try { v.track?.detach?.(v.el); } catch {} vids.delete(k); }
 }
 
 // ======================= dock =======================
@@ -621,10 +630,11 @@ function bindComposer() {
     if (box.hidden || box.contains(e.target) || e.target.closest('#b-chat, .cpop')) return;
     if (input.value.trim()) return;
     closeComposer();
-    swallowClick = true; // this tap only closes the box; it shouldn't also open whatever is underneath
-    setTimeout(() => { swallowClick = false; }, 500);
+    swallowClick = Date.now(); // this tap only closes the box; it shouldn't also open whatever is underneath
   }, true);
-  document.addEventListener('click', (e) => { if (swallowClick) { swallowClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
+  // (only the click of that same tap: if it was a scroll, no click follows, and the next real tap must count)
+  document.addEventListener('pointerdown', (e) => { if (swallowClick && Date.now() - swallowClick > 50) swallowClick = 0; }, false);
+  document.addEventListener('click', (e) => { if (swallowClick && Date.now() - swallowClick < 600) { swallowClick = 0; e.stopPropagation(); e.preventDefault(); } }, true);
 }
 function setReply(m) {
   replyTo = m;

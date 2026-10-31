@@ -349,11 +349,17 @@ class Room:
     def pub_for(self, p: Participant, viewer: Participant) -> dict:
         return self.pub(p, viewer.admin, self.is_mod(viewer), viewer.uid)
 
-    async def bcast_masked(self, p: Participant, msg: dict):
+    def shown_name(self, p: Participant) -> str:
+        """The name others see: the group's for someone appearing as the group (moderators included)."""
+        return self.group_title if p.as_group else p.name
+
+    async def bcast_masked(self, p: Participant, msg: dict, admins_only: bool = False):
         """A message with p's uid in it: members get the stand-in id if p appears as the group."""
         if not p.as_group:
-            return await self.broadcast(msg)
+            return await self.broadcast(msg, admins_only)
         for q in list(self.parts.values()):
+            if admins_only and not self.staff(q):
+                continue
             m = {**msg, "uid": self.vis_uid(p, q)}
             for c in list(q.conns):
                 await c.send(m)
@@ -426,12 +432,16 @@ class Room:
         p = self.parts.get(uid)
         first = p is None
         self.last_active = now()
+        if ROOMS.get(self.chat_id) is not self and self.chat_id not in ROOMS:
+            ROOMS[self.chat_id] = self  # (the clean-up let this room go between get_room() and this join)
         if (t := self._lingering.pop(uid, None)) and not t.done():
             t.cancel()  # back within LINGER: the same visit carries on
         if self._idle_paused and (self.status == "paused" or self._next_on_resume):
             # the music was paused only because everyone had gone: carry on now someone is back (a member
             # without playback rights couldn't start it again, so it stayed off until an admin came)
-            await self._resume_after_idle()
+            async with self._lock:
+                if self._idle_paused:
+                    await self._resume_after_idle()
         if first:
             p = Participant(uid, user, admin)
             p.as_group = as_group and admin
@@ -476,19 +486,12 @@ class Room:
                          **({"pid": self.pid(uid)} if p.as_group else {}),
                          # appearing as the group (or just stopped): a LiveKit token under the identity to use now
                          # (the one from login has the real id); the app joins the voice again if it changed
+                         # (always: an app that stopped appearing as the group and came back later still had the
+                         # stand-in id)
                          **({"livekit": lk.join_info(self.chat_id, int(self.lk_id(uid)), self.can_speak(p)),
-                             "lkid": int(self.lk_id(uid))} if (p.as_group or toggled) and lk.enabled() else {})})
+                             "lkid": int(self.lk_id(uid))} if lk.enabled() else {})})
         if toggled:
-            # everyone else: the old tile goes and the new one comes (its id may have changed)
-            for q in list(self.parts.values()):
-                if q.uid == uid:
-                    continue
-                now_as = self.vis_uid(p, q)
-                for c in list(q.conns):
-                    if seen_as.get(q.uid, now_as) != now_as:
-                        await c.send({"t": "p.leave", "uid": seen_as[q.uid], "quiet": True})
-                    await c.send({"t": "p.join" if seen_as.get(q.uid, now_as) != now_as else "p.upd",
-                                  "p": self.pub_for(p, q), "quiet": True})
+            await self._retile(p, seen_as)
         if first:
             await self.bcast_part(p, "p.join")
             await self.broadcast({"t": "room", "room": self.room_state()})
@@ -525,12 +528,43 @@ class Room:
         if not p.conns and self.parts.get(p.uid) is p:
             await self._gone(p)
 
+    async def _retile(self, p: Participant, seen_as: dict[int, int]):
+        """p's id changed for some people (appearing as the group, or back): their old tile goes, the new comes."""
+        for q in list(self.parts.values()):
+            if q.uid == p.uid:
+                continue
+            now_as = self.vis_uid(p, q)
+            for c in list(q.conns):
+                if seen_as.get(q.uid, now_as) != now_as:
+                    await c.send({"t": "p.leave", "uid": seen_as[q.uid], "quiet": True})
+                await c.send({"t": "p.join" if seen_as.get(q.uid, now_as) != now_as else "p.upd",
+                              "p": self.pub_for(p, q), "quiet": True})
+
+    async def set_as_group(self, p: Participant, on: bool):
+        """Switch appearing as the group from the server (an admin who isn't one any more): everyone's tile, and the
+        person's app gets a voice token under the identity to use now."""
+        if p.as_group == on:
+            return
+        seen_as = {q.uid: self.vis_uid(p, q) for q in self.parts.values() if q.uid != p.uid}
+        p.as_group = on
+        await self._retile(p, seen_as)
+        if lk.enabled():
+            await self.send_to(p.uid, {"t": "lk", "livekit": lk.join_info(self.chat_id, int(self.lk_id(p.uid)), self.can_speak(p)),
+                                       "lkid": int(self.lk_id(p.uid))})
+
+    async def _skip_by_votes(self):
+        async with self._lock:
+            if self.votes and self.current and len(self.votes) >= max(1, (len(self.parts) + 1) // 2):
+                await self._next()
+
     async def _resume_after_idle(self):
         self._idle_paused = False
         if self._next_on_resume:  # (restored after a restart, and the song had ended meanwhile)
             self._next_on_resume = False
             if self.queue:
                 await self._start(self.queue.pop(0))
+            elif self.autoplay and self.recent:
+                spawn(self._autoplay_fill(self.recent[-1]))  # (autoplay was on: it carries on)
             return
         cur = self.current
         if not cur:
@@ -565,6 +599,8 @@ class Room:
             cut = now() - REJOIN_GRACE
             self._left = {k: v for k, v in self._left.items() if v[0] >= cut}
         self.votes.discard(p.uid)
+        if self.votes and self.current and len(self.votes) >= max(1, (len(self.parts) + 1) // 2):
+            spawn(self._skip_by_votes())  # (fewer people now: the votes already given may be enough)
         self._mic_flush(p)
         t = now()
         await db.x("UPDATE sessions SET left=?, last_seen=?, mic_secs=?, open=0 WHERE id=?",
@@ -642,7 +678,15 @@ class Room:
                 await self.kick(p.uid, "You left the group, so you were removed from its voice chat.")
             elif st["admin"] != p.admin:
                 p.admin = st["admin"]
+                if p.admin:
+                    # made an admin: whatever an admin did to them as a member (muted, listener) no longer holds
+                    p.force_muted, p.role = False, "speaker"
+                    self.sticky.pop(p.uid, None)
+                    await lk.set_publish(self.chat_id, self.lk_id(p.uid), True)
+                elif p.as_group:
+                    await self.set_as_group(p, False)  # appearing as the group is for admins only
                 await self.bcast_part(p)
+                await self.send_to(p.uid, {"t": "role", "admin": p.admin})
 
     async def kick(self, uid: int, reason: str = ""):
         p = self.parts.get(uid)
@@ -698,10 +742,14 @@ class Room:
             elif t == "mic":
                 await self.set_mic(p, bool(msg.get("on")))
             elif t == "hand":
+                if msg.get("up") and now() - getattr(p, "hand_at", 0) < 5:
+                    return  # (raising it again and again pinged every admin each time)
+                if msg.get("up"):
+                    p.hand_at = now()
                 p.hand = now() if msg.get("up") else 0
                 await self.bcast_part(p)
                 if p.hand:
-                    await self.broadcast({"t": "hand", "uid": p.uid, "name": p.name}, admins_only=True)
+                    await self.bcast_masked(p, {"t": "hand", "uid": p.uid, "name": self.shown_name(p)}, admins_only=True)
             elif t == "video":
                 p.video = bool(msg.get("on")) and self.can_speak(p)
                 await self.bcast_part(p)
@@ -766,6 +814,9 @@ class Room:
         ts = now()
         mid = await db.x("INSERT INTO messages(chat_id,uid,name,text,reply,ts,asg) VALUES(?,?,?,?,?,?,?)",
                          (self.chat_id, p.uid, name, text, json.dumps(reply) if reply else None, ts, int(p.as_group)))
+        if not p.as_group:  # messages go after 48 h; this count is what the weekly Chatterbox badge reads
+            await db.x("INSERT INTO chat_stats(chat_id,uid,day,n) VALUES(?,?,?,1) "
+                       "ON CONFLICT(chat_id,uid,day) DO UPDATE SET n=n+1", (self.chat_id, p.uid, int(ts // 86400)))
         m = {"id": mid, "uid": p.uid, "name": name, "photo": f"/api/avatar/{self.chat_id}" if p.as_group else p.photo, "text": text,
              "reply": reply, "reactions": {}, "ts": ts}
         if p.as_group:
@@ -781,8 +832,9 @@ class Room:
         emoji = msg.get("emoji")
         if emoji not in REACTIONS:
             return
-        for m in self.chat:
-            if m["id"] == msg.get("id"):
+        m = await self._message(msg.get("id"))
+        if m:
+            if True:
                 users = m["reactions"].setdefault(emoji, [])
                 me = self.pid(p.uid) if p.as_group else p.uid  # (as the group: the stand-in id, for everyone)
                 if me in users:
@@ -795,12 +847,34 @@ class Room:
                 await self.broadcast({"t": "react", "id": m["id"], "reactions": m["reactions"]})
                 return
 
+    async def _message(self, mid) -> dict | None:
+        """A chat message by id: the last 300 are in memory, older ones (up to 48 h) only in the database — reacting
+        to or deleting one of those used to do nothing."""
+        for m in self.chat:
+            if m["id"] == mid:
+                return m
+        try:
+            row = await db.q1("SELECT * FROM messages WHERE id=? AND chat_id=? AND ts>?", (int(mid), self.chat_id, now() - CHAT_KEEP))
+        except (TypeError, ValueError):
+            return None
+        if not row:
+            return None
+        return {"id": row["id"], "uid": row["uid"], "name": row["name"], "text": row["text"],
+                "reactions": json.loads(row["reactions"] or "{}"), "ts": row["ts"], "_old": True,
+                **({"asg": True} if row.get("asg") else {})}
+
     async def on_chat_delete(self, p: Participant, msg: dict):
-        for m in list(self.chat):
-            if m["id"] == msg.get("id") and (p.admin or self.is_mod(p) or m["uid"] == p.uid):
+        m = await self._message(msg.get("id"))
+        if not m:
+            return
+        author = self.parts.get(m["uid"])
+        author_admin = (author.admin if author else False) or m["uid"] in await tg.group_admins(self.chat_id)
+        # admins delete anything; moderators everything but the admins' messages; everyone their own
+        if p.admin or m["uid"] == p.uid or (self.is_mod(p) and not author_admin):
+            if not m.get("_old"):
                 self.chat.remove(m)
-                await db.x("DELETE FROM messages WHERE id=?", (m["id"],))
-                await self.broadcast({"t": "chat.del", "id": m["id"]})
+            await db.x("DELETE FROM messages WHERE id=?", (m["id"],))
+            await self.broadcast({"t": "chat.del", "id": m["id"]})
 
     async def on_sound(self, p: Participant, msg: dict):
         sid = msg.get("id")
@@ -833,7 +907,7 @@ class Room:
         reason = str(msg.get("reason", ""))[:300]
         await db.x("INSERT INTO reports(chat_id,uid,name,by_uid,by_name,reason,ts) VALUES(?,?,?,?,?,?,?)",
                    (self.chat_id, target.uid, target.name, p.uid, p.name, reason, now()))
-        flag = (f"Reported by {p.name}" + (f": {reason}" if reason else ""))[:120]
+        flag = (f"Reported by {self.shown_name(p)}" + (f": {reason}" if reason else ""))[:120]  # (moderators see flags)
         if flag not in target.flags:
             target.flags.append(flag)
             del target.flags[:-10]  # keep the latest few
@@ -1081,7 +1155,7 @@ class Room:
 
     async def _watch_loop(self, qid: int, vid: str):
         trimmed = False
-        for _ in range(2400):
+        while True:  # (as long as the song plays: it stopped after 2 hours, also for a song restored after a restart)
             await asyncio.sleep(3)
             async with self._lock:
                 cur = self.current
@@ -1152,16 +1226,22 @@ class Room:
                 | set(self._auto_names) | ({_song_key(self.current.get("title", ""))} if self.current else set())
             names.discard("")
             seeds = [seed] + [v for v in reversed(self.recent) if v != seed][:2]
+            fallback: list[dict] = []
             for sd in seeds:  # the related list can fail or come back empty: try the songs before it
                 try:
-                    rel = await music.related(sd, 50)
+                    got = await music.related(sd, 50)
                 except Exception as e:
                     log.info("autoplay lookup failed for %s: %s", sd, e)
                     continue
-                rel = [r for r in rel if r["id"] not in skip and _song_key(r["title"]) not in names
-                       and (not r["duration"] or r["duration"] < 900)]
+                ok = [r for r in got if not r["duration"] or r["duration"] < 900]
+                rel = [r for r in ok if r["id"] not in skip and _song_key(r["title"]) not in names]
+                # after hours of autoplay everything related may have played already: then songs not heard in the
+                # last little while are fine again (it used to just stop)
+                near = set(list(self.recent)[-30:]) | {q["id"] for q in self.queue} | ({self.current["id"]} if self.current else set())
+                fallback = fallback or [r for r in ok if r["id"] not in near and r["id"] not in self._bad]
                 if rel:
                     break
+            rel = rel or fallback
             top = rel[:8]
             random.shuffle(top)  # (shuffling a slice in place would shuffle a throwaway copy)
             rel = top + rel[8:]
@@ -1221,9 +1301,13 @@ class Room:
             if len([q for q in self.queue if self.mine(q, p)]) + len(items) > 200 and not admin:
                 return await self.toast(p.uid, "Queue limit reached")
             if len(self.queue) + len(items) > QUEUE_MAX:  # the whole queue goes to every phone on each change
-                items = items[:max(0, QUEUE_MAX - len(self.queue))]
-                if not items:
-                    return await self.toast(p.uid, f"The queue is full ({QUEUE_MAX} songs)")
+                if now_ or next_:
+                    items = items[:QUEUE_MAX]
+                    del self.queue[max(0, QUEUE_MAX - len(items)):]  # (play now / next: the queue's end makes room)
+                else:
+                    items = items[:max(0, QUEUE_MAX - len(self.queue))]
+                    if not items:
+                        return await self.toast(p.uid, f"The queue is full ({QUEUE_MAX} songs)")
             # No duplicates in the queue. "Play now" / "Play next" on a song that's already queued moves it instead.
             queued = {q["id"] for q in self.queue}
             if now_ or next_:
@@ -1355,6 +1439,9 @@ class Room:
                 it = self._item(last, None, by=last.get("by"))
                 if it:
                     it["byUid"] = last.get("byUid", 0)
+                    real = last.get("_real") or self._as_group_by.get(last.get("qid"))
+                    if real:  # (added as the group: who really did stays on the server)
+                        self._as_group_by[it["qid"]] = real
                     if self.current:
                         self._qid += 1
                         self.queue = [q for q in self.queue if q["id"] != self.current["id"]]
@@ -1442,7 +1529,8 @@ class Room:
 
     async def save_now(self):
         data = {"queue": self.queue, "current": self.current, "status": self.status, "pos": self.cur_pos(),
-                "at": now(), "loop": self.loop, "autoplay": self.autoplay, "fx": self.fx, "qid": self._qid}
+                "at": now(), "loop": self.loop, "autoplay": self.autoplay, "fx": self.fx, "qid": self._qid,
+                "recent": list(self.recent)[-30:], "asg_by": {str(k): v for k, v in self._as_group_by.items()}}
         try:
             await db.x("INSERT OR REPLACE INTO room_state(chat_id,data,ts) VALUES(?,?,?)",
                        (self.chat_id, _dumps(data), now()))
@@ -1453,6 +1541,9 @@ class Room:
         if not isinstance(data, dict):
             return
         self._qid = int(data.get("qid") or 0)
+        self.recent.extend(str(v) for v in (data.get("recent") or [])[-30:])
+        self._as_group_by.update({int(k): int(v) for k, v in (data.get("asg_by") or {}).items()
+                                  if str(k).isdigit() and str(v).lstrip("-").isdigit()})
         self.queue = [q for q in data.get("queue") or [] if isinstance(q, dict) and q.get("id")][:QUEUE_MAX]
         self.loop = data.get("loop") if data.get("loop") in ("off", "one", "all") else "off"
         self.autoplay = bool(data.get("autoplay"))
@@ -1470,7 +1561,7 @@ class Room:
                 # when someone comes
                 self.current = None
                 self.history.append(cur)
-                if self.queue:
+                if self.queue or self.autoplay:
                     self._idle_paused = self._next_on_resume = True
             if self.current:
                 # paused until someone is here; the first person in starts it again (see join)
@@ -1594,7 +1685,7 @@ class Room:
             await self.bcast_part(target)
         elif t == "admin.muteall":
             for q in list(self.parts.values()):
-                if not q.admin:
+                if not q.admin and not self.is_mod(q):  # (a moderator couldn't unmute themselves afterwards)
                     q.force_muted = True
                     if q.mic:
                         await self.set_mic(q, False)
@@ -1641,15 +1732,26 @@ class Room:
         elif t == "admin.unschedule":
             await db.x("DELETE FROM schedules WHERE id=? AND chat_id=?", (int(msg.get("id", 0)), self.chat_id))
         elif t == "rec.start":
-            if self.rec["on"]:
+            if self.rec["on"] and self.rec["by"] != p.uid:
                 return await self.toast(p.uid, "Already recording")
-            self.rec = {"on": True, "by": p.uid, "since": now(), "name": _clean_name(msg.get("name"))}
+            # (the same admin again: their app is still recording after its connection dropped — carry on)
+            try:
+                since = float(msg.get("since") or 0)
+            except (TypeError, ValueError):
+                since = 0.0
+            since = since if now() - 6 * 3600 < since <= now() else now()
+            self.rec = {"on": True, "by": p.uid, "since": since, "name": _clean_name(msg.get("name"))}
             await self.broadcast({"t": "room", "room": self.room_state()})
         elif t == "rec.name":
             if self.rec["on"] and self.rec["by"] == p.uid:
                 self.rec["name"] = _clean_name(msg.get("name"))
                 await self.broadcast({"t": "room", "room": self.room_state()})
         elif t == "rec.stop":
+            by = self.rec.get("by")
+            if self.rec["on"] and by != p.uid and by in self.parts:
+                # Someone else's recording: only they can stop it (their app holds it). Another admin "stopping"
+                # it only cleared the REC sign while it kept recording.
+                return await self.toast(p.uid, "Only the admin who started the recording can stop it")
             self.rec = {"on": False, "by": None, "since": 0, "name": ""}
             await self.broadcast({"t": "room", "room": self.room_state()})
 
@@ -1668,7 +1770,7 @@ async def get_room(chat_id: int) -> Room:
         return r
     g = await db.get_group(chat_id)
     rows = await db.q("SELECT * FROM messages WHERE chat_id=? AND ts>? ORDER BY id DESC LIMIT 300", (chat_id, now() - CHAT_KEEP))
-    plays = await db.q("SELECT vid, title, artist, duration, by_uid, by_name FROM plays WHERE chat_id=? "
+    plays = await db.q("SELECT vid, title, artist, duration, by_uid, by_name, asg FROM plays WHERE chat_id=? "
                        "ORDER BY id DESC LIMIT 20", (chat_id,))
     if chat_id in ROOMS:  # another request built it while we were reading the database
         return ROOMS[chat_id]
@@ -1688,8 +1790,11 @@ async def get_room(chat_id: int) -> Room:
                        "reply": json.loads(m["reply"]) if m["reply"] else None,
                        "reactions": json.loads(m["reactions"] or "{}"), "ts": m["ts"], **({"asg": True} if asg else {})})
     for pl in reversed(plays):
+        # (played as the group: "Previous" must not put the real id back on it for everyone to see)
         r.history.append({"id": pl["vid"], "title": pl["title"] or "", "artist": pl["artist"] or "",
-                          "duration": pl["duration"] or 0, "by": pl["by_name"] or "", "byUid": pl["by_uid"] or 0})
+                          "duration": pl["duration"] or 0, "by": pl["by_name"] or "",
+                          "byUid": pid_of(chat_id, pl["by_uid"]) if pl.get("asg") and pl["by_uid"] else (pl["by_uid"] or 0),
+                          **({"_real": pl["by_uid"]} if pl.get("asg") else {})})
     ROOMS[chat_id] = r
     return r
 
@@ -1711,9 +1816,29 @@ async def bg_tick_loop():
                         await c.send_text(tick)
 
 
+async def _tidy_db():
+    """Old rows nothing reads any more (these tables only grew)."""
+    t = now()
+    for sql, age in (("DELETE FROM listens WHERE ts<?", 120), ("DELETE FROM sessions WHERE joined<? AND open=0", 120),
+                     ("DELETE FROM plays WHERE ts<?", 400), ("DELETE FROM reports WHERE ts<? AND resolved=1", 90),
+                     ("DELETE FROM schedules WHERE at<? AND sent=1", 30)):
+        try:
+            await db.x(sql, (t - age * 86400,))
+        except Exception as e:
+            log.info("tidy: %s", e)
+    try:
+        await db.x("DELETE FROM chat_stats WHERE day<?", (int(t // 86400) - 30,))
+    except Exception as e:
+        log.info("tidy: %s", e)
+
+
 async def heartbeat_loop():
+    last_tidy = 0.0
     while True:
         await asyncio.sleep(60)
+        if now() - last_tidy > 6 * 3600:
+            last_tidy = now()
+            spawn(_tidy_db())
         try:
             await db.x("DELETE FROM messages WHERE ts<?", (now() - CHAT_KEEP,))
         except Exception:

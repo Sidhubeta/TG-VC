@@ -16,5 +16,6 @@ RUN mkdir -p web/vendor && curl -fsSL https://cdn.jsdelivr.net/npm/livekit-clien
 # Railway sets PORT. Mount a volume at /data to keep logs, playlists and the audio cache.
 ENV DATA_DIR=/data
 # yt-dlp is updated on every start (YouTube changes often), but never for more than 40 s: a slow PyPI used to
-# hold the start past Railway's health check.
-CMD ["sh", "-c", "timeout 40 pip install -U --quiet --disable-pip-version-check --root-user-action=ignore yt-dlp[default] || true; python -m app.main"]
+# hold the start past Railway's health check. "exec": Python takes the shell's place, so it gets Railway's stop
+# signal and saves the queue and the song before a redeploy (under sh it was killed without a chance to).
+CMD ["sh", "-c", "timeout 40 pip install -U --quiet --disable-pip-version-check --root-user-action=ignore yt-dlp[default] || true; exec python -m app.main"]

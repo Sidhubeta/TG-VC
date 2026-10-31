@@ -87,10 +87,12 @@ export const recorder = {
       } catch (e) { toast(e.message, 5000); offerDownload(blob, ext); }
     };
     mr.start(5000);
-    rec = { mr };
+    rec = { mr, since: Date.now() / 1000 };
     send({ t: 'rec.start' });
     toast('Recording started');
   },
+  // still recording here (the room may have lost track after the connection dropped for a while)
+  active: () => rec ? { since: rec.since } : null,
   stop(name = '') {
     recName = String(name || '').trim().slice(0, 60);
     if (!rec) return send({ t: 'rec.stop' });

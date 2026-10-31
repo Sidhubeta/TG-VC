@@ -1,7 +1,7 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
 import { $, S, actionRow, api, can, report, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
-import { musicInVoice, setMusicVoice } from './voice.js';
+import { musicInVoice, setMusicVoice, voiceDiag } from './voice.js';
 
 // ======================= engine =======================
 // The song plays from a plain <audio> element. It only goes through Web Audio (our effects graph) while an
@@ -225,9 +225,19 @@ function reportCaps() {
 // player, no Web Audio, no stream, no tap. Only the video (muted) follows the room's clock. If this phone's voice
 // isn't connected (or the server's music isn't there), the phone plays the music itself as before.
 const VOICE_LAG = 0.15; // the voice chat's own delay: the video waits for the sound by that much
-const viaVoice = () => !!P.voiceMode && musicInVoice();
-on('voice:music', () => { lastViaVoice = null; sync(true); });
-let lastViaVoice = null;
+// The voice chat's music can be gone for a moment: minimizing Telegram, the network, the voice chat joining again.
+// Starting the phone's own player at once made the song cut and jump (its position isn't the voice chat's), and
+// jump again when the voice music came back a second later. So for a few seconds the phone just waits for it.
+const VOICE_GRACE = 6000;
+let voiceGoneAt = 0, lastViaVoice = null;
+const viaVoice = () => {
+  if (!P.voiceMode) return false;
+  if (musicInVoice()) { voiceGoneAt = 0; return true; }
+  if (lastViaVoice !== true) return false;
+  if (!voiceGoneAt) { voiceGoneAt = Date.now(); setTimeout(() => sync(true), VOICE_GRACE + 50); }
+  return Date.now() - voiceGoneAt < VOICE_GRACE;
+};
+on('voice:music', (here) => { if (!here && lastViaVoice) { viaVoice(); return; } lastViaVoice = null; sync(true); });
 function voiceSync() {
   if (lastViaVoice !== true) {
     lastViaVoice = true;
@@ -382,7 +392,14 @@ const back = () => { G?.c.resume().catch(() => {}); if (WA.on) getCtx(); sync(tr
 // Minimized, the app's timers stop; the server then sends a small tick every few seconds, and each one runs the
 // player's checks (a song that failed to load in the background used to wait for the app to be opened again).
 const tellBg = () => send({ t: 'bg', on: document.hidden });
-on('ws:tick', () => { P.bgTicks = (P.bgTicks || 0) + 1; if (document.hidden && Date.now() - lastSync > 900) sync(); });
+on('ws:tick', () => {
+  P.bgTicks = (P.bgTicks || 0) + 1;
+  // the longest the app went without running while minimized (a phone that froze it shows a long gap here)
+  const now = Date.now();
+  if (document.hidden) { P.bgGap = Math.max(P.bgGap || 0, now - (P.bgLast || P.hiddenAt || now)); P.bgLast = now; }
+  if (document.hidden && Date.now() - lastSync > 900) sync();
+});
+document.addEventListener('freeze', () => { P.bgFrozen = (P.bgFrozen || 0) + 1; });
 on('ws:init', () => { if (document.hidden) tellBg(); });
 // An effect runs the song through Web Audio, and Android starves Web Audio while Telegram is minimized: the song
 // crackled. So minimized, the song moves to the plain player (without the effect) and the effect comes back when
@@ -465,12 +482,16 @@ document.addEventListener('visibilitychange', () => {
   tellBg();
   if (document.hidden) {
     P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false; P.radioPlayed = 0;
+    P.bgGap = 0; P.bgLast = 0; P.bgFrozen = 0; P.bgVia = viaVoice() ? 'voice' : WA.on ? 'webaudio' : 'player';
     effectsToBackground(); startRadio();
   } else {
     stopRadio(); effectsBack();
     // (for the logs: how a long time in the background went, so a phone that still stops can be told apart)
     const away = (Date.now() - (P.hiddenAt || Date.now())) / 1000;
-    if (away > 30 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${P.radioUsed ? Math.round(P.radioPlayed) + 's played' : 'no'} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
+    if (away > 30 && playing()) {
+      const gap = Math.max(P.bgGap || 0, Date.now() - (P.bgLast || P.hiddenAt || Date.now())) / 1000;
+      report('music-bg', `away=${Math.round(away)}s music=${P.bgVia}${P.bgVia === 'player' ? ` radio=${P.radioUsed ? Math.round(P.radioPlayed) + 's played' : 'no'}` : ''} ticks=${P.bgTicks || 0} longest-asleep=${Math.round(gap)}s${P.bgFrozen ? ` frozen=${P.bgFrozen}` : ''} ${voiceDiag()} fx=${!!G}`);
+    }
   }
   reportCaps();
   if (!document.hidden) return back();

@@ -250,6 +250,8 @@ async def api_radio(request: Request):
     room = ROOMS.get(chat_id)
     if not room or radio.busy():
         return Response("not available", status_code=503)
+    p = room.parts.get(uid)
+    request.state.who = f"{p.name if p else uid} ({uid})"
     return StreamingResponse(radio.stream(room, request), media_type="audio/mpeg",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 

@@ -604,6 +604,22 @@ async def prefetch(vid: str):
 _asked: dict[tuple[str, str], float] = {}  # (codec, quality) -> last asked for
 
 
+async def wait_cached(vid: str, timeout: float) -> bool:
+    """Wait (up to timeout) until the song's usual files are downloaded. True if they're on disk."""
+    try:
+        info = await resolve(vid)
+    except Exception:
+        return False
+    fmts = [f for f in (pick_audio(info, "aac", "medium"), pick_audio(info, "opus", "medium")) if f and cacheable(info, f)]
+    jobs = [_start_download(vid, f) for f in fmts if not os.path.exists(_cache_path(vid, f["id"]))]
+    if jobs:
+        try:
+            await asyncio.wait_for(asyncio.gather(*(asyncio.shield(j) for j in jobs), return_exceptions=True), timeout)
+        except asyncio.TimeoutError:
+            pass
+    return all(os.path.exists(_cache_path(vid, f["id"])) for f in fmts)
+
+
 def _start_download(vid: str, f: dict) -> asyncio.Task:
     key = f"{vid}_{f['id']}"
     t = _downloads.get(key)

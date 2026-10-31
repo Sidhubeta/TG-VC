@@ -417,6 +417,7 @@ function radioRetry() {
 }
 function stopRadio() {
   if (!P.radio) return;
+  P.radioPlayed = audio.currentTime; // (how much of the stream the phone really played, for the report)
   P.radio = null;
   P.loadedQid = null; P.loadedTrack = null; // the room's song again, at the room's position
   sync(true);
@@ -424,13 +425,13 @@ function stopRadio() {
 document.addEventListener('visibilitychange', () => {
   tellBg();
   if (document.hidden) {
-    P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false;
+    P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false; P.radioPlayed = 0;
     effectsToBackground(); startRadio();
   } else {
     stopRadio(); effectsBack();
     // (for the logs: how a long time in the background went, so a phone that still stops can be told apart)
     const away = (Date.now() - (P.hiddenAt || Date.now())) / 1000;
-    if (away > 90 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${!!P.radioUsed} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
+    if (away > 30 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${P.radioUsed ? Math.round(P.radioPlayed) + 's played' : 'no'} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
   }
   reportCaps();
   if (!document.hidden) return back();
@@ -452,9 +453,9 @@ function setBlocked(b) {
   else tapHint(false);
 }
 let hintTimer = null, hintEl = null;
-function tapHint(on) {
+function tapHint(on, text = 'Tap to hear the music', ic = 'vol-x') {
   if (on && !hintEl) {
-    hintEl = h('button', { class: 'tap-hint', onclick: () => unlockAudio() }, icon('vol-x'), 'Tap to hear the music');
+    hintEl = h('button', { class: 'tap-hint', onclick: () => unlockAudio() }, icon(ic), text);
     document.body.append(hintEl);
     requestAnimationFrame(() => hintEl?.classList.add('show'));
   } else if (!on && hintEl) {
@@ -536,6 +537,9 @@ function waEnter() {
     report('music-webaudio', 'on');
     setBlocked(false);
     sync();
+    // Web Audio plays without a tap, but can't go on in the background (the phone's player is still locked, so
+    // there's no stream to switch to when Telegram is minimized). One tap anywhere unlocks it: ask for it, gently.
+    setTimeout(() => { if (WA.on && !P.blocked) tapHint(true, 'Tap once to keep the music playing in the background', 'music'); }, 6000);
   };
   if (c.state === 'running') go();
   else c.resume().then(go, () => {});
@@ -625,7 +629,7 @@ function waGiveUp() {
 function waLeave() {
   if (WA.leaving) return;
   const s = WA.song;
-  if (!s || !playing() || P.localPaused || !audio.getAttribute('src') || P.loadedQid !== s.qid) { WA.on = false; waStopSong(); return; }
+  if (!s || !playing() || P.localPaused || !audio.getAttribute('src') || P.loadedQid !== s.qid) { WA.on = false; waStopSong(); tapHint(false); return; }
   WA.leaving = true;
   try { audio.currentTime = waPos(s) + 0.1; } catch {}
   audio.playbackRate = s.rate;
@@ -633,6 +637,7 @@ function waLeave() {
     WA.leaving = false;
     if (!WA.on) return;
     WA.on = false; audio.__ok = true;
+    tapHint(false);
     waStopSong(0.15);
     sync(true);
   }, () => { WA.leaving = false; if (WA.on && !audio.paused) audio.pause(); }); // not a real tap (a scroll): stay

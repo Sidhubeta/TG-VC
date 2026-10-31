@@ -976,6 +976,13 @@ class Room:
                     await self._skip_unplayable(qid, str(e))
                 return
         try:
+            # Wait a few seconds for the song's files (the usual two kinds: iPhone and Android) while it's
+            # "loading". Started before they were on disk, every phone pulled it from YouTube by itself, and an
+            # iPhone often heard nothing for the first 5–15 seconds.
+            await music.wait_cached(vid, 6)
+        except Exception:
+            pass
+        try:
             await music.prefetch(vid)  # make sure the download (and with it the silence check) has started
         except Exception:
             pass

@@ -838,7 +838,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-bg': 'Back from the background', 'music-radio': 'Background stream failed', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-bg': 'Back from the background (how it went)', 'music-radio': 'Background stream failed', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;

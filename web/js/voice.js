@@ -37,6 +37,9 @@ async function connect() {
     const mic = store.get('dev:audioinput', ''), out = store.get('dev:audiooutput', '');
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
+      // Mic off = mic released. A muted mic stayed open, and while a phone records it keeps all sound in "call"
+      // mode: the music came out of the call's speaker at the call's volume. Released, the music is media again.
+      stopMicTrackOnMute: true,
       audioCaptureDefaults: {
         echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
         ...(mic ? { deviceId: mic } : {}),

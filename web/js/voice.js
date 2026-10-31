@@ -21,6 +21,7 @@ async function loadSDK() {
 
 export async function startVoice(lk) {
   info = lk;
+  stopped = false; failN = 0; // (leaving stopped it for good: coming back from the page cache couldn't reconnect)
   if (!lk) { emit('voice', { state: 'off' }); return; }
   if (!(await loadSDK())) { toast('Voice could not load. Check your connection.'); emit('voice', { state: 'off' }); return; }
   await connect();
@@ -370,15 +371,17 @@ function applyVolume(p) {
 }
 export const getVolume = (uid) => volumes.get(uid) ?? 1;
 export const isMutedForMe = (uid) => mutedForMe.has(uid);
+// a tile's uid -> its LiveKit participant (someone appearing as the group is there under their stand-in id)
+const lkPart = (uid) => room?.remoteParticipants.get(String(S.parts.get(uid)?.lk ?? uid));
 export function setVolume(uid, v) {
   volumes.set(uid, v);
   store.set('vols', Object.fromEntries(volumes));
-  const p = room?.remoteParticipants.get(String(uid)); if (p) applyVolume(p);
+  const p = lkPart(uid); if (p) applyVolume(p);
 }
 export function toggleMuteForMe(uid) {
   mutedForMe.has(uid) ? mutedForMe.delete(uid) : mutedForMe.add(uid);
   store.set('mutedForMe', [...mutedForMe]);
-  const p = room?.remoteParticipants.get(String(uid)); if (p) applyVolume(p);
+  const p = lkPart(uid); if (p) applyVolume(p);
   return mutedForMe.has(uid);
 }
 export const getRoomVolume = () => roomVol;
@@ -414,6 +417,14 @@ export async function leaveVoice() {
   stopped = true; clearTimeout(retryTimer);
   const r = room; room = null; V.ready = false;
   try { await r?.disconnect(); } catch {}
+}
+// join again under another identity (switched to appearing as the group, or back)
+export async function restartVoice(lk) {
+  const was = V.mic;
+  await leaveVoice();
+  V.mic = V.cam = V.screen = false;
+  if (was) send({ t: 'mic', on: false });
+  await startVoice(lk);
 }
 
 // for the recorder

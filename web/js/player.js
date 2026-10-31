@@ -204,7 +204,8 @@ function shownVideoTime() {
 // Tell the room whether this phone blends songs. It moves on a few seconds early (crossfade) only when every
 // phone does; a phone that can't blend (iPhone, crossfade off, an effect on) would lose each song's last seconds.
 function reportCaps() {
-  const xf = crossfadeOn() && (WA.on || (canFade() && !!spare?.__ok));
+  // (minimized, the player switches songs without blending: then it can't, and the room mustn't cut the ends)
+  const xf = crossfadeOn() && (WA.on || (!document.hidden && canFade() && !!spare?.__ok));
   if (xf !== P.caps) { P.caps = xf; send({ t: 'caps', xfade: xf }); }
 }
 function sync(force = false) {
@@ -261,7 +262,8 @@ function sync(force = false) {
     // than silence, play the song without the effect on the plain player a tap already unlocked; the next tap
     // brings the effect back.
     P.gSleep ||= Date.now();
-    if (Date.now() - P.gSleep > 1500 && !tapped && spare?.__ok) {
+    // (not on an iPhone turned down: its plain player ignores the volume, the song would come at full blast)
+    if (Date.now() - P.gSleep > 1500 && !tapped && spare?.__ok && !(isApple && P.vol < 0.99)) {
       console.info('music: Web Audio is asleep, playing without the effect until the next tap');
       report('music-fx-asleep', `state=${G.c.state}`);
       P.gSleep = 0; releaseGraph(true); setBlocked(false);
@@ -357,20 +359,46 @@ function effectsToBackground() {
     try { a.currentTime = old.currentTime; } catch {}
     a.muted = false; a.volume = P.vol;
     audio = a; spare = null;
-    old.pause(); old.removeAttribute('src'); old.load();
+    old.pause();
     try { G.master.disconnect(); } catch {}
-    G = null; P.fxBg = true;
+    // the effect player and its graph are kept for the way back (both players stay unlocked: no tap needed)
+    P.fxBg = { el: old, g: G };
+    G = null;
     console.info('music: minimized, playing without the effect until the app is open again');
   }, () => { a.removeAttribute('src'); a.load(); a.muted = false; });
 }
 function effectsBack() {
-  if (!P.fxBg) return;
-  P.fxBg = false;
-  if (needGraph() && !G) { buildGraph(); G?.c.resume().catch(() => {}); }
+  const bg = P.fxBg;
+  if (!bg) return;
+  P.fxBg = null;
+  if (!needGraph() || G || WA.on) { bg.el.removeAttribute('src'); bg.el.load(); return; }
+  // Back on the effect player, and the plain one becomes the spare again (before, the spare was used up until
+  // the next tap, and with it this phone's crossfade for the whole room).
+  const plain = audio, el = bg.el, src = plain.getAttribute('src');
+  if (!src || plain.paused) { // (nothing playing right now: just make the graph the music's again)
+    try { bg.g.master.connect(bg.g.c.destination); } catch {}
+    G = bg.g; audio = el; if (src) { el.src = src; el.load(); } plain.removeAttribute('src'); plain.load(); spare = plain;
+    applyFx(); return;
+  }
+  el.src = src; el.playbackRate = plain.playbackRate;
+  try { el.currentTime = plain.currentTime + 0.2; } catch {}
+  try { bg.g.master.gain.value = 0; bg.g.master.connect(bg.g.c.destination); } catch {}
+  bg.g.c.resume().catch(() => {});
+  el.play().then(() => {
+    try { el.currentTime = plain.currentTime; } catch {}
+    G = bg.g; audio = el;
+    G.master.gain.setTargetAtTime(P.vol, G.c.currentTime, 0.03);
+    plain.pause(); plain.removeAttribute('src'); plain.load(); spare = plain;
+    applyFx();
+  }, () => { // the phone won't start it: stay on the plain player (no effect until the next change)
+    try { bg.g.master.disconnect(); } catch {}
+    el.removeAttribute('src'); el.load();
+  });
 }
 document.addEventListener('visibilitychange', () => {
   tellBg();
   if (document.hidden) effectsToBackground(); else effectsBack();
+  reportCaps();
   if (!document.hidden) return back();
   if (!G && !WA.on) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
 });

@@ -4,7 +4,7 @@ import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
   allowDeviceList, noiseStatus, screenSupported, setCam, setMic, setNoise, setRoomVolume, setScreen, setVolume, startVoice, toggleMuteForMe,
-  unblockAudio, useDevice,
+  restartVoice, unblockAudio, useDevice,
 } from './voice.js';
 import { recorder } from './recorder.js';
 import { startEmoji } from './emoji.js';
@@ -65,6 +65,13 @@ function bye() {
 }
 window.addEventListener('pagehide', bye);
 window.addEventListener('beforeunload', bye);
+// Back from the browser's page cache (the page was kept, not reloaded): we had said goodbye, so join again.
+window.addEventListener('pageshow', (e) => {
+  if (!e.persisted || !byeSent) return;
+  byeSent = false;
+  reconnectWS();
+  restartVoice(S.lk);
+});
 
 function goFullscreen() {
   try {
@@ -77,7 +84,9 @@ on('ws:init', (m) => {
   S.admin = m.admin; S.room = m.room; S.group = m.group;
   // appearing as the group: members know us by a stand-in id, and the voice uses it too
   S.pid = m.pid || null;
-  if (m.livekit) S.lk = m.livekit;
+  // the voice identity changed (switched to appearing as the group, or back): join the voice again under it
+  const lkChanged = !!m.livekit && m.lkid !== (S.lkid ?? S.uid);
+  if (m.livekit) { S.lk = m.livekit; S.lkid = m.lkid; }
   S.parts = new Map(m.parts.map(p => [p.uid, p]));
   // The server decides what we may read back: since we joined (admins: 48 hours). A quick reconnect keeps it;
   // leaving and joining again starts over.
@@ -89,6 +98,8 @@ on('ws:init', (m) => {
     started = true;
     startVoice(S.lk);
     bindDock();
+  } else if (lkChanged) {
+    restartVoice(S.lk);
   } else {
     // Reconnected after a longer drop: the room has us back with the mic off, but we may still be talking.
     // Tell it what we're really doing (before, we saw "You're live" and everyone else saw us muted).
@@ -103,6 +114,12 @@ on('ws:down', () => toast('Reconnecting…', 1500));
 on('ws:kicked', (m) => { closeWS(); emit('fatal', { title: m.ban ? 'Banned' : 'Removed', text: m.reason || (m.ban ? 'An admin banned you from this voice chat.' : 'An admin removed you from this voice chat.') }); });
 on('ws:locked', () => emit('fatal', { title: 'Locked', text: 'Admins locked this voice chat.' }));
 on('ws:toast', (m) => toast(m.text));
+// the room refused our mic (an admin muted us while we were away): it's off, whatever we thought
+on('ws:mic.denied', () => {
+  if (V.mic) setMic(false);
+  toast(S.parts.get(S.uid)?.forceMuted ? 'An admin muted you — raise your hand to speak' : 'You can’t speak right now — raise your hand');
+  renderDock();
+});
 on('ws:denied', (m) => denied(m.text)); // something you're not allowed to do: said in red
 
 // ======================= header =======================
@@ -180,7 +197,7 @@ function renderGrid(full = false) {
 }
 on('ws:p.join', (m) => {
   S.parts.set(m.p.uid, m.p); renderGrid(); renderHeader();
-  if (!document.hidden && S.room.settings?.join_sound !== false && store.get('joinSound', true)) joinSound();
+  if (!m.quiet && !document.hidden && S.room.settings?.join_sound !== false && store.get('joinSound', true)) joinSound();
 });
 on('ws:p.leave', (m) => {
   const t = tiles.get(m.uid);
@@ -188,7 +205,7 @@ on('ws:p.leave', (m) => {
   if (t) { t.classList.add('out'); setTimeout(() => { tiles.delete(m.uid); renderGrid(); }, 280); }
   renderHeader();
   removeVideo(m.uid);
-  if (!document.hidden && S.room.settings?.join_sound !== false && store.get('joinSound', true)) leaveSound();
+  if (!m.quiet && !document.hidden && S.room.settings?.join_sound !== false && store.get('joinSound', true)) leaveSound();
 });
 on('ws:p.upd', (m) => {
   const prev = S.parts.get(m.p.uid);

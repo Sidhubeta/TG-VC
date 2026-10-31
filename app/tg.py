@@ -114,6 +114,10 @@ async def remember_member(chat_id: int, user: dict | None):
     if time.time() - _seen.get(key, 0) < 300:
         return
     _seen[key] = time.time()
+    if len(_seen) > 20000:  # (only a "recently written" note: the old ones can go)
+        cut = time.time() - 300
+        for k in [k for k, t in _seen.items() if t < cut]:
+            _seen.pop(k, None)
     await db.x("INSERT OR REPLACE INTO members(chat_id,uid,name,username,seen) VALUES(?,?,?,?,?)",
                (chat_id, user["id"], _full_name(user)[:64], user.get("username") or "", time.time()))
 
@@ -175,14 +179,30 @@ async def alert_admins(chat_id: int, kind: str, text: str, every: int = 120):
             pass  # admin hasn't started the bot in private
 
 
+_member_calls: dict[tuple[int, int], asyncio.Task] = {}
+
+
 async def member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
     """Returns {'member': bool, 'admin': bool}. Cached for 60s."""
     if config.DEV_MODE and uid < 0:  # fake dev users
         return {"member": True, "admin": uid == -1, "name": f"Dev {abs(uid)}", "username": f"dev{abs(uid)}", "bot": False}
     key = (chat_id, uid)
     hit = _member_cache.get(key)
-    if hit and not fresh and time.time() - hit[0] < 60:
+    # "fresh" still accepts an answer from the last few seconds (opening the app asks several times at once)
+    if hit and time.time() - hit[0] < (3 if fresh else 60):
         return hit[1]
+    # Questions about the same person at the same moment share one Telegram call. When the cache ran out, a phone
+    # loading thumbnails, avatars and songs used to send dozens at once — and Telegram answers that with 429.
+    task = _member_calls.get(key)
+    if task is None:
+        task = _member_calls[key] = asyncio.get_running_loop().create_task(_member_lookup(chat_id, uid))
+        task.add_done_callback(lambda _t: _member_calls.pop(key, None))
+    return await asyncio.shield(task)
+
+
+async def _member_lookup(chat_id: int, uid: int) -> dict:
+    key = (chat_id, uid)
+    hit = _member_cache.get(key)
     try:
         m = await call("getChatMember", chat_id=chat_id, user_id=uid)
         st = m.get("status")
@@ -469,6 +489,9 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
         return path
     if os.path.exists(miss) and now - os.path.getmtime(miss) < 6 * 3600:
         return None
+    if len(_av_locks) > 2000:
+        for k in [k for k, lk in _av_locks.items() if not lk.locked()]:
+            _av_locks.pop(k, None)
     lock = _av_locks.setdefault(entity_id, asyncio.Lock())
     async with lock:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:

@@ -226,14 +226,21 @@ async def post(chat_id: int, thread_id: int | None = None, repin_only: bool = Fa
             await tg.call("pinChatMessage", chat_id=chat_id, message_id=mid, disable_notification=True)
             await refresh(chat_id, force=True)
             return mid
-        except Exception as e:
-            log.info("re-pin failed (%s), posting new", e)
-            # Without the "Pin messages" right the re-pin fails every time: each /vc added another bar. The old
-            # one goes, so there's only ever one.
-            try:
-                await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
-            except Exception:
-                pass
+        except tg.ApiError as e:
+            msg = str(e)
+            if "not found" in msg or "MESSAGE_ID_INVALID" in msg:
+                log.info("pinned bar is gone (%s), posting new", msg)
+            else:
+                # No "Pin messages" right (or another refusal): each /vc used to add another bar. Replace the old
+                # one if the bot may delete it; if not (older than 48 h, no delete right), keep it and just refresh
+                # it — the group gets a small JOIN message instead of a second bar.
+                log.info("re-pin refused (%s)", msg)
+                try:
+                    await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
+                except Exception:
+                    await refresh(chat_id, force=True)
+                    raise
+        # (network trouble and timeouts go up to the caller, which sends a plain JOIN message: the bar stays)
     people, n, sub = await _state(chat_id)
     img = await render(chat_id, people, n, sub)
     data = {"chat_id": str(chat_id), "caption": caption_for(n, sub), "parse_mode": "HTML",

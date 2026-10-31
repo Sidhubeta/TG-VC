@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS members(
 _conn.executescript(SCHEMA)
 for _sql in ("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''",
              "ALTER TABLE groups ADD COLUMN pin_msg INTEGER",
-             "ALTER TABLE groups ADD COLUMN pin_thread INTEGER"):
+             "ALTER TABLE groups ADD COLUMN pin_thread INTEGER",
+             # sent / played "as the group": kept, so it stays hidden after a restart too
+             "ALTER TABLE messages ADD COLUMN asg INTEGER DEFAULT 0",
+             "ALTER TABLE plays ADD COLUMN asg INTEGER DEFAULT 0"):
     try:
         _conn.execute(_sql)
     except sqlite3.OperationalError:

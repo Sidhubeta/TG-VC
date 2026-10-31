@@ -204,7 +204,12 @@ async def api_search(request: Request, uid, chat_id, st):
         title, tracks = await music.playlist(pl)
         return JSONResponse({"playlist": {"id": pl, "title": title, "tracks": tracks}})
     if vid:
-        info = await music.resolve(vid)
+        try:
+            info = await music.resolve(vid)
+        except Exception as e:
+            log.info("search link %s: %s", vid, e)
+            return err("This video is private, removed or not available" if music.unplayable(e)
+                       else "Couldn't look up that link right now — try again in a moment")
         return JSONResponse({"tracks": [info["track"]] if info.get("track") else []})
     return JSONResponse({"tracks": await music.search(q)})
 
@@ -304,13 +309,16 @@ async def api_history(request: Request, uid, chat_id, st):
     offset = max(0, int(_num(request.query_params.get("offset"), 0)))
     limit = max(10, min(100, int(_num(request.query_params.get("limit"), 50))))
     mine = request.query_params.get("mine") == "1"
-    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts FROM plays WHERE chat_id=?"
+    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts,asg FROM plays WHERE chat_id=?"
                       + (" AND by_uid=?" if mine else "") + " ORDER BY id DESC LIMIT ? OFFSET ?",
                       (chat_id, uid, limit + 1, offset) if mine else (chat_id, limit + 1, offset))
     more = len(rows) > limit
     rows = rows[:limit]
+    from .room import pid_of
     for r in rows:
         r["thumb"] = f"/api/thumb/{r['id']}"
+        if r.pop("asg", 0) and not st["admin"] and r["by_uid"] != uid:
+            r["by_uid"] = pid_of(chat_id, r["by_uid"])  # played as the group: members don't learn who it was
     return JSONResponse({"tracks": rows, "more": more, "next": offset + limit})
 
 
@@ -735,9 +743,14 @@ async def api_health(request: Request, uid, chat_id, st):
                   else "Public page (up to ~100 songs) · set SPOTIFY_CLIENT_ID / SECRET for more"})
     try:
         du = shutil.disk_usage(config.DATA_DIR)
-        cache = sum(os.path.getsize(os.path.join(music.CACHE_DIR, f)) for f in os.listdir(music.CACHE_DIR))
+        sizes = {".bin": 0, ".vbin": 0}
+        for f in os.listdir(music.CACHE_DIR):
+            ext = os.path.splitext(f)[1]
+            if ext in sizes:
+                sizes[ext] += os.path.getsize(os.path.join(music.CACHE_DIR, f))
         items.append({"name": "Storage", "ok": du.free > 300 * 1024 * 1024,
-                      "detail": f"{du.free // 2**20} MB free · song cache {cache // 2**20} MB of {config.AUDIO_CACHE_MB} MB"
+                      "detail": f"{du.free // 2**20} MB free · song cache {sizes['.bin'] // 2**20} of {config.AUDIO_CACHE_MB} MB"
+                      f" · video cache {sizes['.vbin'] // 2**20} of {config.VIDEO_CACHE_MB} MB"
                       + ("" if os.path.ismount(config.DATA_DIR) or config.DEV_MODE else " · no volume at /data: data is lost on redeploy")})
     except Exception as e:
         items.append({"name": "Storage", "ok": False, "detail": str(e)[:150]})
@@ -780,7 +793,7 @@ async def ws_endpoint(ws: WebSocket):
             conn.hits.append(t)
             if len(conn.hits) == conn.hits.maxlen and t - conn.hits[0] < 5:
                 continue  # flood protection
-            if len(raw) > 200_000:  # ("Add all" on a long playlist is a big message: 8000 cut it off at ~45 songs)
+            if len(raw) > 64_000:  # ("Add all": 200 songs are ~40 KB; 8000 cut it off at ~45 songs)
                 continue
             try:
                 msg = json.loads(raw)
@@ -811,7 +824,8 @@ async def api_bye(request: Request):
         for c in [c for c in p.conns if not cid or getattr(c, "cid", "") == cid]:
             await c.close(1000)
             await room.leave(c, at_once=True)
-        if not p.conns and room.parts.get(uid) is p and not cid:
+        if not p.conns and room.parts.get(uid) is p:
+            # the socket had already dropped (it's lingering): closing the app means gone now, not in 15 s
             await room._gone(p)
     return Response(status_code=204)
 
@@ -843,6 +857,10 @@ async def lifespan(app):
              asyncio.create_task(heartbeat_loop()), asyncio.create_task(pin.startup_reset()),
              asyncio.create_task(pin.countdown_loop()), asyncio.create_task(bg_tick_loop())]
     log.info("LiveKit %s", "enabled" if lk.enabled() else "NOT configured (voice disabled)")
+    try:
+        await asyncio.to_thread(music._trim_cache, False, True)  # (half-finished downloads from before a restart)
+    except Exception as e:
+        log.info("cache trim at start: %s", e)
     yield
     for r in list(ROOMS.values()):  # a deploy or restart: keep the queue and the song for when it's back
         await r.save_now()

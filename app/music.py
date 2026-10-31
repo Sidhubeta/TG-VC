@@ -478,9 +478,39 @@ def _fmt_path(vid: str, fmt: dict) -> str:
     return _cache_path(vid, fmt["id"], fmt["vcodec"] != "none")
 
 
+# Limits, so nobody can fill the disk (a 10-hour upload, or video asked for at 1080p): files bigger than this aren't
+# kept (they're streamed from YouTube as before), and nothing is cached while the disk is nearly full. When /data
+# fills up, the database stops too (logs, chat, playlists).
+MAX_AUDIO_FILE = 120 * 1024 * 1024
+MAX_VIDEO_FILE = 300 * 1024 * 1024
+MIN_FREE = 600 * 1024 * 1024
+
+
+def _disk_free() -> int:
+    try:
+        import shutil
+        return shutil.disk_usage(CACHE_DIR).free
+    except OSError:
+        return 1 << 40
+
+
+def cacheable(info: dict, fmt: dict) -> bool:
+    video = fmt["vcodec"] != "none"
+    dur = ((info.get("track") or {}).get("duration")) or 0
+    if video and (fmt.get("height") or 0) > 720:
+        return False
+    if dur and dur > (20 * 60 if video else 60 * 60):
+        return False
+    if _disk_free() < MIN_FREE:
+        _trim_cache(squeeze=True)
+        return _disk_free() >= MIN_FREE
+    return True
+
+
 async def _download(vid: str, fmt: dict, retry: bool = True):
     path = _fmt_path(vid, fmt)
     tmp = path + ".part"
+    limit = MAX_VIDEO_FILE if fmt["vcodec"] != "none" else MAX_AUDIO_FILE
     try:
         pos = 0
         with open(tmp, "wb") as fh:
@@ -492,8 +522,10 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
                     raise _Expired()
                 if r.status_code not in (200, 206):
                     raise RuntimeError(f"status {r.status_code}")
-                fh.write(r.content)
                 total = int(r.headers.get("content-range", "/0").split("/")[-1] or 0)
+                if (total or 0) > limit or pos + len(r.content) > limit:
+                    raise RuntimeError(f"too big to keep ({max(total, pos) // 2**20} MB)")
+                fh.write(r.content)
                 pos += len(r.content)
                 if r.status_code == 200 or not r.content or (total and pos >= total):
                     break
@@ -521,16 +553,30 @@ class _Expired(Exception):
     pass
 
 
-def _trim_cache():
+def _trim_cache(squeeze: bool = False, startup: bool = False):
+    """Keep the cache in its limits. squeeze: the disk is nearly full, keep only half."""
+    # downloads that died (a crash, a restart) leave .part files: they count for nothing and are removed
+    for f in os.listdir(CACHE_DIR):
+        if f.endswith(".part"):
+            fp = os.path.join(CACHE_DIR, f)
+            try:
+                if startup or time.time() - os.path.getmtime(fp) > 1800:  # (at start nothing is downloading)
+                    os.remove(fp)
+            except OSError:
+                pass
     # songs and videos have their own room, so a few videos can't push every song out
     for ext, mb in ((".bin", config.AUDIO_CACHE_MB), (".vbin", config.VIDEO_CACHE_MB)):
         files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(ext)]
         files.sort(key=os.path.getmtime)
         total = sum(os.path.getsize(f) for f in files)
-        while files and total > mb * 1024 * 1024:
+        cap = mb * 1024 * 1024 // (2 if squeeze else 1)
+        while files and total > cap:
             f = files.pop(0)
-            total -= os.path.getsize(f)
-            os.remove(f)
+            try:
+                total -= os.path.getsize(f)
+                os.remove(f)
+            except OSError:
+                pass
 
 
 async def prefetch(vid: str):
@@ -540,9 +586,11 @@ async def prefetch(vid: str):
     except Exception as e:
         log.info("prefetch resolve failed %s: %s", vid, e)
         return
-    for codec in ("aac", "opus"):
-        f = pick_audio(info, codec, "medium")
-        if not f:
+    # medium for both kinds of phones, plus any other quality listeners picked lately (High / Data saver)
+    wanted = {("aac", "medium"), ("opus", "medium")} | {k for k, t in _asked.items() if time.time() - t < 3600}
+    for codec, q in sorted(wanted):
+        f = pick_audio(info, codec, q)
+        if not f or not cacheable(info, f):
             continue
         key = f"{vid}_{f['id']}"
         if os.path.exists(_cache_path(vid, f["id"])):
@@ -551,6 +599,9 @@ async def prefetch(vid: str):
         if key in _downloads:
             continue
         _start_download(vid, f)
+
+
+_asked: dict[tuple[str, str], float] = {}  # (codec, quality) -> last asked for
 
 
 def _start_download(vid: str, f: dict) -> asyncio.Task:
@@ -566,12 +617,14 @@ _served_as: dict[tuple[str, str], str] = {}  # (song, format asked for) -> forma
 
 
 def _cached_alternative(info: dict, vid: str, fmt: dict) -> dict | None:
-    """Another quality of the same kind of audio that's already on disk (the cache holds "medium")."""
+    """Another quality of the same kind of audio that's already on disk — never a bigger one (Data saver must
+    not cost more data); a smaller one stands in for High until High is cached itself."""
     opus = "opus" in fmt["acodec"] or fmt["ext"] == "webm"
-    same = [f for f in info["formats"] if f["vcodec"] == "none" and f["acodec"] != "none"
-            and ("opus" in f["acodec"] or f["ext"] == "webm") == opus and os.path.exists(_cache_path(vid, f["id"]))]
     want = fmt["abr"] or fmt["tbr"] or 0
-    return min(same, key=lambda f: abs((f["abr"] or f["tbr"] or 0) - want)) if same else None
+    same = [f for f in info["formats"] if f["vcodec"] == "none" and f["acodec"] != "none"
+            and ("opus" in f["acodec"] or f["ext"] == "webm") == opus and os.path.exists(_cache_path(vid, f["id"]))
+            and (f["abr"] or f["tbr"] or 0) <= want * 1.1]
+    return max(same, key=lambda f: f["abr"] or f["tbr"] or 0) if same else None
 
 
 # ---- silence at the start / end of songs -----------------------------------------------------------------
@@ -662,13 +715,17 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         return Response("no format", status_code=404)
     path = _fmt_path(vid, fmt)
     key = (vid, fmt["id"])
-    if kind == "video" and not os.path.exists(path) and config.VIDEO_CACHE_MB > 0:
+    if kind == "audio":
+        _asked[(codec if codec in ("aac", "opus") else "aac", quality if quality in ("low", "medium", "high") else "medium")] = time.time()
+    if kind == "video" and not os.path.exists(path) and config.VIDEO_CACHE_MB > 0 and cacheable(info, fmt):
         # Videos are cached too (each viewer used to pull the whole video from YouTube). The download runs in the
         # background; until it's done this request goes to YouTube as before (same file, so pieces always match).
         _start_download(vid, fmt)
     if kind == "audio" and key in _served_as:
+        # Pieces of this song were served from that format before: keep to it. If its file has left the cache
+        # meanwhile, the same format comes from YouTube (the same bytes) instead of another file.
         sub = [f for f in info["formats"] if f["id"] == _served_as[key]]
-        if sub and os.path.exists(_cache_path(vid, sub[0]["id"])):
+        if sub:
             fmt, path = sub[0], _cache_path(vid, sub[0]["id"])
     elif kind == "audio" and not os.path.exists(path):
         # Not on disk yet. Every listener used to pull the song from YouTube on their own until the whole file was
@@ -681,11 +738,12 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
             fmt, path = alt, _cache_path(vid, alt["id"])
         else:
             _served_as[key] = fmt["id"]
-            try:
-                # (under 4 s: a phone waiting longer than that for its first bytes reloads the song)
-                await asyncio.wait_for(asyncio.shield(_start_download(vid, fmt)), 3)
-            except Exception:
-                pass
+            if cacheable(info, fmt):
+                try:
+                    # (under 4 s: a phone waiting longer than that for its first bytes reloads the song)
+                    await asyncio.wait_for(asyncio.shield(_start_download(vid, fmt)), 3)
+                except Exception:
+                    pass
         while len(_served_as) > 3000:
             _served_as.pop(next(iter(_served_as)))
     if os.path.exists(path):

@@ -86,7 +86,13 @@ function resetLocal() {
   if (was) emit('voice:local');
 }
 
-const uidOf = (p) => Number(p.identity);
+// LiveKit identity -> uid. Someone appearing as the group joins the voice under a stand-in id (their tile says
+// which, in "lk"); everyone else under their Telegram id.
+const uidOf = (p) => {
+  const id = Number(p.identity);
+  for (const q of S.parts.values()) if (q.lk === id) return q.uid;
+  return id;
+};
 function videoEvent(pub, p, on) {
   const local = p === room?.localParticipant;
   emit('voice:video', { uid: local ? S.uid : uidOf(p), track: pub.track, source: pub.source, on: on && !!pub.track, local });

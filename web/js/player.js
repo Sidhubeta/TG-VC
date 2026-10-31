@@ -75,6 +75,8 @@ const rate = () => S.music?.rate || 1;
 let G = null; // WebAudio graph
 
 const cur = () => S.music?.current || null;
+// a song I added (as the group, songs carry my stand-in id)
+const mine = (t) => !!t && (t.byUid === S.uid || (!!S.pid && t.byUid === S.pid));
 const playing = () => S.music?.status === 'playing';
 const loadingSong = () => S.music?.status === 'loading'; // the server is still finding the stream: the song starts at 0 once it's ready
 // video is on when someone turned it on for this song (and you didn't switch back), or you turned it on for you
@@ -341,8 +343,34 @@ const back = () => { G?.c.resume().catch(() => {}); if (WA.on) getCtx(); sync(tr
 const tellBg = () => send({ t: 'bg', on: document.hidden });
 on('ws:tick', () => { if (document.hidden && Date.now() - lastSync > 900) sync(); });
 on('ws:init', () => { if (document.hidden) tellBg(); });
+// An effect runs the song through Web Audio, and Android starves Web Audio while Telegram is minimized: the song
+// crackled. So minimized, the song moves to the plain player (without the effect) and the effect comes back when
+// the app is opened again. The plain player takes over only once it really plays; if the phone won't let it, the
+// song stays on the effect.
+function effectsToBackground() {
+  if (!G || tapped || isApple || WA.on || !spare?.__ok || audio.paused || !audio.getAttribute('src') || isSilence(audio)) return;
+  const old = audio, a = spare, src = old.getAttribute('src');
+  a.muted = true; a.src = src; a.playbackRate = old.playbackRate;
+  try { a.currentTime = old.currentTime + 0.25; } catch {}
+  a.play().then(() => {
+    if (audio !== old || !G || !document.hidden) { a.pause(); a.removeAttribute('src'); a.load(); a.muted = false; return; }
+    try { a.currentTime = old.currentTime; } catch {}
+    a.muted = false; a.volume = P.vol;
+    audio = a; spare = null;
+    old.pause(); old.removeAttribute('src'); old.load();
+    try { G.master.disconnect(); } catch {}
+    G = null; P.fxBg = true;
+    console.info('music: minimized, playing without the effect until the app is open again');
+  }, () => { a.removeAttribute('src'); a.load(); a.muted = false; });
+}
+function effectsBack() {
+  if (!P.fxBg) return;
+  P.fxBg = false;
+  if (needGraph() && !G) { buildGraph(); G?.c.resume().catch(() => {}); }
+}
 document.addEventListener('visibilitychange', () => {
   tellBg();
+  if (document.hidden) effectsToBackground(); else effectsBack();
   if (!document.hidden) return back();
   if (!G && !WA.on) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
 });
@@ -860,7 +888,7 @@ function togglePlay() {
 function next() {
   haptic('medium');
   const t = cur(); if (!t) return;
-  if ((t.byUid === S.uid && can('skip_own')) || can('playback')) send({ t: 'music.skip' });
+  if ((mine(t) && can('skip_own')) || can('playback')) send({ t: 'music.skip' });
   else if (can('vote')) { send({ t: 'music.voteskip' }); toast('Voted to skip'); }
   else deny('vote');
 }
@@ -990,7 +1018,7 @@ export function refresh() {
   if (pp.getAttribute('aria-label') !== (isPlay ? 'Pause' : 'Play')) { pp.replaceChildren(icon(isPlay ? 'pause' : 'play', 'fill')); pp.setAttribute('aria-label', isPlay ? 'Pause' : 'Play'); }
   el.querySelector('#np-prev').classList.toggle('locked', !can('playback'));
   const v = S.music;
-  el.querySelector('#np-votes').textContent = !can('playback') && t.byUid !== S.uid && v.votes ? `${v.votes}/${v.need}` : '';
+  el.querySelector('#np-votes').textContent = !can('playback') && !mine(t) && v.votes ? `${v.votes}/${v.need}` : '';
   el.querySelector('#np-scrub').classList.toggle('ro', !can('playback'));
   el.querySelector('#np-like').classList.toggle('on', S.liked.has(t.id));
   const lk = el.querySelector('#np-like'), liked = S.liked.has(t.id) ? '1' : '0';
@@ -1006,6 +1034,7 @@ let lastQid = null, lastTimeline = '', lastFx = '';
 on('ws:music', (m) => onMusic(m.m));
 on('ws:init', (m) => { P.caps = null; onMusic(m.music); reportCaps(); }); // (a new connection starts as "can't blend")
 function onMusic(m) {
+  if (m.queueSame) m.queue = S.music?.queue || []; // (the server leaves the queue out when it didn't change)
   S.music = m;
   const t = m.current;
   if (t && t.qid === P.loadedQid) P.loadedTrack = t; // keep what we know about the playing song fresh (start/end arrive later)
@@ -1102,12 +1131,12 @@ function renderQueue(st) {
   st.append(box);
 }
 function queueMenu(t, i) {
-  const mine = t.byUid === S.uid;
+  const own = mine(t);
   const body = h('div', { class: 'list' },
     actionRow('play', 'Play now', () => { if (!can('queue')) return deny('queue'); send({ t: 'music.playnow', qid: t.qid }); s.close(); }, can('queue') ? '' : 'locked'),
     i > 0 ? actionRow('up', 'Move to top', () => { if (!can('queue')) return deny('queue'); send({ t: 'music.move', qid: t.qid, to: 0 }); s.close(); }, can('queue') ? '' : 'locked') : null,
     actionRow('list-plus', 'Add to a playlist', () => { s.close(); addToPlaylist([t]); }),
-    actionRow('trash', 'Remove from queue', () => { if (!(mine || can('queue'))) return deny('queue'); send({ t: 'music.remove', qid: t.qid }); s.close(); }, mine || can('queue') ? 'red' : 'red locked'));
+    actionRow('trash', 'Remove from queue', () => { if (!(own || can('queue'))) return deny('queue'); send({ t: 'music.remove', qid: t.qid }); s.close(); }, own || can('queue') ? 'red' : 'red locked'));
   const s = sheet({ title: t.title, body });
 }
 
@@ -1206,7 +1235,7 @@ async function openQuality() {
 
 // ======================= effects sheet =======================
 // Everyone hears the same effect. Only admins, or whoever added the playing song, can change it.
-const canFx = () => can('fx') || (!!cur() && cur().byUid === S.uid && can('fx_own'));
+const canFx = () => can('fx') || (!!cur() && mine(cur()) && can('fx_own'));
 function openFx() {
   unlockAudio();
   const body = h('div');

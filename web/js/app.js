@@ -75,6 +75,9 @@ function goFullscreen() {
 let started = false;
 on('ws:init', (m) => {
   S.admin = m.admin; S.room = m.room; S.group = m.group;
+  // appearing as the group: members know us by a stand-in id, and the voice uses it too
+  S.pid = m.pid || null;
+  if (m.livekit) S.lk = m.livekit;
   S.parts = new Map(m.parts.map(p => [p.uid, p]));
   // The server decides what we may read back: since we joined (admins: 48 hours). A quick reconnect keeps it;
   // leaving and joining again starts over.
@@ -641,7 +644,7 @@ function msgEl(m) {
 function reactsEl(m) {
   const e = Object.entries(m.reactions || {});
   if (!e.length) return null;
-  return h('div', { class: 'reacts' }, ...e.map(([em, us]) => h('button', { class: us.includes(S.uid) ? 'mine' : '', onclick: (ev) => { ev.stopPropagation(); send({ t: 'react', id: m.id, emoji: em }); } }, em, String(us.length))));
+  return h('div', { class: 'reacts' }, ...e.map(([em, us]) => h('button', { class: us.includes(S.uid) || (S.pid && us.includes(S.pid)) ? 'mine' : '', onclick: (ev) => { ev.stopPropagation(); send({ t: 'react', id: m.id, emoji: em }); } }, em, String(us.length))));
 }
 function msgMenu(m) {
   haptic('light');
@@ -734,7 +737,7 @@ function adminRoom(c) {
   // the recording section follows the room state (start / rename / stop) without redrawing the whole tab
   const drawRec = () => {
     const rec = S.room.rec || {};
-    const mine = rec.on && rec.by === S.uid;
+    const mine = rec.on && (rec.by === S.uid || (S.pid && rec.by === S.pid));
     const name = h('input', { class: 'field', maxlength: 60, placeholder: 'Recording name (optional)', value: rec.name || '' });
     name.addEventListener('change', () => send({ t: 'rec.name', name: name.value }));
     recBox.replaceChildren(

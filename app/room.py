@@ -117,6 +117,12 @@ def _device(ua: str) -> str:
     return f"{os_} {ver} {app}".replace("  ", " ").strip()
 
 
+def pid_of(chat_id: int, uid: int) -> int:
+    """Stand-in id for someone appearing as the group: the same every time (their reactions stay theirs), never a
+    real Telegram id or chat id, and not something a member can turn back into the person."""
+    return -(10 ** 13 + int(auth._hmac(f"pid:{chat_id}:{uid}", 12), 16) % 10 ** 12)
+
+
 def _dumps(msg: dict) -> str:
     # allow_nan=False: a NaN (or Infinity) would reach the phones as bare NaN, which their JSON.parse rejects, and
     # every music update after it was dropped. Numbers are cleaned where they come in; this makes sure.
@@ -250,6 +256,11 @@ class Room:
         self._bad: deque[str] = deque(maxlen=200)       # songs that couldn't be played (skipped)
         self._load_seek: int | None = None              # qid that was seeked while still loading
         self.last_active = now()
+        self._qsig: tuple | None = None                 # the queue as last sent to everyone
+        self._gave_up: dict[int, set[int]] = {}         # qid -> people whose phone gave up on that song
+        self._probing: set[int] = set()
+        self._auto_skips: list[float] = []              # when songs were skipped because nobody could play them
+        self._block_told = 0.0
 
     # ---------------- helpers -----------------
     def is_mod(self, p: Participant | None) -> bool:
@@ -275,13 +286,41 @@ class Room:
     def staff(self, q: Participant) -> bool:
         return q.admin or self.is_mod(q)
 
-    def pub(self, p: Participant, for_admin: bool, mod_view: bool = False) -> dict:
-        d = {"uid": p.uid, "name": p.name, "username": p.username, "photo": p.photo, "bio": p.bio, "admin": p.admin,
+    # ---- someone appearing "as the group" (admins only) ----
+    # Members must not learn who it is. Everything a member's phone gets about them carries a stand-in id instead
+    # of the Telegram id: their tile, chat messages, reactions, sounds, leaving, and their LiveKit identity.
+    def pid(self, uid: int) -> int:
+        return pid_of(self.chat_id, uid)
+
+    def masked(self, p: Participant | None, viewer: Participant | None) -> bool:
+        return bool(p and p.as_group and not (viewer and (viewer.admin or viewer.uid == p.uid)))
+
+    def vis_uid(self, p: Participant, viewer: Participant | None) -> int:
+        return self.pid(p.uid) if self.masked(p, viewer) else p.uid
+
+    def real_uid(self, uid) -> int:
+        """A uid sent by a phone: the stand-in id of someone appearing as the group means them."""
+        try:
+            uid = int(uid or 0)
+        except (TypeError, ValueError):
+            return 0
+        if uid in self.parts:
+            return uid
+        return next((q.uid for q in self.parts.values() if q.as_group and self.pid(q.uid) == uid), uid)
+
+    def lk_id(self, uid: int) -> str:
+        p = self.parts.get(uid)
+        return str(self.pid(uid) if p and p.as_group else uid)
+
+    def pub(self, p: Participant, for_admin: bool, mod_view: bool = False, viewer_uid: int | None = None) -> dict:
+        hide = p.as_group and not for_admin and viewer_uid != p.uid
+        d = {"uid": self.pid(p.uid) if hide else p.uid, "name": p.name, "username": p.username, "photo": p.photo, "bio": p.bio, "admin": p.admin,
              "role": p.role, "mic": p.mic, "forceMuted": p.force_muted, "canSpeak": self.can_speak(p),
              "hand": p.hand, "video": p.video, "screen": p.screen, "joined": p.joined, "asGroup": p.as_group,
              "mod": self.is_mod(p)}
         if p.as_group:
-            d.update(name=self.group_title, username="", photo=f"/api/avatar/{self.chat_id}", bio="")
+            d.update(name=self.group_title, username="", photo=f"/api/avatar/{self.chat_id}", bio="",
+                     lk=self.pid(p.uid))  # (their LiveKit identity, for matching their voice to their tile)
             if for_admin:
                 d["realName"] = p.name
         if for_admin or mod_view:
@@ -291,10 +330,19 @@ class Room:
     def chat_view(self, m: dict, viewer: Participant) -> dict:
         if not m.get("asg") or viewer.admin or viewer.uid == m["uid"]:
             return m
-        return {**m, "uid": self.chat_id}
+        return {**m, "uid": self.pid(m["uid"])}
 
     def pub_for(self, p: Participant, viewer: Participant) -> dict:
-        return self.pub(p, viewer.admin, self.is_mod(viewer))
+        return self.pub(p, viewer.admin, self.is_mod(viewer), viewer.uid)
+
+    async def bcast_masked(self, p: Participant, msg: dict):
+        """A message with p's uid in it: members get the stand-in id if p appears as the group."""
+        if not p.as_group:
+            return await self.broadcast(msg)
+        for q in list(self.parts.values()):
+            m = {**msg, "uid": self.vis_uid(p, q)}
+            for c in list(q.conns):
+                await c.send(m)
 
     async def send_to(self, uid: int, msg: dict):
         p = self.parts.get(uid)
@@ -315,14 +363,21 @@ class Room:
         for q in list(self.parts.values()):
             if t == "p.join" and q.uid == p.uid:
                 continue
-            key = (q.admin, self.is_mod(q))
+            key = (q.admin, self.is_mod(q), q.uid if q.uid == p.uid else None)
             if key not in views:
                 views[key] = _dumps({"t": t, "p": self.pub(p, *key)})
             for c in list(q.conns):
                 await c.send_text(views[key])
 
     def room_state(self) -> dict:
-        return {"settings": self.settings, "rec": self.rec, "count": len(self.parts)}
+        rec = self.rec
+        if rec.get("by") and (q := self.parts.get(rec["by"])) and q.as_group:
+            rec = {**rec, "by": self.pid(q.uid)}  # (recording as the group: the stand-in id)
+        return {"settings": self.settings, "rec": rec, "count": len(self.parts)}
+
+    def mine(self, item: dict | None, p: Participant) -> bool:
+        """Did p add this song (under their own id, or the stand-in one when they appear as the group)?"""
+        return bool(item) and item.get("byUid") in (p.uid, self.pid(p.uid))
 
     def music_state(self) -> dict:
         need = max(1, (len(self.parts) + 1) // 2)
@@ -331,7 +386,15 @@ class Room:
                 "need": need, "fx": self.fx, "rate": self.fx["rate"], "xfade": XFADE}
 
     async def push_music(self):
-        await self.broadcast({"t": "music", "m": self.music_state(), "now": now()})
+        # The queue goes out only when it changed. Most updates (a vote, the song's silence info, crossfade being
+        # set up every few seconds) used to carry the whole queue — up to hundreds of songs — to every phone.
+        st = self.music_state()
+        sig = tuple((q["qid"], q.get("title"), q.get("duration")) for q in self.queue)
+        if sig == self._qsig:
+            st.pop("queue")
+            st["queueSame"] = True
+        self._qsig = sig
+        await self.broadcast({"t": "music", "m": st, "now": now()})
         # whatever is next now (after a move, play now, shuffle, remove…) starts downloading, so it can start
         # straight away and crossfade
         nxt = self.queue[0]["id"] if self.queue else ""
@@ -381,7 +444,7 @@ class Room:
         if self._idle:
             self._idle.cancel()
             self._idle = None
-        everyone = [self.pub(q, admin, self.is_mod(p)) for q in self.parts.values()]
+        everyone = [self.pub(q, admin, self.is_mod(p), uid) for q in self.parts.values()]
         # Messages pop up and disappear, like Telegram's voice chat. Everyone can read back what was said since
         # they joined (leaving and coming back starts over); admins can read back the last 48 hours.
         since = now() - CHAT_KEEP if admin else max(p.chat_since, now() - CHAT_KEEP)
@@ -390,7 +453,12 @@ class Room:
                          "admin": admin,
                          "group": self.group_title,
                          # a fresh session: one opened 12 hours ago would otherwise expire (and the song links with it)
-                         "session": auth.make_session(uid, self.chat_id)})
+                         "session": auth.make_session(uid, self.chat_id),
+                         **({"pid": self.pid(uid)} if p.as_group else {}),
+                         # appearing as the group: a LiveKit token under the stand-in id (the one from login has
+                         # the real one)
+                         **({"livekit": lk.join_info(self.chat_id, self.pid(uid), self.can_speak(p))}
+                            if p.as_group and lk.enabled() else {})})
         if first:
             await self.bcast_part(p, "p.join")
             await self.broadcast({"t": "room", "room": self.room_state()})
@@ -447,7 +515,7 @@ class Room:
                    (t, t, p.mic_secs, p.session_id))
         if self.rec["on"] and self.rec["by"] == p.uid:
             self.rec = {"on": False, "by": None, "since": 0, "name": ""}
-        await self.broadcast({"t": "p.leave", "uid": p.uid})
+        await self.bcast_masked(p, {"t": "p.leave", "uid": p.uid})
         await self.broadcast({"t": "room", "room": self.room_state()})
         pin.schedule(self.chat_id)
         if not self.parts and not self._idle:
@@ -527,8 +595,9 @@ class Room:
         await self.send_to(uid, {"t": "kicked", "ban": False, "reason": reason})
         for c in list(p.conns):
             await c.close(4003)
+        ident = self.lk_id(uid)
         await self._gone(p)
-        await lk.remove(self.chat_id, uid)
+        await lk.remove(self.chat_id, ident)
 
     # ---------------- message router -----------------
     async def handle(self, conn: Conn, msg: dict):
@@ -562,6 +631,14 @@ class Room:
                             cur, self.status)
                 DIAG.append({"ts": now(), "chat": self.chat_id, "uid": p.uid, "name": p.name, "device": device,
                              "kind": kind, "detail": detail})
+                cur_ = self.current
+                if kind == "music-gaveup" and cur_ and f"song={cur_['id']}" in detail and self.status == "playing":
+                    gave = self._gave_up.setdefault(cur_["qid"], set())
+                    gave.add(p.uid)
+                    listening = len([q for q in self.parts.values() if q.conns])
+                    if len(gave) >= max(1, (listening + 1) // 2) and cur_["qid"] not in self._probing:
+                        self._probing.add(cur_["qid"])
+                        spawn(self._check_dead_song(cur_["qid"], cur_["id"]))
             elif t == "mic":
                 await self.set_mic(p, bool(msg.get("on")))
             elif t == "hand":
@@ -651,12 +728,13 @@ class Room:
         for m in self.chat:
             if m["id"] == msg.get("id"):
                 users = m["reactions"].setdefault(emoji, [])
-                if p.uid in users:
-                    users.remove(p.uid)
+                me = self.pid(p.uid) if p.as_group else p.uid  # (as the group: the stand-in id, for everyone)
+                if me in users:
+                    users.remove(me)
                     if not users:
                         m["reactions"].pop(emoji)
                 else:
-                    users.append(p.uid)
+                    users.append(me)
                 await db.x("UPDATE messages SET reactions=? WHERE id=?", (json.dumps(m["reactions"]), m["id"]))
                 await self.broadcast({"t": "react", "id": m["id"], "reactions": m["reactions"]})
                 return
@@ -675,8 +753,8 @@ class Room:
         if now() - p.last_sound < 4:
             return await self.toast(p.uid, "Slow down 🙂")
         p.last_sound = now()
-        await self.broadcast({"t": "sound", "id": sid, "uid": p.uid,
-                              "name": self.group_title if p.as_group else p.name})
+        await self.bcast_masked(p, {"t": "sound", "id": sid, "uid": p.uid,
+                                    "name": self.group_title if p.as_group else p.name})
 
     async def on_fly(self, p: Participant, msg: dict):
         emoji = msg.get("emoji")
@@ -686,14 +764,11 @@ class Room:
         if len(p.fly_times) == p.fly_times.maxlen and t - p.fly_times[0] < 3:
             return  # max 6 every 3 seconds
         p.fly_times.append(t)
-        await self.broadcast({"t": "fly", "emoji": emoji, "uid": p.uid,
-                              "name": self.group_title if p.as_group else p.name})
+        await self.bcast_masked(p, {"t": "fly", "emoji": emoji, "uid": p.uid,
+                                    "name": self.group_title if p.as_group else p.name})
 
     async def on_report(self, p: Participant, msg: dict):
-        try:
-            target = self.parts.get(int(msg.get("uid", 0)))
-        except (TypeError, ValueError):
-            return
+        target = self.parts.get(self.real_uid(msg.get("uid")))
         if not target or target.uid == p.uid:
             return
         if now() - getattr(p, "last_report", 0) < 30:
@@ -768,12 +843,15 @@ class Room:
         self._qid += 1
         return {"qid": self._qid, "id": vid, "title": str(t.get("title", ""))[:200],
                 "artist": str(t.get("artist", ""))[:120], "duration": _dur(t.get("duration")),
-                "thumb": f"/api/thumb/{vid}", "by": by or (p.name if p else ""), "byUid": p.uid if p else 0}
+                "thumb": f"/api/thumb/{vid}",
+                "by": by or ((self.group_title if p.as_group else p.name) if p else ""),
+                "byUid": (self.pid(p.uid) if p.as_group else p.uid) if p else 0}
 
     async def _start(self, item: dict | None, from_prev: bool = False, repeat: bool = False):
         cur = self.current
         self._idle_paused = False
         self._load_seek = None
+        self._gave_up.clear()
         if cur and not from_prev and (not item or item["id"] != cur["id"]):
             self.history.append(cur)
         if (item or {}).get("qid") != (cur or {}).get("qid") and not self.fx_by_admin:
@@ -851,6 +929,27 @@ class Room:
                 self.status, self.pos, self.upd = "playing", pos, now()
                 self._arm_timer()
                 await self.push_music()
+
+    async def _check_dead_song(self, qid: int, vid: str):
+        """Half the room's phones gave up on the song. Skip it only if the server can't get it either, and only
+        while it's this one song: when YouTube is blocking everything, skipping would empty the queue."""
+        try:
+            if await music.probe(vid):
+                log.info("phones gave up on %s, but the server gets it fine: not skipping", vid)
+                return
+            t = now()
+            self._auto_skips = [x for x in self._auto_skips if t - x < 600]
+            if len(self._auto_skips) >= 2 or music.youtube_blocking():
+                if t - self._block_told > 600:
+                    self._block_told = t
+                    await self.broadcast({"t": "toast", "text": "YouTube is refusing songs right now — the music "
+                                          "will come back by itself"}, admins_only=True)
+                return
+            self._auto_skips.append(t)
+            async with self._lock:
+                await self._skip_unplayable(qid, "no phone (and not the server) could get it")
+        finally:
+            self._probing.discard(qid)
 
     async def _skip_unplayable(self, qid: int, why: str = ""):
         cur = self.current
@@ -1034,7 +1133,7 @@ class Room:
                     items.append(it)
             if not items:
                 return
-            if len([q for q in self.queue if q["byUid"] == p.uid]) + len(items) > 200 and not admin:
+            if len([q for q in self.queue if self.mine(q, p)]) + len(items) > 200 and not admin:
                 return await self.toast(p.uid, "Queue limit reached")
             if len(self.queue) + len(items) > QUEUE_MAX:  # the whole queue goes to every phone on each change
                 items = items[:max(0, QUEUE_MAX - len(self.queue))]
@@ -1108,7 +1207,7 @@ class Room:
             qid = msg.get("qid")
             for q in self.queue:
                 if q["qid"] == qid:
-                    if not (q["byUid"] == p.uid or self.can(p, "queue")):
+                    if not (self.mine(q, p) or self.can(p, "queue")):
                         return await self.deny(p, "queue")
                     self.queue.remove(q)
                     await self.push_music()
@@ -1117,7 +1216,7 @@ class Room:
         if cmd == "skip":
             if not self.current:
                 return
-            if (self.current["byUid"] == p.uid and self.can(p, "skip_own")) or self.can(p, "playback"):
+            if (self.mine(self.current, p) and self.can(p, "skip_own")) or self.can(p, "playback"):
                 return await self._next()
             return await self.deny(p, "playback")
         need = {"play": "playback", "pause": "playback", "seek": "playback", "prev": "playback", "stop": "stop",
@@ -1217,7 +1316,7 @@ class Room:
                 await self._next(auto=True)
 
     async def set_fx(self, p: Participant, new: dict):
-        own = bool(self.current and self.current["byUid"] == p.uid)
+        own = self.mine(self.current, p)
         if not (self.can(p, "fx") or (own and self.can(p, "fx_own"))):
             return await self.deny(p, "fx")
         if not isinstance(new, dict):
@@ -1302,6 +1401,8 @@ class Room:
                 self._remember(q)
 
     async def _on_admin(self, p: Participant, t: str, msg: dict):
+        if not p.admin and "uid" in msg:  # (moderators see stand-in ids)
+            msg = {**msg, "uid": self.real_uid(msg.get("uid"))}
         target = self.parts.get(int(msg.get("uid", 0) or 0))
         if t in ("admin.mute", "admin.unmute", "admin.role", "admin.kick", "admin.ban", "admin.clearflags") and not target:
             if t != "admin.ban":
@@ -1314,12 +1415,12 @@ class Room:
             target.force_muted = True
             if target.mic:
                 await self.set_mic(target, False)
-            await lk.set_publish(self.chat_id, target.uid, False)
+            await lk.set_publish(self.chat_id, self.lk_id(target.uid), False)
             await self.bcast_part(target)
             await self.toast(target.uid, ("An admin" if p.admin else "A moderator") + " muted you")
         elif t == "admin.unmute":
             target.force_muted = False
-            await lk.set_publish(self.chat_id, target.uid, self.can_speak(target))
+            await lk.set_publish(self.chat_id, self.lk_id(target.uid), self.can_speak(target))
             await self.bcast_part(target)
             await self.toast(target.uid, ("An admin" if p.admin else "A moderator") + " allowed you to speak")
         elif t == "admin.role":
@@ -1331,7 +1432,7 @@ class Room:
                 target.force_muted = False
             if not self.can_speak(target) and target.mic:
                 await self.set_mic(target, False)
-            await lk.set_publish(self.chat_id, target.uid, self.can_speak(target))
+            await lk.set_publish(self.chat_id, self.lk_id(target.uid), self.can_speak(target))
             await self.bcast_part(target)
             await self.toast(target.uid, "You can speak now — tap the mic" if role == "speaker" else "You are now a listener")
         elif t in ("admin.kick", "admin.ban"):
@@ -1348,8 +1449,9 @@ class Room:
                 await self.send_to(uid, {"t": "kicked", "ban": t == "admin.ban"})
                 for c in list(target.conns):
                     await c.close(4003)
+                ident = self.lk_id(uid)
                 await self._gone(target)
-                await lk.remove(self.chat_id, uid)
+                await lk.remove(self.chat_id, ident)
             await self.toast(p.uid, f"{'Banned' if t == 'admin.ban' else 'Removed'} {name}")
         elif t == "admin.musicperms":
             ev = msg.get("everyone") or {}
@@ -1407,14 +1509,14 @@ class Room:
                     q.force_muted = True
                     if q.mic:
                         await self.set_mic(q, False)
-                    await lk.set_publish(self.chat_id, q.uid, False)
+                    await lk.set_publish(self.chat_id, self.lk_id(q.uid), False)
                     await self.bcast_part(q)
             await self.broadcast({"t": "toast", "text": "Admin muted everyone"})
         elif t == "admin.unmuteall":
             for q in list(self.parts.values()):
                 if q.force_muted:
                     q.force_muted = False
-                    await lk.set_publish(self.chat_id, q.uid, self.can_speak(q))
+                    await lk.set_publish(self.chat_id, self.lk_id(q.uid), self.can_speak(q))
                     await self.bcast_part(q)
         elif t == "admin.settings":
             s = msg.get("settings") or {}

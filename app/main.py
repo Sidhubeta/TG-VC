@@ -166,7 +166,7 @@ async def api_auth(request: Request):
     can_pub = room.may_publish(uid, st["admin"])
     out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"], "bot": tg.BOT_USERNAME,
            "group": "Dev Group" if config.DEV_MODE and uid < 0 else await tg.chat_title(chat_id),
-           "livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, name, can_pub)} if lk.enabled() else None}
+           "livekit": lk.join_info(chat_id, uid, can_pub) if lk.enabled() else None}
     return JSONResponse(out)
 
 
@@ -179,9 +179,8 @@ async def api_lk_token(request: Request):
     if not lk.enabled():
         return JSONResponse({"livekit": None})
     room = await get_room(chat_id)
-    u = await db.q1("SELECT name FROM users WHERE uid=?", (uid,))
     can = room.may_publish(uid, st["admin"])
-    return JSONResponse({"livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, (u or {}).get("name", "User"), can)}})
+    return JSONResponse({"livekit": lk.join_info(chat_id, int(room.lk_id(uid)), can)})
 
 
 # ---------------- music ----------------
@@ -709,6 +708,9 @@ async def api_health(request: Request, uid, chat_id, st):
         ok = tgs["poll_ok_at"] and time.time() - tgs["poll_ok_at"] < 180
         items.append({"name": "Telegram bot", "ok": bool(ok), "detail": f"@{tg.BOT_USERNAME} · last update check {_ago(tgs['poll_ok_at'])}"
                       + (f" · last error {_ago(tgs['poll_err_at'])}: {tgs['poll_err']}" if tgs["poll_err_at"] > tgs["poll_ok_at"] else "")})
+        if tgs.get("conflicts", 0) >= 10:
+            items.append({"name": "Second bot copy", "ok": False, "detail": f"{tgs['conflicts']} times another program used "
+                          "this BOT_TOKEN at the same time (another server, Railway service or PC). Stop it, or the bot misses messages."})
         items.append({"name": "Bot privacy mode", "ok": not tg.PRIVACY_ON,
                       "detail": "On: the bot doesn't see group messages (@BotFather → /setprivacy → Disable)" if tg.PRIVACY_ON else "Off: the bot sees who chats"})
     ms = music.STATS
@@ -719,6 +721,13 @@ async def api_health(request: Request, uid, chat_id, st):
                   + (" · PO token: " + ("plugin ready" if music.POT_PLUGIN else "plugin missing")
                      + (", provider set" if config.POT_PROVIDER_URL else ", POT_PROVIDER_URL not set"))
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
+    items.append({"name": "PO token provider", **(await music.pot_check())})
+    n403 = music.refused_last_hour()
+    items.append({"name": "YouTube song links", "ok": n403 < 10,
+                  "detail": "No refused links in the last hour" if not n403 else
+                  f"YouTube refused {n403} song link{'s' if n403 != 1 else ''} in the last hour"
+                  + (" — songs may start late or stay silent. Check the PO token provider above; YouTube cookies "
+                     "(YT_COOKIES_B64) help too" if n403 >= 10 else " (retried by themselves)")})
     lkc = await lk.check()
     items.append({"name": "Voice (LiveKit)", **lkc})
     items.append({"name": "Full member list", **members.status()})
@@ -817,6 +826,13 @@ async def health(request: Request):
     return JSONResponse({"ok": True})
 
 
+async def favicon(request: Request):
+    # browsers ask for it on every open (it was a 404 in the logs): a small music note
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2b5278"/>'
+           '<path d="M40 14v24.5a7 7 0 1 1-4-6.3V22l-12 3v17.5a7 7 0 1 1-4-6.3V20z" fill="#fff"/></svg>')
+    return Response(svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=604800"})
+
+
 async def robots(request: Request):
     return Response("User-agent: *\nDisallow: /\n", media_type="text/plain")
 
@@ -842,6 +858,7 @@ routes = [
     Route("/", index),
     Route("/health", health),
     Route("/robots.txt", robots),
+    Route("/favicon.ico", favicon),
     Route("/api/auth", api_auth, methods=["POST"]),
     Route("/api/lk", api_lk_token),
     Route("/api/search", api_search),

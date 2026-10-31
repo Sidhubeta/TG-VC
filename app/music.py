@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
@@ -49,6 +49,34 @@ elif config.YT_COOKIES:
 
 _info_cache: dict[str, tuple[float, dict]] = {}
 STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": ""}  # for the admins' Health page
+REFUSED: "deque[float]" = deque(maxlen=500)  # when YouTube refused a song link (403/410)
+
+
+def youtube_blocking() -> bool:
+    """YouTube is refusing the server in general right now (not just one song): its last answer was an error, or
+    many song links were refused in the last few minutes."""
+    cut = time.time() - 300
+    return STATS["yt_err_at"] > STATS["yt_ok_at"] or sum(1 for t in REFUSED if t > cut) >= 8
+
+
+def refused_last_hour() -> int:
+    cut = time.time() - 3600
+    return sum(1 for t in REFUSED if t > cut)
+
+
+async def pot_check() -> dict:
+    """For the Health page: does the PO-token provider answer?"""
+    if not config.POT_PROVIDER_URL:
+        return {"ok": False, "detail": "POT_PROVIDER_URL not set — YouTube blocks the server more often"}
+    try:
+        r = await http().get(config.POT_PROVIDER_URL.rstrip("/") + "/ping", timeout=4)
+        if r.status_code == 200:
+            v = (r.json() or {}).get("version", "")
+            return {"ok": True, "detail": f"Answers ({config.POT_PROVIDER_URL})" + (f" · version {v}" if v else "")}
+        return {"ok": False, "detail": f"Answered {r.status_code} — check the provider service and the port (4416)"}
+    except Exception as e:
+        return {"ok": False, "detail": f"Can't reach {config.POT_PROVIDER_URL}: {str(e)[:100]} — check the address "
+                                       "(http://<service>.railway.internal:4416) and that the service is running"}
 _downloads: dict[str, asyncio.Task] = {}
 _resolve_locks: dict[str, asyncio.Lock] = {}
 _http: httpx.AsyncClient | None = None
@@ -441,19 +469,25 @@ def video_heights(info: dict) -> list[int]:
 
 
 # ---- audio cache ---------------------------------------------------------------------------
-def _cache_path(vid: str, fid: str) -> str:
+def _cache_path(vid: str, fid: str, video: bool = False) -> str:
     safe = re.sub(r"[^\w-]", "", str(fid))
-    return os.path.join(CACHE_DIR, f"{vid}_{safe}.bin")
+    return os.path.join(CACHE_DIR, f"{vid}_{safe}.{'vbin' if video else 'bin'}")
+
+
+def _fmt_path(vid: str, fmt: dict) -> str:
+    return _cache_path(vid, fmt["id"], fmt["vcodec"] != "none")
 
 
 async def _download(vid: str, fmt: dict, retry: bool = True):
-    path = _cache_path(vid, fmt["id"])
+    path = _fmt_path(vid, fmt)
     tmp = path + ".part"
     try:
         pos = 0
         with open(tmp, "wb") as fh:
             while True:
                 r = await stream_http().get(fmt["url"], headers={**fmt["headers"], "Range": f"bytes={pos}-{pos + CHUNK - 1}"})
+                if r.status_code in (403, 410):
+                    REFUSED.append(time.time())
                 if r.status_code in (403, 410) and retry:
                     raise _Expired()
                 if r.status_code not in (200, 206):
@@ -465,7 +499,8 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
                     break
         os.replace(tmp, path)
         _trim_cache()
-        spawn_analyze(vid, path)
+        if fmt["vcodec"] == "none":
+            spawn_analyze(vid, path)
     except _Expired:  # the link went stale (or came without a PO token): get a fresh one and try once more
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -487,13 +522,15 @@ class _Expired(Exception):
 
 
 def _trim_cache():
-    files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(".bin")]
-    files.sort(key=os.path.getmtime)
-    total = sum(os.path.getsize(f) for f in files)
-    while files and total > config.AUDIO_CACHE_MB * 1024 * 1024:
-        f = files.pop(0)
-        total -= os.path.getsize(f)
-        os.remove(f)
+    # songs and videos have their own room, so a few videos can't push every song out
+    for ext, mb in ((".bin", config.AUDIO_CACHE_MB), (".vbin", config.VIDEO_CACHE_MB)):
+        files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(ext)]
+        files.sort(key=os.path.getmtime)
+        total = sum(os.path.getsize(f) for f in files)
+        while files and total > mb * 1024 * 1024:
+            f = files.pop(0)
+            total -= os.path.getsize(f)
+            os.remove(f)
 
 
 async def prefetch(vid: str):
@@ -623,8 +660,12 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         fmt = pick_video(info, int(quality) if quality.isdigit() else 480)
     if not fmt:
         return Response("no format", status_code=404)
-    path = _cache_path(vid, fmt["id"])
+    path = _fmt_path(vid, fmt)
     key = (vid, fmt["id"])
+    if kind == "video" and not os.path.exists(path) and config.VIDEO_CACHE_MB > 0:
+        # Videos are cached too (each viewer used to pull the whole video from YouTube). The download runs in the
+        # background; until it's done this request goes to YouTube as before (same file, so pieces always match).
+        _start_download(vid, fmt)
     if kind == "audio" and key in _served_as:
         sub = [f for f in info["formats"] if f["id"] == _served_as[key]]
         if sub and os.path.exists(_cache_path(vid, sub[0]["id"])):
@@ -641,7 +682,8 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         else:
             _served_as[key] = fmt["id"]
             try:
-                await asyncio.wait_for(asyncio.shield(_start_download(vid, fmt)), 6)
+                # (under 4 s: a phone waiting longer than that for its first bytes reloads the song)
+                await asyncio.wait_for(asyncio.shield(_start_download(vid, fmt)), 3)
             except Exception:
                 pass
         while len(_served_as) > 3000:
@@ -667,6 +709,8 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
     end = min(end, start + CHUNK - 1)
     req = stream_http().build_request("GET", fmt["url"], headers={**fmt["headers"], "Range": f"bytes={start}-{end}"})
     r = await stream_http().send(req, stream=True)
+    if r.status_code in (403, 410):
+        REFUSED.append(time.time())
     if r.status_code in (403, 410) and retry:
         await r.aclose()
         info = await resolve(vid, force=True)
@@ -695,6 +739,34 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
             await r.aclose()
 
     return StreamingResponse(body(), status_code=r.status_code, media_type=_mime(fmt), headers=headers)
+
+
+async def probe(vid: str) -> bool:
+    """Can the server get this song's sound right now? (On disk, or the first bytes from YouTube.)"""
+    try:
+        info = await resolve(vid)
+    except Exception:
+        return False
+    fmts = [f for f in (pick_audio(info, "opus", "medium"), pick_audio(info, "aac", "medium")) if f]
+    if any(os.path.exists(_cache_path(vid, f["id"])) for f in fmts):
+        return True
+    for f in fmts[:1]:
+        for attempt in range(2):
+            try:
+                r = await stream_http().get(f["url"], headers={**f["headers"], "Range": "bytes=0-65535"})
+            except Exception:
+                return False
+            if r.status_code in (200, 206) and r.content:
+                return True
+            if r.status_code in (403, 410) and attempt == 0:
+                try:
+                    info = await resolve(vid, force=True)
+                    f = next((x for x in info["formats"] if x["id"] == f["id"]), f)
+                    continue
+                except Exception:
+                    return False
+            return False
+    return False
 
 
 # ---- the song in short pieces, for Web Audio --------------------------------------------------------------------

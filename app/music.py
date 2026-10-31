@@ -5,7 +5,8 @@ import logging
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
 from starlette.requests import Request
@@ -48,6 +49,34 @@ elif config.YT_COOKIES:
 
 _info_cache: dict[str, tuple[float, dict]] = {}
 STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": ""}  # for the admins' Health page
+REFUSED: "deque[float]" = deque(maxlen=500)  # when YouTube refused a song link (403/410)
+
+
+def youtube_blocking() -> bool:
+    """YouTube is refusing the server in general right now (not just one song): its last answer was an error, or
+    many song links were refused in the last few minutes."""
+    cut = time.time() - 300
+    return STATS["yt_err_at"] > STATS["yt_ok_at"] or sum(1 for t in REFUSED if t > cut) >= 8
+
+
+def refused_last_hour() -> int:
+    cut = time.time() - 3600
+    return sum(1 for t in REFUSED if t > cut)
+
+
+async def pot_check() -> dict:
+    """For the Health page: does the PO-token provider answer?"""
+    if not config.POT_PROVIDER_URL:
+        return {"ok": False, "detail": "POT_PROVIDER_URL not set — YouTube blocks the server more often"}
+    try:
+        r = await http().get(config.POT_PROVIDER_URL.rstrip("/") + "/ping", timeout=4)
+        if r.status_code == 200:
+            v = (r.json() or {}).get("version", "")
+            return {"ok": True, "detail": f"Answers ({config.POT_PROVIDER_URL})" + (f" · version {v}" if v else "")}
+        return {"ok": False, "detail": f"Answered {r.status_code} — check the provider service and the port (4416)"}
+    except Exception as e:
+        return {"ok": False, "detail": f"Can't reach {config.POT_PROVIDER_URL}: {str(e)[:100]} — check the address "
+                                       "(http://<service>.railway.internal:4416) and that the service is running"}
 _downloads: dict[str, asyncio.Task] = {}
 _resolve_locks: dict[str, asyncio.Lock] = {}
 _http: httpx.AsyncClient | None = None
@@ -64,6 +93,28 @@ def http() -> httpx.AsyncClient:
     if _http is None:
         _http = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10), follow_redirects=True)
     return _http
+
+
+_sthttp: httpx.AsyncClient | None = None
+
+
+def stream_http() -> httpx.AsyncClient:
+    """Song streams and downloads. Each listener's stream holds a connection for the whole song; on the shared
+    client (100 connections) a big room used up the pool and thumbnails, lyrics and new streams timed out."""
+    global _sthttp
+    if _sthttp is None:
+        _sthttp = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10, pool=20), follow_redirects=True,
+                                    limits=httpx.Limits(max_connections=600, max_keepalive_connections=60))
+    return _sthttp
+
+
+# yt-dlp and ffmpeg work (seconds each) runs on its own threads, so it can't hold up anything else
+_POOL = ThreadPoolExecutor(8, thread_name_prefix="yt")
+
+
+def _bg(fn, *args, **kw):
+    loop = asyncio.get_running_loop()
+    return loop.run_in_executor(_POOL, lambda: fn(*args, **kw))
 
 
 class _QuietLog:
@@ -94,17 +145,33 @@ def _track(e: dict) -> dict | None:
         return None
     if e.get("live_status") in ("is_live", "is_upcoming"):
         return None
+    # playlists list removed and private uploads too ("[Private video]", "[Deleted video]"): they can't be played,
+    # and with no length the room used to wait on them forever
+    if e.get("availability") in ("private", "needs_auth", "premium_only", "subscriber_only"):
+        return None
+    if re.fullmatch(r"\[(private|deleted|unavailable) video\]", (e.get("title") or "").strip().lower()):
+        return None
     artist = e.get("artist") or e.get("channel") or e.get("uploader") or ""
     artist = re.sub(r"\s*-\s*Topic$", "", artist)
+    try:
+        dur = float(e.get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
     return {"id": vid, "title": e.get("track") or e.get("title") or "Unknown", "artist": artist,
-            "duration": float(e.get("duration") or 0), "thumb": _thumb(vid)}
+            "duration": dur if 0 < dur < 86400 else 0.0, "thumb": _thumb(vid)}
+
+
+def looks_like_id(text: str) -> bool:
+    """A bare 11-letter text is taken as a video id only if it looks random: "Cheerleader" or "Bohemianish" are
+    words to search for. Real ids almost always have a digit, - or _, or capitals after the first letter."""
+    return bool(VID_RE.fullmatch(text)) and bool(re.search(r"[\d_-]", text) or re.search(r"[A-Z]", text[1:]))
 
 
 def parse_youtube(text: str) -> tuple[str | None, str | None]:
     """Returns (video_id, playlist_id) from any YouTube / YT Music URL."""
     text = text.strip()
     if re.fullmatch(r"[\w-]{11}", text):
-        return text, None
+        return (text, None) if looks_like_id(text) else (None, None)
     try:
         u = urlparse(text if "://" in text else "https://" + text)
     except Exception:
@@ -236,7 +303,7 @@ async def soundcloud(url: str, limit: int = 100) -> tuple[str, list[dict]]:
         url = str(r.url).split("?")[0]
         if "soundcloud.com" not in url:
             raise ValueError("SoundCloud link not understood")
-    info = await asyncio.to_thread(_extract, url, extract_flat="in_playlist", noplaylist=False, playlistend=limit)
+    info = await _bg(_extract, url, extract_flat="in_playlist", noplaylist=False, playlistend=limit)
     if info.get("_type") != "playlist" and not info.get("entries"):
         return info.get("title") or "SoundCloud", [_sc_song(info)]
     entries = [e for e in info.get("entries") or [] if e][:limit]
@@ -247,7 +314,7 @@ async def soundcloud(url: str, limit: int = 100) -> tuple[str, list[dict]]:
             return _sc_song(e)
         async with sem:
             try:
-                return _sc_song(await asyncio.to_thread(_extract, e.get("url") or e.get("webpage_url")))
+                return _sc_song(await _bg(_extract, e.get("url") or e.get("webpage_url")))
             except Exception:
                 return None
     songs = [x for x in await asyncio.gather(*(full(e) for e in entries)) if x and x["title"]]
@@ -290,7 +357,7 @@ async def search(query: str, limit: int = 15) -> list[dict]:
     if hit and time.time() - hit[0] < 600:
         _searches.move_to_end(key)
         return hit[1]
-    info = await asyncio.to_thread(_extract, f"ytsearch{limit}:{query}", extract_flat="in_playlist")
+    info = await _bg(_extract, f"ytsearch{limit}:{query}", extract_flat="in_playlist")
     res = [t for e in info.get("entries") or [] if (t := _track(e))]
     _searches[key] = (time.time(), res)
     while len(_searches) > 500:
@@ -299,15 +366,27 @@ async def search(query: str, limit: int = 15) -> list[dict]:
 
 
 async def playlist(pid: str, limit: int = 200) -> tuple[str, list[dict]]:
-    info = await asyncio.to_thread(_extract, f"https://www.youtube.com/playlist?list={pid}",
+    info = await _bg(_extract, f"https://www.youtube.com/playlist?list={pid}",
                                    extract_flat="in_playlist", noplaylist=False, playlistend=limit)
     return info.get("title") or "Playlist", [t for e in info.get("entries") or [] if (t := _track(e))]
 
 
 async def related(vid: str, limit: int = 25) -> list[dict]:
-    info = await asyncio.to_thread(_extract, f"https://www.youtube.com/watch?v={vid}&list=RD{vid}",
+    info = await _bg(_extract, f"https://www.youtube.com/watch?v={vid}&list=RD{vid}",
                                    extract_flat="in_playlist", noplaylist=False, playlistend=limit)
     return [t for e in info.get("entries") or [] if (t := _track(e)) and t["id"] != vid]
+
+
+_DEAD = re.compile(r"private video|video unavailable|has been removed|no longer available|is not available|"
+                   r"not available in your country|members[- ]only|join this channel|confirm your age|age[- ]restricted|"
+                   r"copyright|terminated|does not exist|premieres in|live event will begin", re.I)
+
+
+def unplayable(err) -> bool:
+    """The song itself can't be played (private, removed, blocked, age-restricted) — as opposed to YouTube
+    blocking the server for a while ("confirm you're not a bot", 403s, timeouts), where skipping would empty the
+    whole queue in a few seconds."""
+    return bool(_DEAD.search(str(err))) and "not a bot" not in str(err)
 
 
 def is_ready(vid: str) -> bool:
@@ -324,12 +403,17 @@ async def resolve(vid: str, force: bool = False) -> dict:
         for k in [k for k, lk in _resolve_locks.items() if not lk.locked()]:
             _resolve_locks.pop(k, None)
     lock = _resolve_locks.setdefault(vid, asyncio.Lock())
+    asked = time.time()
     async with lock:
         hit = _info_cache.get(vid)
         if hit and not force and time.time() - hit[0] < 3 * 3600:
             return hit[1]
+        # A forced refresh (a link was refused) that someone else already did while we waited is good enough:
+        # 20 listeners refused at once used to run 20 YouTube lookups one after another.
+        if hit and force and hit[0] >= asked:
+            return hit[1]
         try:
-            info = await asyncio.to_thread(_extract, f"https://www.youtube.com/watch?v={vid}")
+            info = await _bg(_extract, f"https://www.youtube.com/watch?v={vid}")
         except Exception as e:
             STATS["yt_err"], STATS["yt_err_at"] = str(e)[:300], time.time()
             raise
@@ -385,19 +469,25 @@ def video_heights(info: dict) -> list[int]:
 
 
 # ---- audio cache ---------------------------------------------------------------------------
-def _cache_path(vid: str, fid: str) -> str:
+def _cache_path(vid: str, fid: str, video: bool = False) -> str:
     safe = re.sub(r"[^\w-]", "", str(fid))
-    return os.path.join(CACHE_DIR, f"{vid}_{safe}.bin")
+    return os.path.join(CACHE_DIR, f"{vid}_{safe}.{'vbin' if video else 'bin'}")
+
+
+def _fmt_path(vid: str, fmt: dict) -> str:
+    return _cache_path(vid, fmt["id"], fmt["vcodec"] != "none")
 
 
 async def _download(vid: str, fmt: dict, retry: bool = True):
-    path = _cache_path(vid, fmt["id"])
+    path = _fmt_path(vid, fmt)
     tmp = path + ".part"
     try:
         pos = 0
         with open(tmp, "wb") as fh:
             while True:
-                r = await http().get(fmt["url"], headers={**fmt["headers"], "Range": f"bytes={pos}-{pos + CHUNK - 1}"})
+                r = await stream_http().get(fmt["url"], headers={**fmt["headers"], "Range": f"bytes={pos}-{pos + CHUNK - 1}"})
+                if r.status_code in (403, 410):
+                    REFUSED.append(time.time())
                 if r.status_code in (403, 410) and retry:
                     raise _Expired()
                 if r.status_code not in (200, 206):
@@ -409,7 +499,8 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
                     break
         os.replace(tmp, path)
         _trim_cache()
-        spawn_analyze(vid, path)
+        if fmt["vcodec"] == "none":
+            spawn_analyze(vid, path)
     except _Expired:  # the link went stale (or came without a PO token): get a fresh one and try once more
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -431,13 +522,15 @@ class _Expired(Exception):
 
 
 def _trim_cache():
-    files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(".bin")]
-    files.sort(key=os.path.getmtime)
-    total = sum(os.path.getsize(f) for f in files)
-    while files and total > config.AUDIO_CACHE_MB * 1024 * 1024:
-        f = files.pop(0)
-        total -= os.path.getsize(f)
-        os.remove(f)
+    # songs and videos have their own room, so a few videos can't push every song out
+    for ext, mb in ((".bin", config.AUDIO_CACHE_MB), (".vbin", config.VIDEO_CACHE_MB)):
+        files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith(ext)]
+        files.sort(key=os.path.getmtime)
+        total = sum(os.path.getsize(f) for f in files)
+        while files and total > mb * 1024 * 1024:
+            f = files.pop(0)
+            total -= os.path.getsize(f)
+            os.remove(f)
 
 
 async def prefetch(vid: str):
@@ -457,9 +550,28 @@ async def prefetch(vid: str):
             continue
         if key in _downloads:
             continue
-        t = asyncio.create_task(_download(vid, f))
-        _downloads[key] = t
+        _start_download(vid, f)
+
+
+def _start_download(vid: str, f: dict) -> asyncio.Task:
+    key = f"{vid}_{f['id']}"
+    t = _downloads.get(key)
+    if t is None:
+        t = _downloads[key] = asyncio.get_running_loop().create_task(_download(vid, f))
         t.add_done_callback(lambda _t, k=key: _downloads.pop(k, None))
+    return t
+
+
+_served_as: dict[tuple[str, str], str] = {}  # (song, format asked for) -> format whose file is served
+
+
+def _cached_alternative(info: dict, vid: str, fmt: dict) -> dict | None:
+    """Another quality of the same kind of audio that's already on disk (the cache holds "medium")."""
+    opus = "opus" in fmt["acodec"] or fmt["ext"] == "webm"
+    same = [f for f in info["formats"] if f["vcodec"] == "none" and f["acodec"] != "none"
+            and ("opus" in f["acodec"] or f["ext"] == "webm") == opus and os.path.exists(_cache_path(vid, f["id"]))]
+    want = fmt["abr"] or fmt["tbr"] or 0
+    return min(same, key=lambda f: abs((f["abr"] or f["tbr"] or 0) - want)) if same else None
 
 
 # ---- silence at the start / end of songs -----------------------------------------------------------------
@@ -485,7 +597,7 @@ def spawn_analyze(vid: str, path: str):
 
     async def run():
         try:
-            _trims[vid] = await asyncio.to_thread(_silence, path)
+            _trims[vid] = await _bg(_silence, path)
             if len(_trims) > 3000:
                 for k in list(_trims)[:500]:
                     _trims.pop(k, None)
@@ -548,7 +660,34 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
         fmt = pick_video(info, int(quality) if quality.isdigit() else 480)
     if not fmt:
         return Response("no format", status_code=404)
-    path = _cache_path(vid, fmt["id"])
+    path = _fmt_path(vid, fmt)
+    key = (vid, fmt["id"])
+    if kind == "video" and not os.path.exists(path) and config.VIDEO_CACHE_MB > 0:
+        # Videos are cached too (each viewer used to pull the whole video from YouTube). The download runs in the
+        # background; until it's done this request goes to YouTube as before (same file, so pieces always match).
+        _start_download(vid, fmt)
+    if kind == "audio" and key in _served_as:
+        sub = [f for f in info["formats"] if f["id"] == _served_as[key]]
+        if sub and os.path.exists(_cache_path(vid, sub[0]["id"])):
+            fmt, path = sub[0], _cache_path(vid, sub[0]["id"])
+    elif kind == "audio" and not os.path.exists(path):
+        # Not on disk yet. Every listener used to pull the song from YouTube on their own until the whole file was
+        # cached — many requests from one server address, the main reason for 403s and throttling. Use another
+        # quality that's already cached, or wait a moment for the download that's running (one request for all).
+        # The choice is remembered: a player asks for a file in pieces, and every piece must come from the same file.
+        alt = _cached_alternative(info, vid, fmt)
+        if alt:
+            _served_as[key] = alt["id"]
+            fmt, path = alt, _cache_path(vid, alt["id"])
+        else:
+            _served_as[key] = fmt["id"]
+            try:
+                # (under 4 s: a phone waiting longer than that for its first bytes reloads the song)
+                await asyncio.wait_for(asyncio.shield(_start_download(vid, fmt)), 3)
+            except Exception:
+                pass
+        while len(_served_as) > 3000:
+            _served_as.pop(next(iter(_served_as)))
     if os.path.exists(path):
         try:
             os.utime(path)  # LRU: mark as recently used (atime is often not updated on volumes)
@@ -568,8 +707,10 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
     start = int(m.group(1) or 0) if m else 0
     end = int(m.group(2)) if m and m.group(2) else start + CHUNK - 1
     end = min(end, start + CHUNK - 1)
-    req = http().build_request("GET", fmt["url"], headers={**fmt["headers"], "Range": f"bytes={start}-{end}"})
-    r = await http().send(req, stream=True)
+    req = stream_http().build_request("GET", fmt["url"], headers={**fmt["headers"], "Range": f"bytes={start}-{end}"})
+    r = await stream_http().send(req, stream=True)
+    if r.status_code in (403, 410):
+        REFUSED.append(time.time())
     if r.status_code in (403, 410) and retry:
         await r.aclose()
         info = await resolve(vid, force=True)
@@ -598,6 +739,34 @@ async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response
             await r.aclose()
 
     return StreamingResponse(body(), status_code=r.status_code, media_type=_mime(fmt), headers=headers)
+
+
+async def probe(vid: str) -> bool:
+    """Can the server get this song's sound right now? (On disk, or the first bytes from YouTube.)"""
+    try:
+        info = await resolve(vid)
+    except Exception:
+        return False
+    fmts = [f for f in (pick_audio(info, "opus", "medium"), pick_audio(info, "aac", "medium")) if f]
+    if any(os.path.exists(_cache_path(vid, f["id"])) for f in fmts):
+        return True
+    for f in fmts[:1]:
+        for attempt in range(2):
+            try:
+                r = await stream_http().get(f["url"], headers={**f["headers"], "Range": "bytes=0-65535"})
+            except Exception:
+                return False
+            if r.status_code in (200, 206) and r.content:
+                return True
+            if r.status_code in (403, 410) and attempt == 0:
+                try:
+                    info = await resolve(vid, force=True)
+                    f = next((x for x in info["formats"] if x["id"] == f["id"]), f)
+                    continue
+                except Exception:
+                    return False
+            return False
+    return False
 
 
 # ---- the song in short pieces, for Web Audio --------------------------------------------------------------------
@@ -699,8 +868,11 @@ async def thumb(vid: str) -> Response:
                 failed = True
         if data or not failed:  # don't remember network errors as "no thumbnail"
             _thumbs[vid] = data
-            while len(_thumbs) > 300:
-                _thumbs.popitem(last=False)
+            # by size, not count: big covers are ~150 KB each, 300 of them took ~45 MB
+            total = sum(len(v or b"") for v in _thumbs.values())
+            while _thumbs and (total > 16 * 1024 * 1024 or len(_thumbs) > 600):
+                _, old = _thumbs.popitem(last=False)
+                total -= len(old or b"")
     if not data:
         return Response(status_code=404)
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
@@ -722,9 +894,12 @@ def _clean(title: str, artist: str) -> tuple[str, str]:
 
 
 async def lyrics(vid: str, title: str, artist: str, duration: float) -> dict:
-    if vid in _lyr_cache:
-        _lyr_cache.move_to_end(vid)
-        return _lyr_cache[vid]
+    # Kept per song AND the name asked for: the name comes from the phone, so one person sending a wrong name
+    # could otherwise have given everyone the wrong lyrics for that song.
+    key = f"{vid}|{title.lower()}|{artist.lower()}"
+    if key in _lyr_cache:
+        _lyr_cache.move_to_end(key)
+        return _lyr_cache[key]
     name, art = _clean(title, artist)
     res = {"synced": None, "plain": None}
     try:
@@ -743,35 +918,36 @@ async def lyrics(vid: str, title: str, artist: str, duration: float) -> dict:
     except Exception as e:
         log.info("lyrics failed: %s", e)
         return res  # don't cache failures: try again next time
-    _lyr_cache[vid] = res
+    _lyr_cache[key] = res
     while len(_lyr_cache) > 500:
         _lyr_cache.popitem(last=False)
     return res
 
 
 # ---- browse: genres, trending, recommendations (cached so YouTube isn't hit every open) ----------
-YEAR = time.strftime("%Y")
+# "{year}" is filled in when a search runs (built once at start-up, a server running across New Year kept
+# searching last year's hits)
 GENRES = [
-    {"id": "punjabi", "title": "Punjabi", "c": ["#ff7a18", "#af002d"], "q": [f"latest punjabi songs {YEAR}", "punjabi hit songs"]},
-    {"id": "bollywood", "title": "Bollywood", "c": ["#f7971e", "#d4145a"], "q": [f"latest bollywood songs {YEAR}", "bollywood hits"]},
+    {"id": "punjabi", "title": "Punjabi", "c": ["#ff7a18", "#af002d"], "q": ["latest punjabi songs {year}", "punjabi hit songs"]},
+    {"id": "bollywood", "title": "Bollywood", "c": ["#f7971e", "#d4145a"], "q": ["latest bollywood songs {year}", "bollywood hits"]},
     {"id": "hiphop", "title": "Hip-Hop & Rap", "c": ["#232526", "#5b5b5b"], "q": ["desi hip hop songs", "hip hop hits"]},
     {"id": "romantic", "title": "Romantic", "c": ["#ee0979", "#ff6a88"], "q": ["romantic hindi songs", "romantic punjabi songs"]},
     {"id": "party", "title": "Party", "c": ["#8e2de2", "#4a00e0"], "q": ["party songs hindi punjabi", "dance party hits"]},
     {"id": "sad", "title": "Sad", "c": ["#2c3e50", "#4ca1af"], "q": ["sad hindi songs", "sad punjabi songs"]},
     {"id": "lofi", "title": "Lo-fi & Chill", "c": ["#614385", "#516395"], "q": ["hindi lofi songs", "lofi chill songs"]},
-    {"id": "pop", "title": "Pop", "c": ["#fc466b", "#3f5efb"], "q": [f"pop hits {YEAR}", "english pop songs"]},
-    {"id": "haryanvi", "title": "Haryanvi", "c": ["#11998e", "#38ef7d"], "q": [f"latest haryanvi songs {YEAR}", "haryanvi hit songs"]},
+    {"id": "pop", "title": "Pop", "c": ["#fc466b", "#3f5efb"], "q": ["pop hits {year}", "english pop songs"]},
+    {"id": "haryanvi", "title": "Haryanvi", "c": ["#11998e", "#38ef7d"], "q": ["latest haryanvi songs {year}", "haryanvi hit songs"]},
     {"id": "retro", "title": "90s & Retro", "c": ["#c79081", "#dfa579"], "q": ["90s hindi songs", "old hindi songs evergreen"]},
     {"id": "workout", "title": "Workout", "c": ["#f12711", "#f5af19"], "q": ["gym workout songs", "workout motivation songs"]},
     {"id": "edm", "title": "Dance & EDM", "c": ["#00c6ff", "#0072ff"], "q": ["edm hits", "bollywood remix songs"]},
     {"id": "indie", "title": "Indie", "c": ["#606c88", "#3f4c6b"], "q": ["hindi indie songs", "indie pop songs india"]},
     {"id": "devotional", "title": "Devotional", "c": ["#f6d365", "#fda085"], "q": ["shabad gurbani kirtan", "bhakti songs"]},
-    {"id": "english", "title": "English Hits", "c": ["#1d2b64", "#f8cdda"], "q": [f"top english songs {YEAR}", "billboard hits"]},
+    {"id": "english", "title": "English Hits", "c": ["#1d2b64", "#f8cdda"], "q": ["top english songs {year}", "billboard hits"]},
     {"id": "sufi", "title": "Sufi & Ghazal", "c": ["#3a1c71", "#d76d77"], "q": ["sufi songs", "best ghazals"]},
 ]
 SPECIAL = {
-    "trending": [f"trending songs india {YEAR}", f"top hits this week {YEAR}"],
-    "new": [f"new songs this week {YEAR}", f"new punjabi songs {YEAR}"],
+    "trending": ["trending songs india {year}", "top hits this week {year}"],
+    "new": ["new songs this week {year}", "new punjabi songs {year}"],
 }
 _bcache: dict[str, tuple[float, list]] = {}
 _blocks: dict[str, asyncio.Lock] = {}
@@ -812,7 +988,8 @@ def _interleave(lists: list[list[dict]], limit: int) -> list[dict]:
 
 
 async def _multi(queries: list[str], limit: int) -> list[dict]:
-    res = await asyncio.gather(*(search(q, 15) for q in queries), return_exceptions=True)
+    year = time.strftime("%Y")
+    res = await asyncio.gather(*(search(q.format(year=year), 15) for q in queries), return_exceptions=True)
     return _interleave([r for r in res if isinstance(r, list)], limit)
 
 

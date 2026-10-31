@@ -15,9 +15,23 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import auth, badges, config, db, lk, members, music, pin, tg
-from .room import Conn, ROOMS, get_room, heartbeat_loop
+from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+
+class _HideSession(logging.Filter):
+    """Song, avatar and socket links carry the session (?s=…) — anyone reading the logs could have used it."""
+    def filter(self, record):
+        if record.args and isinstance(record.args, tuple):
+            record.args = tuple(re.sub(r"([?&]s=)[^&\s\"]+", r"\1…", a) if isinstance(a, str) else a for a in record.args)
+        if isinstance(record.msg, str) and "s=" in record.msg:
+            record.msg = re.sub(r"([?&]s=)[^&\s\"]+", r"\1…", record.msg)
+        return True
+
+
+for _name in ("uvicorn.access", "uvicorn.error"):
+    logging.getLogger(_name).addFilter(_HideSession())
 log = logging.getLogger("main")
 # httpx logs every request URL at INFO, and Telegram URLs contain the bot token: keep it out of the logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -139,7 +153,9 @@ async def api_auth(request: Request):
     old = await db.q1("SELECT bio, updated FROM users WHERE uid=?", (uid,))
     bio = (old or {}).get("bio") or ""
     if uid > 0 and (not old or time.time() - (old.get("updated") or 0) > 1800):
-        bio = await tg.fetch_bio(uid)
+        fresh = await tg.fetch_bio(uid)
+        if fresh is not None:  # (None: Telegram didn't answer — keep the bio we have instead of wiping it)
+            bio = fresh
     if config.DEV_MODE and uid < 0:
         bio = ["Music lover 🎧", "", "Living one song at a time", "", "Punjab ⇄ Toronto", ""][abs(uid) % 6]
     await db.x("INSERT OR REPLACE INTO users(uid,name,username,photo,bio,updated) VALUES(?,?,?,?,?,?)",
@@ -147,10 +163,10 @@ async def api_auth(request: Request):
     room = await get_room(chat_id)
     if room.settings["locked"] and not st["admin"] and uid not in room.parts:
         return err("The voice chat is locked by admins", 403)
-    can_pub = st["admin"] or room.settings["new_can_speak"] or (uid in room.parts and room.can_speak(room.parts[uid]))
+    can_pub = room.may_publish(uid, st["admin"])
     out = {"session": auth.make_session(uid, chat_id), "uid": uid, "chat": chat_id, "admin": st["admin"], "bot": tg.BOT_USERNAME,
            "group": "Dev Group" if config.DEV_MODE and uid < 0 else await tg.chat_title(chat_id),
-           "livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, name, can_pub)} if lk.enabled() else None}
+           "livekit": lk.join_info(chat_id, uid, can_pub) if lk.enabled() else None}
     return JSONResponse(out)
 
 
@@ -163,10 +179,8 @@ async def api_lk_token(request: Request):
     if not lk.enabled():
         return JSONResponse({"livekit": None})
     room = await get_room(chat_id)
-    p = room.parts.get(uid)
-    u = await db.q1("SELECT name FROM users WHERE uid=?", (uid,))
-    can = room.can_speak(p) if p else (st["admin"] or room.settings["new_can_speak"])
-    return JSONResponse({"livekit": {"url": config.LIVEKIT_URL, "token": lk.join_token(chat_id, uid, (u or {}).get("name", "User"), can)}})
+    can = room.may_publish(uid, st["admin"])
+    return JSONResponse({"livekit": lk.join_info(chat_id, int(room.lk_id(uid)), can)})
 
 
 # ---------------- music ----------------
@@ -694,6 +708,9 @@ async def api_health(request: Request, uid, chat_id, st):
         ok = tgs["poll_ok_at"] and time.time() - tgs["poll_ok_at"] < 180
         items.append({"name": "Telegram bot", "ok": bool(ok), "detail": f"@{tg.BOT_USERNAME} · last update check {_ago(tgs['poll_ok_at'])}"
                       + (f" · last error {_ago(tgs['poll_err_at'])}: {tgs['poll_err']}" if tgs["poll_err_at"] > tgs["poll_ok_at"] else "")})
+        if tgs.get("conflicts", 0) >= 10:
+            items.append({"name": "Second bot copy", "ok": False, "detail": f"{tgs['conflicts']} times another program used "
+                          "this BOT_TOKEN at the same time (another server, Railway service or PC). Stop it, or the bot misses messages."})
         items.append({"name": "Bot privacy mode", "ok": not tg.PRIVACY_ON,
                       "detail": "On: the bot doesn't see group messages (@BotFather → /setprivacy → Disable)" if tg.PRIVACY_ON else "Off: the bot sees who chats"})
     ms = music.STATS
@@ -704,6 +721,13 @@ async def api_health(request: Request, uid, chat_id, st):
                   + (" · PO token: " + ("plugin ready" if music.POT_PLUGIN else "plugin missing")
                      + (", provider set" if config.POT_PROVIDER_URL else ", POT_PROVIDER_URL not set"))
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
+    items.append({"name": "PO token provider", **(await music.pot_check())})
+    n403 = music.refused_last_hour()
+    items.append({"name": "YouTube song links", "ok": n403 < 10,
+                  "detail": "No refused links in the last hour" if not n403 else
+                  f"YouTube refused {n403} song link{'s' if n403 != 1 else ''} in the last hour"
+                  + (" — songs may start late or stay silent. Check the PO token provider above; YouTube cookies "
+                     "(YT_COOKIES_B64) help too" if n403 >= 10 else " (retried by themselves)")})
     lkc = await lk.check()
     items.append({"name": "Voice (LiveKit)", **lkc})
     items.append({"name": "Full member list", **members.status()})
@@ -747,6 +771,7 @@ async def ws_endpoint(ws: WebSocket):
         return
     user = await db.q1("SELECT * FROM users WHERE uid=?", (uid,)) or {}
     conn = Conn(ws, uid)
+    conn.cid = ws.query_params.get("c", "")[:40]
     try:
         await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
         while True:
@@ -755,7 +780,7 @@ async def ws_endpoint(ws: WebSocket):
             conn.hits.append(t)
             if len(conn.hits) == conn.hits.maxlen and t - conn.hits[0] < 5:
                 continue  # flood protection
-            if len(raw) > 8000:
+            if len(raw) > 200_000:  # ("Add all" on a long playlist is a big message: 8000 cut it off at ~45 songs)
                 continue
             try:
                 msg = json.loads(raw)
@@ -780,10 +805,14 @@ async def api_bye(request: Request):
         return Response(status_code=204)
     room = ROOMS.get(chat_id)
     p = room.parts.get(uid) if room else None
+    cid = request.query_params.get("c", "")
     if p:
-        for c in list(p.conns):
+        # only the app that closed: the same person on another phone stays (old apps send no id: all of them)
+        for c in [c for c in p.conns if not cid or getattr(c, "cid", "") == cid]:
             await c.close(1000)
-            await room.leave(c)
+            await room.leave(c, at_once=True)
+        if not p.conns and room.parts.get(uid) is p and not cid:
+            await room._gone(p)
     return Response(status_code=204)
 
 
@@ -797,6 +826,13 @@ async def health(request: Request):
     return JSONResponse({"ok": True})
 
 
+async def favicon(request: Request):
+    # browsers ask for it on every open (it was a 404 in the logs): a small music note
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2b5278"/>'
+           '<path d="M40 14v24.5a7 7 0 1 1-4-6.3V22l-12 3v17.5a7 7 0 1 1-4-6.3V20z" fill="#fff"/></svg>')
+    return Response(svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=604800"})
+
+
 async def robots(request: Request):
     return Response("User-agent: *\nDisallow: /\n", media_type="text/plain")
 
@@ -805,13 +841,15 @@ async def robots(request: Request):
 async def lifespan(app):
     tasks = [asyncio.create_task(tg.run_polling()), asyncio.create_task(tg.schedule_loop()),
              asyncio.create_task(heartbeat_loop()), asyncio.create_task(pin.startup_reset()),
-             asyncio.create_task(pin.countdown_loop())]
+             asyncio.create_task(pin.countdown_loop()), asyncio.create_task(bg_tick_loop())]
     log.info("LiveKit %s", "enabled" if lk.enabled() else "NOT configured (voice disabled)")
     yield
+    for r in list(ROOMS.values()):  # a deploy or restart: keep the queue and the song for when it's back
+        await r.save_now()
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    for c in (music._http, tg._client, lk._client):
+    for c in (music._http, music._sthttp, tg._client, lk._client):
         if c is not None:
             await c.aclose()
 
@@ -820,6 +858,7 @@ routes = [
     Route("/", index),
     Route("/health", health),
     Route("/robots.txt", robots),
+    Route("/favicon.ico", favicon),
     Route("/api/auth", api_auth, methods=["POST"]),
     Route("/api/lk", api_lk_token),
     Route("/api/search", api_search),

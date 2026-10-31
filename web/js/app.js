@@ -1,4 +1,4 @@
-import { $, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
+import { $, CID, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
 import { getMusicVolume, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
@@ -60,7 +60,7 @@ let byeSent = false;
 function bye() {
   if (byeSent || !S.session) return;
   byeSent = true;
-  try { navigator.sendBeacon('/api/bye?s=' + encodeURIComponent(S.session)); } catch {}
+  try { navigator.sendBeacon('/api/bye?s=' + encodeURIComponent(S.session) + '&c=' + CID); } catch {}
   leaveVoice();
 }
 window.addEventListener('pagehide', bye);
@@ -75,6 +75,9 @@ function goFullscreen() {
 let started = false;
 on('ws:init', (m) => {
   S.admin = m.admin; S.room = m.room; S.group = m.group;
+  // appearing as the group: members know us by a stand-in id, and the voice uses it too
+  S.pid = m.pid || null;
+  if (m.livekit) S.lk = m.livekit;
   S.parts = new Map(m.parts.map(p => [p.uid, p]));
   // The server decides what we may read back: since we joined (admins: 48 hours). A quick reconnect keeps it;
   // leaving and joining again starts over.
@@ -86,6 +89,12 @@ on('ws:init', (m) => {
     started = true;
     startVoice(S.lk);
     bindDock();
+  } else {
+    // Reconnected after a longer drop: the room has us back with the mic off, but we may still be talking.
+    // Tell it what we're really doing (before, we saw "You're live" and everyone else saw us muted).
+    if (V.mic) send({ t: 'mic', on: true });
+    if (V.cam) send({ t: 'video', on: true });
+    if (V.screen) send({ t: 'screen', on: true });
   }
   renderHeader(); renderGrid(true); renderDock();
 });
@@ -635,7 +644,7 @@ function msgEl(m) {
 function reactsEl(m) {
   const e = Object.entries(m.reactions || {});
   if (!e.length) return null;
-  return h('div', { class: 'reacts' }, ...e.map(([em, us]) => h('button', { class: us.includes(S.uid) ? 'mine' : '', onclick: (ev) => { ev.stopPropagation(); send({ t: 'react', id: m.id, emoji: em }); } }, em, String(us.length))));
+  return h('div', { class: 'reacts' }, ...e.map(([em, us]) => h('button', { class: us.includes(S.uid) || (S.pid && us.includes(S.pid)) ? 'mine' : '', onclick: (ev) => { ev.stopPropagation(); send({ t: 'react', id: m.id, emoji: em }); } }, em, String(us.length))));
 }
 function msgMenu(m) {
   haptic('light');
@@ -728,7 +737,7 @@ function adminRoom(c) {
   // the recording section follows the room state (start / rename / stop) without redrawing the whole tab
   const drawRec = () => {
     const rec = S.room.rec || {};
-    const mine = rec.on && rec.by === S.uid;
+    const mine = rec.on && (rec.by === S.uid || (S.pid && rec.by === S.pid));
     const name = h('input', { class: 'field', maxlength: 60, placeholder: 'Recording name (optional)', value: rec.name || '' });
     name.addEventListener('change', () => send({ t: 'rec.name', name: name.value }));
     recBox.replaceChildren(
@@ -773,7 +782,7 @@ function scheduleBox() {
       h('button', { class: 'close-x', 'aria-label': 'Delete', onclick: () => { send({ t: 'admin.unschedule', id: x.id }); setTimeout(load, 300); } }, icon('trash'))))) : '');
   };
   box.append(h('div', { style: { display: 'grid', gap: '8px', margin: '8px 0' } }, when, ttl,
-    h('button', { class: 'btn sm', onclick: () => { const at = new Date(when.value).getTime() / 1000; send({ t: 'admin.schedule', at, title: ttl.value }); setTimeout(load, 400); } }, 'Schedule reminder')), list);
+    h('button', { class: 'btn sm', onclick: () => { const at = new Date(when.value).getTime() / 1000; if (!when.value || !Number.isFinite(at)) return toast('Pick a date and time first'); send({ t: 'admin.schedule', at, title: ttl.value }); setTimeout(load, 400); } }, 'Schedule reminder')), list);
   load().catch(() => {});
   return box;
 }
@@ -803,7 +812,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;

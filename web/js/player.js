@@ -75,6 +75,8 @@ const rate = () => S.music?.rate || 1;
 let G = null; // WebAudio graph
 
 const cur = () => S.music?.current || null;
+// a song I added (as the group, songs carry my stand-in id)
+const mine = (t) => !!t && (t.byUid === S.uid || (!!S.pid && t.byUid === S.pid));
 const playing = () => S.music?.status === 'playing';
 const loadingSong = () => S.music?.status === 'loading'; // the server is still finding the stream: the song starts at 0 once it's ready
 // video is on when someone turned it on for this song (and you didn't switch back), or you turned it on for you
@@ -160,7 +162,7 @@ function onAudioError() {
   console.warn('audio error', audio.error);
   report('music-error', `code=${audio.error?.code} ${audio.error?.message || ''} song=${t.id} try=${errCount + 1}`);
   if (errQid !== t.qid) { errQid = t.qid; errCount = 0; }
-  if (++errCount > 4) { if (errCount === 5) toast('This song can’t be played right now'); return; }
+  if (++errCount > 4) { if (errCount === 5) { toast('This song can’t be played right now'); report('music-gaveup', `song=${t.id} after errors`); } return; }
   // quick first retries: a refused first link is usually fine a moment later (the server gets a fresh one)
   const n = errCount;
   setTimeout(() => { if (P.loadedQid === t.qid && audio.error) { audio.src = audioSrc(t) + '&try=' + n; audio.load(); tryPlay(); } }, [600, 1500, 3000, 5000][n - 1]);
@@ -199,8 +201,15 @@ function shownVideoTime() {
   return video.currentTime;
 }
 
+// Tell the room whether this phone blends songs. It moves on a few seconds early (crossfade) only when every
+// phone does; a phone that can't blend (iPhone, crossfade off, an effect on) would lose each song's last seconds.
+function reportCaps() {
+  const xf = crossfadeOn() && (WA.on || (canFade() && !!spare?.__ok));
+  if (xf !== P.caps) { P.caps = xf; send({ t: 'caps', xfade: xf }); }
+}
 function sync(force = false) {
   lastSync = Date.now();
+  reportCaps();
   let pr = predicted();
   // The room's clock says the song is over (our copy may be stopped a moment before its own "ended" fires):
   // count it as ended and go straight on to the next song, rather than pausing and waiting.
@@ -246,7 +255,18 @@ function sync(force = false) {
   if (want && audio.paused && !over) tryPlay();
   else if ((!want || over) && !audio.paused) audio.pause();
   // With an effect on, the song goes through Web Audio; if the phone suspended it, the song "plays" in silence.
-  if (want && G && G.c.state !== 'running') { setBlocked(true); G.c.resume().then(() => { if (G?.c.state === 'running') setBlocked(false); }, () => {}); }
+  if (want && G && G.c.state !== 'running') {
+    setBlocked(true); G.c.resume().then(() => { if (G?.c.state === 'running') setBlocked(false); }, () => {});
+    // The phone keeps Web Audio asleep (iPhone after a call or a trip to the background, until a tap). Rather
+    // than silence, play the song without the effect on the plain player a tap already unlocked; the next tap
+    // brings the effect back.
+    P.gSleep ||= Date.now();
+    if (Date.now() - P.gSleep > 1500 && !tapped && spare?.__ok) {
+      console.info('music: Web Audio is asleep, playing without the effect until the next tap');
+      report('music-fx-asleep', `state=${G.c.state}`);
+      P.gSleep = 0; releaseGraph(true); setBlocked(false);
+    }
+  } else P.gSleep = 0;
   syncVideo();
 }
 let fine = 0; // -1 slower, 0 normal, +1 faster (small catch-up on the audio)
@@ -312,12 +332,45 @@ function reviveDead(want) {
   if (!dead.at) { dead.at = now; return; } // give the normal "error" retry a moment first
   dead = { n: dead.n + 1, at: now };
   report('music-dead', `song=${P.loadedTrack?.id} try=${dead.n} net=${audio.networkState} err=${audio.error?.code || 0}`);
+  if (dead.n === 4) report('music-gaveup', `song=${P.loadedTrack?.id} link keeps failing`); // (the room skips it if half the phones say so)
   audio.src = audio.getAttribute('src').replace(/&try=[^&]*/g, '') + '&try=d' + dead.n;
   audio.load(); tryPlay();
 }
 // coming back to the app: jump to where the room is now (not where it was when you left)
 const back = () => { G?.c.resume().catch(() => {}); if (WA.on) getCtx(); sync(true); emit('app:back'); }; // (getCtx wakes the Web Audio mode's context)
+// Minimized, the app's timers stop; the server then sends a small tick every few seconds, and each one runs the
+// player's checks (a song that failed to load in the background used to wait for the app to be opened again).
+const tellBg = () => send({ t: 'bg', on: document.hidden });
+on('ws:tick', () => { if (document.hidden && Date.now() - lastSync > 900) sync(); });
+on('ws:init', () => { if (document.hidden) tellBg(); });
+// An effect runs the song through Web Audio, and Android starves Web Audio while Telegram is minimized: the song
+// crackled. So minimized, the song moves to the plain player (without the effect) and the effect comes back when
+// the app is opened again. The plain player takes over only once it really plays; if the phone won't let it, the
+// song stays on the effect.
+function effectsToBackground() {
+  if (!G || tapped || isApple || WA.on || !spare?.__ok || audio.paused || !audio.getAttribute('src') || isSilence(audio)) return;
+  const old = audio, a = spare, src = old.getAttribute('src');
+  a.muted = true; a.src = src; a.playbackRate = old.playbackRate;
+  try { a.currentTime = old.currentTime + 0.25; } catch {}
+  a.play().then(() => {
+    if (audio !== old || !G || !document.hidden) { a.pause(); a.removeAttribute('src'); a.load(); a.muted = false; return; }
+    try { a.currentTime = old.currentTime; } catch {}
+    a.muted = false; a.volume = P.vol;
+    audio = a; spare = null;
+    old.pause(); old.removeAttribute('src'); old.load();
+    try { G.master.disconnect(); } catch {}
+    G = null; P.fxBg = true;
+    console.info('music: minimized, playing without the effect until the app is open again');
+  }, () => { a.removeAttribute('src'); a.load(); a.muted = false; });
+}
+function effectsBack() {
+  if (!P.fxBg) return;
+  P.fxBg = false;
+  if (needGraph() && !G) { buildGraph(); G?.c.resume().catch(() => {}); }
+}
 document.addEventListener('visibilitychange', () => {
+  tellBg();
+  if (document.hidden) effectsToBackground(); else effectsBack();
   if (!document.hidden) return back();
   if (!G && !WA.on) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
 });
@@ -595,8 +648,8 @@ const needGraph = () => {
   return tapped || f.mode !== 'none' || !!(f.bass || f.mid || f.treble || f.reverb) || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
 };
 // effects switched off: move the song back to a plain <audio> element (keeps playing where it was)
-function releaseGraph() {
-  if (!G || needGraph()) return;
+function releaseGraph(force = false) {
+  if (!G || (needGraph() && !force)) return;
   // Moving the song to a fresh <audio> needs one a tap has unlocked (else it's silent on iPhone / Telegram Android).
   // Without one, the song stays on the effects graph (now set flat) until the next tap brings a spare.
   if (!spare?.__ok) { applyFx(FX_NONE); return; }
@@ -679,6 +732,7 @@ async function setMusicSink(id) {
 on('voice:sink', (id) => { setMusicSink(id); kickAudio('speaker'); });
 // the recorder needs the music as Web Audio
 export function musicTap() { tapped = true; buildGraph(); return G ? { ctx: G.c, node: G.master } : null; }
+export function musicUntap() { tapped = false; if (G && !needGraph()) releaseGraph(); }
 
 // ======================= colors from artwork =======================
 const colorCache = new Map();
@@ -834,7 +888,7 @@ function togglePlay() {
 function next() {
   haptic('medium');
   const t = cur(); if (!t) return;
-  if ((t.byUid === S.uid && can('skip_own')) || can('playback')) send({ t: 'music.skip' });
+  if ((mine(t) && can('skip_own')) || can('playback')) send({ t: 'music.skip' });
   else if (can('vote')) { send({ t: 'music.voteskip' }); toast('Voted to skip'); }
   else deny('vote');
 }
@@ -964,7 +1018,7 @@ export function refresh() {
   if (pp.getAttribute('aria-label') !== (isPlay ? 'Pause' : 'Play')) { pp.replaceChildren(icon(isPlay ? 'pause' : 'play', 'fill')); pp.setAttribute('aria-label', isPlay ? 'Pause' : 'Play'); }
   el.querySelector('#np-prev').classList.toggle('locked', !can('playback'));
   const v = S.music;
-  el.querySelector('#np-votes').textContent = !can('playback') && t.byUid !== S.uid && v.votes ? `${v.votes}/${v.need}` : '';
+  el.querySelector('#np-votes').textContent = !can('playback') && !mine(t) && v.votes ? `${v.votes}/${v.need}` : '';
   el.querySelector('#np-scrub').classList.toggle('ro', !can('playback'));
   el.querySelector('#np-like').classList.toggle('on', S.liked.has(t.id));
   const lk = el.querySelector('#np-like'), liked = S.liked.has(t.id) ? '1' : '0';
@@ -978,8 +1032,9 @@ const queueSig = () => { const m = S.music; return [m.loop, m.autoplay, can('que
 // ======================= server updates =======================
 let lastQid = null, lastTimeline = '', lastFx = '';
 on('ws:music', (m) => onMusic(m.m));
-on('ws:init', (m) => onMusic(m.music));
+on('ws:init', (m) => { P.caps = null; onMusic(m.music); reportCaps(); }); // (a new connection starts as "can't blend")
 function onMusic(m) {
+  if (m.queueSame) m.queue = S.music?.queue || []; // (the server leaves the queue out when it didn't change)
   S.music = m;
   const t = m.current;
   if (t && t.qid === P.loadedQid) P.loadedTrack = t; // keep what we know about the playing song fresh (start/end arrive later)
@@ -1076,12 +1131,12 @@ function renderQueue(st) {
   st.append(box);
 }
 function queueMenu(t, i) {
-  const mine = t.byUid === S.uid;
+  const own = mine(t);
   const body = h('div', { class: 'list' },
     actionRow('play', 'Play now', () => { if (!can('queue')) return deny('queue'); send({ t: 'music.playnow', qid: t.qid }); s.close(); }, can('queue') ? '' : 'locked'),
     i > 0 ? actionRow('up', 'Move to top', () => { if (!can('queue')) return deny('queue'); send({ t: 'music.move', qid: t.qid, to: 0 }); s.close(); }, can('queue') ? '' : 'locked') : null,
     actionRow('list-plus', 'Add to a playlist', () => { s.close(); addToPlaylist([t]); }),
-    actionRow('trash', 'Remove from queue', () => { if (!(mine || can('queue'))) return deny('queue'); send({ t: 'music.remove', qid: t.qid }); s.close(); }, mine || can('queue') ? 'red' : 'red locked'));
+    actionRow('trash', 'Remove from queue', () => { if (!(own || can('queue'))) return deny('queue'); send({ t: 'music.remove', qid: t.qid }); s.close(); }, own || can('queue') ? 'red' : 'red locked'));
   const s = sheet({ title: t.title, body });
 }
 
@@ -1180,7 +1235,7 @@ async function openQuality() {
 
 // ======================= effects sheet =======================
 // Everyone hears the same effect. Only admins, or whoever added the playing song, can change it.
-const canFx = () => can('fx') || (!!cur() && cur().byUid === S.uid && can('fx_own'));
+const canFx = () => can('fx') || (!!cur() && mine(cur()) && can('fx_own'));
 function openFx() {
   unlockAudio();
   const body = h('div');

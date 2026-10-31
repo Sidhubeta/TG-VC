@@ -23,6 +23,9 @@ def client() -> httpx.AsyncClient:
 
 class ApiError(RuntimeError):
     """Telegram answered and said no (as opposed to a network problem)."""
+    def __init__(self, text: str, code: int = 0):
+        super().__init__(text)
+        self.code = code
 
 
 async def _post(method: str, **kw) -> dict:
@@ -34,7 +37,7 @@ async def _post(method: str, **kw) -> dict:
             await asyncio.sleep(retry)  # flood control: wait once, then retry
             continue
         if not data.get("ok"):
-            raise ApiError(f"{method}: {data.get('description')}")
+            raise ApiError(f"{method}: {data.get('description')}", int(data.get("error_code") or r.status_code or 0))
         return data["result"]
 
 
@@ -71,8 +74,10 @@ async def admin_list(chat_id: int) -> list[dict]:
         res = await call("getChatAdministrators", chat_id=chat_id)
         out = [{"uid": a["user"]["id"], "name": _full_name(a["user"]), "username": a["user"].get("username") or "",
                 "anonymous": bool(a.get("is_anonymous"))} for a in res if not a["user"].get("is_bot")]
-    except Exception:
-        out = hit[1] if hit else []
+    except Exception as e:
+        # Not remembered for 10 minutes: one failed lookup used to leave the group "without admins" that long.
+        log.info("getChatAdministrators %s failed: %s", chat_id, e)
+        return hit[1] if hit else []
     _admins_cache[chat_id] = (time.time(), out)
     return out
 
@@ -187,13 +192,18 @@ async def member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
             "admin": st in ("creator", "administrator"),
             "name": _full_name(u)[:64], "username": u.get("username") or "", "bot": bool(u.get("is_bot")),
         }
-    except ApiError as e:  # Telegram's answer: not a member / chat gone
-        log.info("getChatMember %s %s: %s", chat_id, uid, e)
+    except ApiError as e:
+        if e.code not in (400, 403):
+            # Too many requests (429) or Telegram's own trouble (5xx) is not an answer: keep what we knew. It used
+            # to count as "not a member", and the room's check removed everyone at once.
+            log.warning("getChatMember %s %s: %s", chat_id, uid, e)
+            return hit[1] if hit else {"member": False, "admin": False, "name": "", "username": "", "bot": False, "unsure": True}
+        log.info("getChatMember %s %s: %s", chat_id, uid, e)  # Telegram's answer: not a member / chat gone
         res = {"member": False, "admin": False, "name": "", "username": "", "bot": False}
     except Exception as e:
         # Network trouble is not an answer: keep the last known status instead of kicking people out.
         log.warning("getChatMember failed %s %s: %s", chat_id, uid, e)
-        return hit[1] if hit else {"member": False, "admin": False, "name": "", "username": "", "bot": False}
+        return hit[1] if hit else {"member": False, "admin": False, "name": "", "username": "", "bot": False, "unsure": True}
     if len(_member_cache) > 5000:
         cutoff = time.time() - 120
         for k in [k for k, v in _member_cache.items() if v[0] < cutoff]:
@@ -327,6 +337,9 @@ async def _handle(upd: dict):
     await db.x("UPDATE groups SET title=? WHERE chat_id=?", (chat.get("title", ""), cid))
     if cmd in ("/vc", "/start", "/voice", "/join"):
         from . import pin
+        if time.time() - _vc_last.get(cid, 0) < 20:  # spam: the pinned bar is already fresh
+            return
+        _vc_last[cid] = time.time()
         thread = msg.get("message_thread_id") if msg.get("is_topic_message") else None
         try:
             await pin.post(cid, thread)
@@ -345,6 +358,9 @@ async def _handle(upd: dict):
         from . import pin
         await pin.refresh(cid, force=True)
         await call("sendMessage", chat_id=cid, text="🔒 Old voice chat link disabled. The pinned Join button now uses the new link.")
+
+
+_vc_last: dict[int, float] = {}
 
 
 def _esc(s: str) -> str:
@@ -377,6 +393,11 @@ async def run_polling():
         except Exception as e:
             log.error("getMe failed: %s (retrying)", e)
             await asyncio.sleep(10)
+    try:
+        # a webhook set earlier (another host, an old setup) makes every getUpdates fail with 409
+        await call("deleteWebhook", drop_pending_updates=False)
+    except Exception as e:
+        log.info("deleteWebhook: %s", e)
     log.info("Bot @%s running", BOT_USERNAME)
     offset = 0
     while True:
@@ -394,6 +415,11 @@ async def run_polling():
         except Exception as e:
             STATS["poll_err"], STATS["poll_err_at"] = str(e)[:200], time.time()
             log.warning("polling error: %s", e)
+            if "Conflict" in str(e) and "other getUpdates" in str(e):
+                STATS["conflicts"] = STATS.get("conflicts", 0) + 1
+                if STATS["conflicts"] % 20 == 10:  # (a few during a deploy are normal: the old copy is stopping)
+                    log.error("Another copy of this bot keeps polling Telegram (another server, service or PC uses "
+                              "the same BOT_TOKEN). Stop it, or the bot misses messages.")
             await asyncio.sleep(3)
 
 
@@ -420,12 +446,12 @@ os.makedirs(AV_DIR, exist_ok=True)
 _av_locks: dict[int, asyncio.Lock] = {}
 
 
-async def fetch_bio(uid: int) -> str:
+async def fetch_bio(uid: int) -> str | None:
     try:
         c = await call("getChat", chat_id=uid)
         return (c.get("bio") or "")[:140]
     except Exception:
-        return ""
+        return None  # unknown (not "no bio"): the caller keeps the one it has
 
 
 async def _download_file(file_id: str) -> bytes | None:
@@ -447,7 +473,7 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
     async with lock:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
             return path
-        data = None
+        data, answered = None, False
         try:
             if entity_id > 0:
                 r = await call("getUserProfilePhotos", user_id=entity_id, limit=1)
@@ -455,10 +481,12 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
                     sizes = r["photos"][0]
                     pick = next((x for x in sizes if x.get("width", 0) >= 300), sizes[-1])
                     data = await _download_file(pick["file_id"])
+                answered = True
             else:
                 c = await call("getChat", chat_id=entity_id)
                 if c.get("photo"):
                     data = await _download_file(c["photo"]["big_file_id"])
+                answered = True
         except Exception as e:
             log.info("avatar %s: %s", entity_id, e)
         if not data and fallback_url:
@@ -476,7 +504,12 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
             if os.path.exists(miss):
                 os.remove(miss)
             return path
-        open(miss, "w").close()
+        if answered:
+            open(miss, "w").close()  # really no photo: don't ask again for 6 hours
+        elif not os.path.exists(miss):
+            # a failed request: try again in a few minutes (a "no photo" mark hid the avatar for 6 hours)
+            open(miss, "w").close()
+            os.utime(miss, (now - 6 * 3600 + 300, now - 6 * 3600 + 300))
         if os.path.exists(path):  # stale but better than nothing
             return path
         return None

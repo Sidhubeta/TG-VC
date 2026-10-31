@@ -26,14 +26,22 @@ def room_name(chat_id: int) -> str:
     return f"g{chat_id}"
 
 
-def join_token(chat_id: int, uid: int, name: str, can_publish: bool, ttl: int = 6 * 3600) -> str:
+def join_token(chat_id: int, uid: int, name: str, can_publish: bool, ttl: int = 20 * 60) -> str:
+    # (uid is the LiveKit identity: the Telegram id, or the stand-in id of someone appearing as the group)
+    # Short-lived: a token only matters when joining. LiveKit hands connected apps fresh ones, and the app asks us
+    # for a new one when it reconnects (/api/lk, which checks bans). A 6-hour token let a banned person with a
+    # modified app get back into the voice for hours.
     now = int(time.time())
     claims = {
-        "iss": config.LIVEKIT_API_KEY, "sub": str(uid), "nbf": now - 10, "exp": now + ttl, "name": name,
+        "iss": config.LIVEKIT_API_KEY, "sub": str(uid), "nbf": now - 10, "exp": now + ttl, "name": "",  # (names come from the room, not LiveKit: someone appearing as the group stays hidden)
         "video": {"room": room_name(chat_id), "roomJoin": True, "canSubscribe": True,
                   "canPublish": can_publish, "canPublishData": False},
     }
     return jwt.encode(claims, config.LIVEKIT_API_SECRET, algorithm="HS256")
+
+
+def join_info(chat_id: int, identity: int, can_publish: bool) -> dict:
+    return {"url": config.LIVEKIT_URL, "token": join_token(chat_id, identity, "", can_publish)}
 
 
 def _admin_token(room: str) -> str:
@@ -58,13 +66,13 @@ async def _twirp(method: str, body: dict):
         return None
 
 
-async def set_publish(chat_id: int, uid: int, allowed: bool):
+async def set_publish(chat_id: int, uid, allowed: bool):
     room = room_name(chat_id)
     await _twirp("UpdateParticipant", {"room": room, "identity": str(uid), "permission": {
         "can_subscribe": True, "can_publish": allowed, "can_publish_data": False}})
 
 
-async def remove(chat_id: int, uid: int):
+async def remove(chat_id: int, uid):
     await _twirp("RemoveParticipant", {"room": room_name(chat_id), "identity": str(uid)})
 
 

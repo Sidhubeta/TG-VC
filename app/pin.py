@@ -192,8 +192,19 @@ async def _state(chat_id: int) -> tuple[list[dict], int, str]:
     else:
         sch = await db.q1("SELECT at FROM schedules WHERE chat_id=? AND sent=0 ORDER BY at LIMIT 1", (chat_id,))
         if sch and sch["at"] - time.time() < 7 * 86400:
+            # Coarser the further away it is: the bar is a new picture each time the text changes, and minute-by-
+            # minute text meant a new upload every minute for up to a week.
             mins = max(1, int((sch["at"] - time.time()) / 60))
-            sub = f"Starts in {mins // 60}h {mins % 60}m" if mins >= 60 else f"Starts in {mins}m"
+            if mins >= 1440:
+                sub = f"Starts in {mins // 1440}d {mins % 1440 // 60}h"
+            elif mins >= 120:
+                sub = f"Starts in {mins // 60}h"
+            elif mins >= 60:
+                sub = f"Starts in 1h {mins % 60 // 10 * 10}m"
+            elif mins >= 15:
+                sub = f"Starts in {mins // 5 * 5}m"
+            else:
+                sub = f"Starts in {mins}m"
         else:
             sub = "No participants"
     return people, n, sub
@@ -217,6 +228,12 @@ async def post(chat_id: int, thread_id: int | None = None, repin_only: bool = Fa
             return mid
         except Exception as e:
             log.info("re-pin failed (%s), posting new", e)
+            # Without the "Pin messages" right the re-pin fails every time: each /vc added another bar. The old
+            # one goes, so there's only ever one.
+            try:
+                await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
+            except Exception:
+                pass
     people, n, sub = await _state(chat_id)
     img = await render(chat_id, people, n, sub)
     data = {"chat_id": str(chat_id), "caption": caption_for(n, sub), "parse_mode": "HTML",

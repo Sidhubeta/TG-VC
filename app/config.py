@@ -30,6 +30,7 @@ YT_COOKIES = _env("YT_COOKIES")            # contents of cookies.txt (Netscape f
 YT_COOKIES_B64 = _env("YT_COOKIES_B64")    # same, base64 encoded (easier for Railway vars)
 POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. http://bgutil.railway.internal:4416
 AUDIO_CACHE_MB = int(_env("AUDIO_CACHE_MB", "800"))
+VIDEO_CACHE_MB = int(_env("VIDEO_CACHE_MB", "600"))  # 0 = don't cache videos
 
 # Optional: the full member list for invites. The Bot API can't list a group's members, Telegram's full API
 # (MTProto) can. Get both values at https://my.telegram.org -> API development tools. Without them, the invite

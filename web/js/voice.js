@@ -37,6 +37,11 @@ async function connect() {
     const mic = store.get('dev:audioinput', ''), out = store.get('dev:audiooutput', '');
     room = new LK.Room({
       adaptiveStream: true, dynacast: true,
+      // LiveKit leaves the voice chat by itself when the page is hidden away ("pagehide") or frozen ("freeze").
+      // Android freezes a minimized Telegram's page for a moment now and then: the voice chat was left, the mic
+      // went off and the music in the voice chat stopped, and nothing joined again. We leave only when the app
+      // really closes (our own pagehide handler).
+      disconnectOnPageLeave: false,
 
       audioCaptureDefaults: {
         echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
@@ -50,11 +55,13 @@ async function connect() {
     });
     wire(room);
     await room.connect(info.url, info.token, { autoSubscribe: true });
+    try { window.removeEventListener('freeze', room.onPageLeave); } catch {} // (it listens to this one regardless)
     V.ready = true;
-    if (failN) toast('Voice connected');
+    if (failN && !document.hidden) toast('Voice connected');
     failN = 0;
     emit('voice', { state: 'ready' });
     emit('voice:session', 'joined');
+    restoreMic();
     if (!room.canPlaybackAudio) emit('voice:blocked', true);
     room.remoteParticipants.forEach(p => (isMusic(p) ? applyMusic(p) : applyVolume(p)));
   } catch (e) {
@@ -176,11 +183,14 @@ function wire(r) {
     }
   });
   r.on(E.Disconnected, (reason) => {
-    if (r !== room) return; // an old room we already replaced
+    if (r !== room) return; // an old room we already replaced (leaving on purpose clears "room" first)
     V.ready = false;
+    if (V.mic) micWanted = true; // (back on once we're in again: the drop wasn't the user's choice)
     resetLocal();
     const R = LK.DisconnectReason || {};
-    if (reason === R.CLIENT_INITIATED) return;
+    D.drops++; D.last = Object.keys(R).find(k => R[k] === reason) || String(reason);
+    if (document.hidden) D.hiddenDrops++;
+    // CLIENT_INITIATED here isn't us (we clear "room" before we leave): it's the SDK leaving by itself
     if (reason === R.PARTICIPANT_REMOVED || reason === R.DUPLICATE_IDENTITY) {
       // removed by an admin, or this account joined from another device: don't fight it
       emit('voice', { state: 'off' });
@@ -191,6 +201,31 @@ function wire(r) {
     scheduleRetry(1500);
   });
 }
+
+// How the voice chat went (for the background report on the Health page).
+const D = { drops: 0, hiddenDrops: 0, last: '' };
+export const voiceDiag = () => `voice=${V.ready ? 'on' : (stopped ? 'off' : 'down')} drops=${D.drops}${D.hiddenDrops ? `(${D.hiddenDrops} hidden)` : ''}${D.last ? ' last=' + D.last : ''} mic=${V.mic ? 'on' : (micWanted ? 'lost' : 'off')}`;
+
+// The mic was on when the voice chat dropped: it comes back on by itself after joining again. A minimized phone may
+// refuse the mic for now; then it's tried again as soon as the app is open.
+let micWanted = false, micRestoring = false;
+async function restoreMic() {
+  if (!micWanted || V.mic || micRestoring || !room || !V.ready) return;
+  micRestoring = true;
+  try {
+    if (await setMic(true)) micWanted = false;
+    else if (!document.hidden) { micWanted = false; toast('Your mic was turned off — tap it to speak again'); }
+  } catch { if (!document.hidden) micWanted = false; } finally { micRestoring = false; }
+}
+// Back in the app (or the page unfrozen): if the voice chat is down, join now instead of after the retry wait.
+function wake() {
+  if (document.hidden || stopped || !info) return;
+  if (!V.ready && !connecting) { clearTimeout(retryTimer); connect(); }
+  else restoreMic();
+}
+document.addEventListener('visibilitychange', wake);
+document.addEventListener('resume', wake);
+window.addEventListener('online', wake);
 
 export async function unblockAudio() {
   try { if (room && !room.canPlaybackAudio) await room.startAudio(); } catch {}
@@ -460,7 +495,7 @@ export async function useDevice(kind, deviceId) {
 }
 
 export async function leaveVoice() {
-  stopped = true; clearTimeout(retryTimer);
+  stopped = true; clearTimeout(retryTimer); micWanted = false;
   const r = room; room = null; V.ready = false;
   try { await r?.disconnect(); } catch {}
 }

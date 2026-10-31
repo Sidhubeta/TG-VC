@@ -1,7 +1,7 @@
 // Music: synced playback engine, Apple Music style UI, lyrics, queue, search, playlists, effects.
 import { $, S, actionRow, api, can, report, confirmBox, deny, dragToClose, emit, fmtTime, fullView, h, haptic, icon, media, off, on, pushBack, send, serverNow, sheet, store, tg, toast } from './core.js';
 import { getCtx } from './sounds.js';
-import { musicInVoice, setMusicVoice } from './voice.js';
+import { musicInVoice, setMusicVoice, voiceDiag } from './voice.js';
 
 // ======================= engine =======================
 // The song plays from a plain <audio> element. It only goes through Web Audio (our effects graph) while an
@@ -382,7 +382,14 @@ const back = () => { G?.c.resume().catch(() => {}); if (WA.on) getCtx(); sync(tr
 // Minimized, the app's timers stop; the server then sends a small tick every few seconds, and each one runs the
 // player's checks (a song that failed to load in the background used to wait for the app to be opened again).
 const tellBg = () => send({ t: 'bg', on: document.hidden });
-on('ws:tick', () => { P.bgTicks = (P.bgTicks || 0) + 1; if (document.hidden && Date.now() - lastSync > 900) sync(); });
+on('ws:tick', () => {
+  P.bgTicks = (P.bgTicks || 0) + 1;
+  // the longest the app went without running while minimized (a phone that froze it shows a long gap here)
+  const now = Date.now();
+  if (document.hidden) { P.bgGap = Math.max(P.bgGap || 0, now - (P.bgLast || P.hiddenAt || now)); P.bgLast = now; }
+  if (document.hidden && Date.now() - lastSync > 900) sync();
+});
+document.addEventListener('freeze', () => { P.bgFrozen = (P.bgFrozen || 0) + 1; });
 on('ws:init', () => { if (document.hidden) tellBg(); });
 // An effect runs the song through Web Audio, and Android starves Web Audio while Telegram is minimized: the song
 // crackled. So minimized, the song moves to the plain player (without the effect) and the effect comes back when
@@ -465,12 +472,16 @@ document.addEventListener('visibilitychange', () => {
   tellBg();
   if (document.hidden) {
     P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false; P.radioPlayed = 0;
+    P.bgGap = 0; P.bgLast = 0; P.bgFrozen = 0; P.bgVia = viaVoice() ? 'voice' : WA.on ? 'webaudio' : 'player';
     effectsToBackground(); startRadio();
   } else {
     stopRadio(); effectsBack();
     // (for the logs: how a long time in the background went, so a phone that still stops can be told apart)
     const away = (Date.now() - (P.hiddenAt || Date.now())) / 1000;
-    if (away > 30 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${P.radioUsed ? Math.round(P.radioPlayed) + 's played' : 'no'} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
+    if (away > 30 && playing()) {
+      const gap = Math.max(P.bgGap || 0, Date.now() - (P.bgLast || P.hiddenAt || Date.now())) / 1000;
+      report('music-bg', `away=${Math.round(away)}s music=${P.bgVia}${P.bgVia === 'player' ? ` radio=${P.radioUsed ? Math.round(P.radioPlayed) + 's played' : 'no'}` : ''} ticks=${P.bgTicks || 0} longest-asleep=${Math.round(gap)}s${P.bgFrozen ? ` frozen=${P.bgFrozen}` : ''} ${voiceDiag()} fx=${!!G}`);
+    }
   }
   reportCaps();
   if (!document.hidden) return back();

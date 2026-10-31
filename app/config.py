@@ -31,6 +31,9 @@ YT_COOKIES_B64 = _env("YT_COOKIES_B64")    # same, base64 encoded (easier for Ra
 POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. http://bgutil.railway.internal:4416
 AUDIO_CACHE_MB = int(_env("AUDIO_CACHE_MB", "800"))
 VIDEO_CACHE_MB = int(_env("VIDEO_CACHE_MB", "600"))  # 0 = don't cache videos
+# The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)
+_owner = _env("OWNER_ID").strip()
+OWNER_ID = int(_owner) if _owner.isdigit() else 0
 
 # Optional: the full member list for invites. The Bot API can't list a group's members, Telegram's full API
 # (MTProto) can. Get both values at https://my.telegram.org -> API development tools. Without them, the invite

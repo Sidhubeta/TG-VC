@@ -9,12 +9,12 @@ from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, badges, config, db, lk, members, music, pin, tg
+from . import auth, badges, config, db, lk, members, music, pin, radio, sudo, tg
 from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -71,6 +71,14 @@ async def _json(request: Request) -> dict:
     if not isinstance(body, dict):
         raise Denied("Bad request", 400)
     return body
+
+
+sudo.load()
+
+
+def is_sudo(uid: int, st: dict | None = None) -> bool:
+    """The bot's owner (OWNER_ID) or a sudo user they added: the only ones who see the Health page."""
+    return sudo.is_sudo(uid)
 
 
 async def is_banned(chat_id: int, uid: int) -> bool:
@@ -233,6 +241,19 @@ async def api_stream(request: Request):
                               request.query_params.get("q", "medium"))
 
 
+async def api_radio(request: Request):
+    """The room's music as one endless stream, for a minimized app (see radio.py)."""
+    try:
+        uid, chat_id, _ = await session(request)
+    except Denied as d:
+        return Response(d.msg, status_code=d.code)
+    room = ROOMS.get(chat_id)
+    if not room or radio.busy():
+        return Response("not available", status_code=503)
+    return StreamingResponse(radio.stream(room, request), media_type="audio/mpeg",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
 async def api_avatar(request: Request):
     try:
         uid, chat_id, _ = await session(request)
@@ -305,13 +326,23 @@ async def api_lyrics(request: Request, uid, chat_id, st):
 
 @guarded()
 async def api_history(request: Request, uid, chat_id, st):
-    """Play history of this voice chat: what played, who added it, when. ?offset= for more, ?mine=1 for my songs."""
+    """Play history of this voice chat over the last 24 hours: what played, who added it, when. ?offset= for more,
+    ?mine=1 for my songs, ?q= to search the song, artist or who added it."""
     offset = max(0, int(_num(request.query_params.get("offset"), 0)))
     limit = max(10, min(100, int(_num(request.query_params.get("limit"), 50))))
     mine = request.query_params.get("mine") == "1"
-    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts,asg FROM plays WHERE chat_id=?"
-                      + (" AND by_uid=?" if mine else "") + " ORDER BY id DESC LIMIT ? OFFSET ?",
-                      (chat_id, uid, limit + 1, offset) if mine else (chat_id, limit + 1, offset))
+    q = (request.query_params.get("q") or "").strip()[:60]
+    where, args = "chat_id=? AND ts>?", [chat_id, time.time() - 86400]
+    if mine:
+        where += " AND by_uid=?"
+        args.append(uid)
+    if q:
+        like = "%" + q.replace("\\", "").replace("%", "").replace("_", " ") + "%"
+        # (someone who played as the group is found by the group's name, not their own)
+        where += " AND (title LIKE ? OR artist LIKE ? OR by_name LIKE ?)"
+        args += [like, like, like]
+    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts,asg FROM plays WHERE " + where
+                      + " ORDER BY id DESC LIMIT ? OFFSET ?", (*args, limit + 1, offset))
     more = len(rows) > limit
     rows = rows[:limit]
     from .room import pid_of
@@ -685,7 +716,28 @@ async def api_badges(request: Request, uid, chat_id, st):
                          "all": badges.describe(badges.ORDER)})
 
 
-# ---------------- health (admins) ----------------
+# ---------------- sudo users (the owner manages them) ----------------
+@guarded()
+async def api_sudo(request: Request, uid, chat_id, st):
+    """GET: the list. POST {"who": "<id or @username>"} adds, {"remove": uid} removes. The owner only."""
+    if not sudo.is_owner(uid):
+        return err("Only the bot's owner can change sudo users", 403)
+    if request.method == "POST":
+        body = await _json(request)
+        if "remove" in body:
+            await sudo.remove(int(_num(body.get("remove"))))
+        else:
+            who = await sudo.find(str(body.get("who", ""))[:64])
+            if not who:
+                return err("I don't know that username yet. Ask them to open the voice chat once (or write in a "
+                           "group with the bot), or use their numeric Telegram id.")
+            if sudo.is_owner(who["uid"]):
+                return err("That's you — the owner always has access")
+            await sudo.add(who["uid"], who.get("name") or "", who.get("username") or "", uid)
+    return JSONResponse({"users": await sudo.listing()})
+
+
+# ---------------- health (the bot's owner and sudo users) ----------------
 _started = time.time()
 
 
@@ -696,11 +748,13 @@ def _ago(ts: float) -> str:
     return f"{s}s ago" if s < 120 else f"{s // 60} min ago" if s < 7200 else f"{s // 3600} h ago"
 
 
-@guarded(need_admin=True)
+@guarded()
 async def api_health(request: Request, uid, chat_id, st):
-    """Is everything working? One look for admins: bot, YouTube, LiveKit, member lists, storage, phones' problems."""
+    """Is everything working? One look for the owner: bot, YouTube, LiveKit, member lists, storage, phones' problems."""
     import shutil
     from .room import DIAG
+    if not is_sudo(uid, st):
+        return err("Only the bot's owner and sudo users can see this", 403)
     if request.method == "POST":  # "Test YouTube now"
         t = time.time()
         try:
@@ -785,6 +839,8 @@ async def ws_endpoint(ws: WebSocket):
     user = await db.q1("SELECT * FROM users WHERE uid=?", (uid,)) or {}
     conn = Conn(ws, uid)
     conn.cid = ws.query_params.get("c", "")[:40]
+    conn.sudo = is_sudo(uid, st)
+    conn.owner = sudo.is_owner(uid)
     try:
         await room.join(conn, user, st["admin"], ws.query_params.get("asg") == "1")
         while True:
@@ -881,6 +937,7 @@ routes = [
     Route("/api/lk", api_lk_token),
     Route("/api/search", api_search),
     Route("/api/stream/{vid}/{kind}", api_stream),
+    Route("/api/radio", api_radio),
     Route("/api/thumb/{vid}", api_thumb),
     Route("/api/avatar/{eid}", api_avatar),
     Route("/emoji/{name}", emoji),
@@ -899,6 +956,7 @@ routes = [
     Route("/api/dmcheck", api_dm_check),
     Route("/api/invite", api_invite, methods=["GET", "POST"]),
     Route("/api/health", api_health, methods=["GET", "POST"]),
+    Route("/api/sudo", api_sudo, methods=["GET", "POST"]),
     Route("/api/badges", api_badges),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),

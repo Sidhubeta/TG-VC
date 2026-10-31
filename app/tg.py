@@ -128,16 +128,9 @@ async def forget_member(chat_id: int, uid: int):
 
 
 async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0) -> str | None:
-    """DM the person a Join button; if they never started the bot, mention them in the group instead."""
+    """Mention the person in the group, with a Join button. (Invites used to go to their private chat with the
+    bot first; they're only posted in the group now.)"""
     url = await group_link(chat_id)
-    title = await chat_title(chat_id)
-    try:
-        await call("sendMessage", chat_id=uid, parse_mode="HTML",
-                   text=f"🎧 <b>{_esc(by_name)}</b> invited you to the voice chat in <b>{_esc(title)}</b>",
-                   reply_markup=join_button(url))
-        return "dm"
-    except Exception:
-        pass
     g = await db.get_group(chat_id)
     params = {"chat_id": chat_id, "parse_mode": "HTML", "reply_markup": join_button(url),
               "text": f'🎧 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you to the voice chat'}
@@ -210,6 +203,7 @@ async def _member_lookup(chat_id: int, uid: int) -> dict:
         res = {
             "member": st in ("creator", "administrator", "member") or (st == "restricted" and bool(m.get("is_member"))),
             "admin": st in ("creator", "administrator"),
+            "owner": st == "creator",
             "name": _full_name(u)[:64], "username": u.get("username") or "", "bot": bool(u.get("is_bot")),
         }
     except ApiError as e:
@@ -253,17 +247,7 @@ async def play_help(chat_id: int, msg: dict, song: str = ""):
         return
     _play_help_at[chat_id] = time.time()
     url = await group_link(chat_id)
-    asked = f"To play <b>{_esc(song)}</b>, join the voice chat and search for it there.\n\n" if song else ""
-    text = (f"🎧 <b>Music plays in the voice chat!</b>\n{asked}"
-            "Tap the pinned <b>Voice Chat</b> message at the top of this group, or the button below, to join.\n\n"
-            "<b>Inside the voice chat you can:</b>\n"
-            "🎵 Play any song — search, or paste a YouTube or Spotify link\n"
-            "⏭ Queue songs, play next, skip, repeat, autoplay\n"
-            "🎤 Read synced lyrics, watch the music video\n"
-            "🎚 Add sound effects for everyone: Bass Boost, 8D, Slowed + Reverb…\n"
-            "🎙 Talk with your mic or camera, chat and send reactions\n"
-            "❤️ Like songs and save playlists\n\n"
-            "Everyone hears the same song at the same moment.")
+    text = f"🎧 Join the voice chat to play <b>{_esc(song)}</b> 👇" if song else "🎧 Songs play in the voice chat — join 👇"
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": join_button(url),
               "reply_parameters": {"message_id": msg["message_id"], "allow_sending_without_reply": True}}
     if msg.get("is_topic_message") and msg.get("message_thread_id"):
@@ -343,6 +327,8 @@ async def _handle(upd: dict):
     cmd = text.split("@")[0]
     if "@" in text and text.split("@")[1] != BOT_USERNAME.lower():
         return
+    if cmd in ("/addsudo", "/delsudo", "/rmsudo", "/sudolist", "/sudo", "/id"):
+        return await _sudo_cmd(msg, cmd, " ".join(words[1:]))
     if chat["type"] == "private":
         if cmd == "/start":
             await call("sendMessage", chat_id=chat["id"], parse_mode="HTML", text=(
@@ -383,6 +369,54 @@ async def _handle(upd: dict):
 _vc_last: dict[int, float] = {}
 
 
+async def _sudo_cmd(msg: dict, cmd: str, arg: str):
+    """The owner's commands: /addsudo and /delsudo (a user id, an @username, a mention, or as a reply), /sudolist.
+    /id tells anyone their own Telegram id (to put in OWNER_ID)."""
+    from . import sudo
+    chat_id, frm = msg["chat"]["id"], msg.get("from") or {}
+    say = lambda text: call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                            reply_parameters={"message_id": msg["message_id"], "allow_sending_without_reply": True})
+    if cmd == "/id":
+        target = (msg.get("reply_to_message") or {}).get("from") or frm
+        return await say(f"🆔 <b>{_esc(_full_name(target))}</b>: <code>{target.get('id')}</code>")
+    if not sudo.is_owner(frm.get("id", 0)):
+        if msg["chat"]["type"] == "private":  # (in groups: no reply, nobody else needs to see it)
+            await say("Only the bot's owner can manage sudo users." if config.OWNER_ID else
+                      f"No owner is set yet. Put your Telegram id in the <code>OWNER_ID</code> variable on Railway: "
+                      f"<code>{frm.get('id')}</code>")
+        return
+    if cmd in ("/sudolist", "/sudo") and not arg and not msg.get("reply_to_message"):
+        rows = await sudo.listing()
+        if not rows:
+            return await say("No sudo users yet. Add one: <code>/addsudo @username</code>, a user id, or reply to "
+                             "their message with /addsudo")
+        lines = [f"• {_esc(r['name'] or 'User')}" + (f" @{_esc(r['username'])}" if r["username"] else "")
+                 + f" — <code>{r['uid']}</code>" for r in rows]
+        return await say(f"🛡 <b>Sudo users ({len(rows)})</b>\n" + "\n".join(lines))
+    # who: a reply, a mention without a username (text_mention), else what was typed
+    who = None
+    if (rep := msg.get("reply_to_message")) and (u := rep.get("from")) and not u.get("is_bot"):
+        who = {"uid": u["id"], "name": _full_name(u), "username": u.get("username") or ""}
+    for e in msg.get("entities") or []:
+        if not who and e.get("type") == "text_mention" and e.get("user"):
+            u = e["user"]
+            who = {"uid": u["id"], "name": _full_name(u), "username": u.get("username") or ""}
+    if not who and arg:
+        who = await sudo.find(arg.split()[0])
+    if not who:
+        return await say("Who? Send <code>/addsudo @username</code> or a user id, or reply to their message."
+                         if arg == "" else "I don't know that username yet — ask them to open the voice chat once (or "
+                         "write in a group with me), or use their numeric id (they can send me /id).")
+    label = f"<b>{_esc(who.get('name') or 'User')}</b>" + (f" @{_esc(who['username'])}" if who.get("username") else "")
+    if cmd == "/addsudo":
+        if sudo.is_owner(who["uid"]):
+            return await say("That's you — the owner always has access.")
+        await sudo.add(who["uid"], who.get("name") or "", who.get("username") or "", frm["id"])
+        return await say(f"✅ {label} is a sudo user now (they see the Health page)")
+    gone = await sudo.remove(who["uid"])
+    await say(f"🗑 {label} is no longer a sudo user" if gone else f"{label} wasn't a sudo user")
+
+
 def _esc(s: str) -> str:
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -404,11 +438,22 @@ async def run_polling():
             if PRIVACY_ON:
                 log.warning("Bot privacy mode is ON: the bot can't see group messages, so the invite list only fills "
                             "up slowly. Turn it off: @BotFather -> /setprivacy -> your bot -> Disable")
-            await call("setMyCommands", commands=[
+            base = [
                 {"command": "vc", "description": "Open the voice chat"},
                 {"command": "play", "description": "How to play music in the voice chat"},
                 {"command": "resetlink", "description": "Admins: make a new private link"},
-            ])
+            ]
+            await call("setMyCommands", commands=base)
+            if config.OWNER_ID:  # the owner's own chat with the bot also lists the sudo commands
+                try:
+                    await call("setMyCommands", scope={"type": "chat", "chat_id": config.OWNER_ID}, commands=base + [
+                        {"command": "addsudo", "description": "Add a sudo user (id, @username or reply)"},
+                        {"command": "delsudo", "description": "Remove a sudo user"},
+                        {"command": "sudolist", "description": "List sudo users"},
+                        {"command": "id", "description": "Show a Telegram id"},
+                    ])
+                except Exception as e:
+                    log.info("owner commands: %s", e)
             break
         except Exception as e:
             log.error("getMe failed: %s (retrying)", e)

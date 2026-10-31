@@ -81,7 +81,7 @@ function goFullscreen() {
 
 let started = false;
 on('ws:init', (m) => {
-  S.admin = m.admin; S.room = m.room; S.group = m.group;
+  S.admin = m.admin; S.sudo = !!m.sudo; S.owner = !!m.owner; S.room = m.room; S.group = m.group;
   // appearing as the group: members know us by a stand-in id, and the voice uses it too
   S.pid = m.pid || null;
   // the voice identity changed (switched to appearing as the group, or back): join the voice again under it
@@ -482,6 +482,14 @@ function openMore() {
   const body = h('div',
     S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Manage voice chat', () => { s.close(); openAdmin(); }, 'acc',
       adminAlerts ? `${adminAlerts} new alert${adminAlerts > 1 ? 's' : ''}` : 'Settings, logs, safety, recording')) : null,
+    // a sudo user who isn't an admin of this group: just the Health page
+    S.sudo && !S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Health', () => {
+      s.close();
+      const body = h('div');
+      let stop = null;
+      sheet({ title: 'Health', body, tall: true, onClose: () => stop?.() });
+      stop = adminHealth(body);
+    }, 'acc', 'Is everything working?')) : null,
     h('div', { class: 'list' },
       p && !p.canSpeak ? actionRow('hand', p.hand ? 'Lower hand' : 'Raise hand', () => { send({ t: 'hand', up: !p.hand }); s.close(); }) : null,
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
@@ -527,9 +535,9 @@ async function openInvite() {
     btn.onclick = async () => {
       btn.disabled = true; btn.textContent = '…';
       try {
-        const r = await api('/api/invite', { body: { uid: p.uid } });
+        await api('/api/invite', { body: { uid: p.uid } });
         sent.add(p.uid); haptic('success');
-        toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} hasn’t started the bot, so they were mentioned in the group`, 3600);
+        toast(`${p.name} was invited in the group`, 3000);
         btn.textContent = 'Invited'; btn.classList.add('soft');
       } catch (e) { btn.disabled = false; btn.textContent = 'Invite'; toast(e.message, 3600, 'err'); }
     };
@@ -715,7 +723,8 @@ function openAdmin(tab = 'room') {
   const body = h('div', null, tabs, content);
   let cleanup = null;
   const s = sheet({ title: 'Manage', body, tall: true, onClose: () => cleanup?.() });
-  const TABS = [['room', 'Room'], ['music', 'Music'], ['team', 'Team'], ['logs', 'Logs'], ['safety', 'Safety'], ['health', 'Health']];
+  // Health only for the group's owner and the bot's sudo users, not every admin
+  const TABS = [['room', 'Room'], ['music', 'Music'], ['team', 'Team'], ['logs', 'Logs'], ['safety', 'Safety'], ...(S.sudo ? [['health', 'Health']] : [])];
   const go = (k) => {
     tab = k; cleanup?.(); cleanup = null;
     tabs.replaceChildren(...TABS.map(([id, l]) => h('button', { class: id === k ? 'on' : '', onclick: () => go(id) }, l)));
@@ -829,7 +838,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-bg': 'Back from the background', 'music-radio': 'Background stream failed', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;
@@ -855,10 +864,34 @@ function adminHealth(c) {
           h('div', { class: 'list' }, ...pr.latest.map(d => h('div', { class: 'row' },
             h('span', { class: 'lab' }, `${PROBLEM[d.kind] || d.kind} — ${d.name}`, h('small', null, `${fmtDate(d.ts)} · ${d.device} · ${d.detail}`))))))
         : h('p', { class: 'muted note' }, 'None reported. 🎉'),
-      h('button', { class: 'btn sm soft', style: { marginTop: '10px' }, onclick: load }, 'Refresh'));
+      h('button', { class: 'btn sm soft', style: { marginTop: '10px' }, onclick: load }, 'Refresh'),
+      S.owner ? sudoBox() : null);
   };
   load();
   return () => { alive = false; };
+}
+// ---- sudo users: the bot's owner picks who else sees the Health page (also /addsudo in Telegram) ----
+function sudoBox() {
+  const list = h('div', { class: 'list' });
+  const input = h('input', { class: 'field', placeholder: '@username or Telegram id', autocomplete: 'off', style: { flex: 1 } });
+  const draw = (users) => list.replaceChildren(...(users.length ? users.map(u => h('div', { class: 'row' }, icon('shield'),
+    h('span', { class: 'lab' }, u.name || 'User', h('small', null, (u.username ? '@' + u.username + ' · ' : '') + u.uid)),
+    h('button', { class: 'close-x', 'aria-label': 'Remove', onclick: async () => {
+      if (!(await confirmBox(`Remove ${u.name || u.uid} from sudo users?`, 'Remove', true))) return;
+      try { draw((await api('/api/sudo', { body: { remove: u.uid } })).users); toast('Removed'); } catch (e) { toast(e.message, 3000, 'err'); }
+    } }, icon('trash')))) : [h('p', { class: 'muted note' }, 'Nobody yet.')]));
+  const add = async () => {
+    const who = input.value.trim(); if (!who) return;
+    try { draw((await api('/api/sudo', { body: { who } })).users); input.value = ''; toast('Added'); haptic('success'); }
+    catch (e) { toast(e.message, 4000, 'err'); }
+  };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  api('/api/sudo').then(r => draw(r.users), () => {});
+  return h('div', null,
+    h('div', { class: 'grp-h' }, 'Sudo users'),
+    h('p', { class: 'muted note' }, 'They see this page too. Add as many as you like: here, or with /addsudo in Telegram (a user id, an @username, or as a reply to their message).'),
+    list,
+    h('div', { style: { display: 'flex', gap: '8px', marginTop: '8px' } }, input, h('button', { class: 'btn sm', onclick: add }, 'Add')));
 }
 
 // ---- team: moderators (people) and music DJs (music) ----

@@ -117,6 +117,15 @@ def _device(ua: str) -> str:
     return f"{os_} {ver} {app}".replace("  ", " ").strip()
 
 
+def _song_key(title: str) -> str:
+    """A song's name without the upload's extras: "Kya Baat Ay (Official Video) | Harrdy Sandhu" and
+    "Kya Baat Ay - Lyrics" are the same song."""
+    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", (title or "").lower())
+    t = re.split(r"\s[|•]\s|\s-\s(?:lyrics?|official|full|audio|video)", t)[0]
+    t = re.sub(r"\b(official|video|lyrics?|lyrical|audio|full song|hd|4k|song)\b", " ", t)
+    return re.sub(r"[^\w]+", "", t)[:30]
+
+
 def pid_of(chat_id: int, uid: int) -> int:
     """Stand-in id for someone appearing as the group: the same every time (their reactions stay theirs), never a
     real Telegram id or chat id, and not something a member can turn back into the person."""
@@ -234,7 +243,9 @@ class Room:
         self.loop = "off"        # off | one | all
         self.autoplay = False
         self.votes: set[int] = set()
-        self.recent: deque[str] = deque(maxlen=60)
+        self.recent: deque[str] = deque(maxlen=300)
+        self._auto_seen: deque[str] = deque(maxlen=500)  # every song autoplay ever lined up (played or not)
+        self._auto_names: deque[str] = deque(maxlen=500)
         self.history: deque[dict] = deque(maxlen=50)  # played tracks, for "previous"
         self._left: dict[int, tuple[float, float]] = {}
         self._spotify_busy: dict[int, bool] = {}  # uid -> (left at, chat_since) for quick reconnects
@@ -457,6 +468,8 @@ class Room:
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
                          "music": self.music_state(), "chat": [self.chat_view(m, p) for m in self.chat if m["ts"] >= since],
                          "admin": admin,
+                         "sudo": bool(getattr(conn, "sudo", False)),  # (bot owner / sudo user: sees the Health tab)
+                         "owner": bool(getattr(conn, "owner", False)),  # (the bot's owner: manages sudo users)
                          "group": self.group_title,
                          # a fresh session: one opened 12 hours ago would otherwise expire (and the song links with it)
                          "session": auth.make_session(uid, self.chat_id),
@@ -1121,14 +1134,24 @@ class Room:
         self._filling = True
         try:
             rel: list[dict] = []
+            # Songs not to suggest again. A related list overlaps a lot with the one before (each song's "mix"
+            # holds the same hits), so autoplay kept bringing back the songs it had just played: everything it
+            # ever lined up, what played in the last 24 hours (kept across restarts), and what's queued now.
+            rows = await db.q("SELECT DISTINCT vid, title FROM plays WHERE chat_id=? AND ts>?", (self.chat_id, now() - 86400))
+            skip = set(self.recent) | set(self._auto_seen) | set(self._bad) | {r["vid"] for r in rows} \
+                | {q["id"] for q in self.queue} | ({self.current["id"]} if self.current else set())
+            # the same song under another upload (official video, lyrics, audio) counts as the same song
+            names = {_song_key(r["title"]) for r in rows} | {_song_key(q.get("title", "")) for q in self.queue} \
+                | set(self._auto_names) | ({_song_key(self.current.get("title", ""))} if self.current else set())
+            names.discard("")
             seeds = [seed] + [v for v in reversed(self.recent) if v != seed][:2]
             for sd in seeds:  # the related list can fail or come back empty: try the songs before it
                 try:
-                    rel = await music.related(sd)
+                    rel = await music.related(sd, 50)
                 except Exception as e:
                     log.info("autoplay lookup failed for %s: %s", sd, e)
                     continue
-                rel = [r for r in rel if r["id"] not in self.recent and r["id"] not in self._bad
+                rel = [r for r in rel if r["id"] not in skip and _song_key(r["title"]) not in names
                        and (not r["duration"] or r["duration"] < 900)]
                 if rel:
                     break
@@ -1147,6 +1170,8 @@ class Room:
                     if it:
                         it["auto"] = True
                         self.queue.append(it)
+                        self._auto_seen.append(it["id"])
+                        self._auto_names.append(_song_key(it["title"]))
                 if not self.current:
                     await self._start(self.queue.pop(0))
                 else:

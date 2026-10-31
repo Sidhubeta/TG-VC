@@ -10,6 +10,10 @@ export function getCtx() {
   return ctx;
 }
 export const ctxReady = () => ctx && ctx.state === 'running';
+// Something needs the context to keep running while the app is minimized (a recording): it isn't put to sleep then.
+let held = 0;
+export const holdCtx = (on) => { held = Math.max(0, held + (on ? 1 : -1)); };
+export const ctxHeld = () => held > 0;
 
 let sfxGain = null;
 function out() {

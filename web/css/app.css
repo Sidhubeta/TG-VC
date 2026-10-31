@@ -990,3 +990,11 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
 .tap-hint .ico { width: 18px; height: 18px; }
 @keyframes hintpulse { 50% { box-shadow: 0 8px 26px rgba(0, 0, 0, .35), 0 0 0 7px rgba(255, 179, 64, .22); } }
 .pl-card.soundcloud .sp-logo { background: #ff5500; color: #fff; }
+
+/* small phones (320–370 px wide): the five dock buttons used to run off the screen ("Leave" was cut in half) */
+@media (max-width: 370px) {
+  .dock { grid-template-columns: repeat(2, minmax(0, 1fr)) auto repeat(2, minmax(0, 1fr)); gap: 2px; padding-left: 6px; padding-right: 6px; }
+  .dk { font-size: 11px; }
+  .dk .c { width: 44px; height: 44px; }
+  .mic { width: 88px; height: 88px; margin: -18px 2px 0; }
+}

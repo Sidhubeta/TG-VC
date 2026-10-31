@@ -151,17 +151,20 @@ async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0)
             return None
     # Invites are only posted in the group now: they clean up after themselves, so a busy evening doesn't leave
     # the chat full of mentions (the person was notified when it was posted).
+    # (kept in the database: a restart in those 15 minutes used to leave the invite in the group for good)
     if isinstance(sent, dict) and sent.get("message_id"):
-        asyncio.get_running_loop().create_task(_delete_later(chat_id, sent["message_id"], 15 * 60))
+        await db.x("INSERT OR REPLACE INTO deletions(chat_id,message_id,at) VALUES(?,?,?)",
+                   (chat_id, sent["message_id"], time.time() + 15 * 60))
     return "group"
 
 
-async def _delete_later(chat_id: int, message_id: int, delay: float):
-    await asyncio.sleep(delay)
-    try:
-        await call("deleteMessage", chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
+async def _delete_due():
+    for d in await db.q("SELECT chat_id, message_id FROM deletions WHERE at<=? LIMIT 50", (time.time(),)):
+        try:
+            await call("deleteMessage", chat_id=d["chat_id"], message_id=d["message_id"])
+        except Exception:
+            pass  # (gone already, or older than 48 h: nothing more to do)
+        await db.x("DELETE FROM deletions WHERE chat_id=? AND message_id=?", (d["chat_id"], d["message_id"]))
 
 
 
@@ -516,6 +519,10 @@ async def run_polling():
 async def schedule_loop():
     while True:
         await asyncio.sleep(20)
+        try:
+            await _delete_due()
+        except Exception:
+            log.exception("delete invites")
         try:
             due = await db.q("SELECT * FROM schedules WHERE sent=0 AND at<=?", (time.time() + 30,))
             for s in due:

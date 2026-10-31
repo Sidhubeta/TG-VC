@@ -392,6 +392,18 @@ def unplayable(err) -> bool:
     return bool(_DEAD.search(str(err))) and "not a bot" not in str(err)
 
 
+def is_cached(vid: str) -> bool:
+    """The song's usual file is on our disk already (it can be played from the first second, by everyone)."""
+    hit = _info_cache.get(vid)
+    if not hit:
+        return False
+    for codec in ("aac", "opus"):
+        f = pick_audio(hit[1], codec, "medium")
+        if f and os.path.exists(_cache_path(vid, f["id"])):
+            return True
+    return False
+
+
 def is_ready(vid: str) -> bool:
     """The stream address is already known, so the song can start right away."""
     hit = _info_cache.get(vid)
@@ -542,12 +554,12 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
                 total = int(r.headers.get("content-range", "/0").split("/")[-1] or 0)
                 if (total or 0) > limit or pos + len(r.content) > limit:
                     raise RuntimeError(f"too big to keep ({max(total, pos) // 2**20} MB)")
-                fh.write(r.content)
+                await asyncio.to_thread(fh.write, r.content)  # (8 MB at a time: not on the loop that sends the music)
                 pos += len(r.content)
                 if r.status_code == 200 or not r.content or (total and pos >= total):
                     break
         os.replace(tmp, path)
-        _trim_cache()
+        await asyncio.to_thread(_trim_cache)  # (lists and sizes every file: a moment's stall for everyone on the loop)
         if fmt["vcodec"] == "none":
             spawn_analyze(vid, path)
     except _Expired:  # the link went stale (or came without a PO token): get a fresh one and try once more

@@ -56,6 +56,7 @@ CREATE INDEX IF NOT EXISTS ix_listens_uid ON listens(uid, ts);
 CREATE TABLE IF NOT EXISTS chat_stats(chat_id INTEGER, uid INTEGER, day INTEGER, n INTEGER, PRIMARY KEY(chat_id, uid, day));
 CREATE TABLE IF NOT EXISTS sudo(uid INTEGER PRIMARY KEY, name TEXT, username TEXT, added_by INTEGER, ts REAL);
 CREATE TABLE IF NOT EXISTS room_state(chat_id INTEGER PRIMARY KEY, data TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS deletions(chat_id INTEGER, message_id INTEGER, at REAL, PRIMARY KEY(chat_id, message_id));
 CREATE TABLE IF NOT EXISTS members(
   chat_id INTEGER, uid INTEGER, name TEXT, username TEXT, seen REAL, PRIMARY KEY(chat_id, uid));
 """
@@ -65,7 +66,9 @@ for _sql in ("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''",
              "ALTER TABLE groups ADD COLUMN pin_thread INTEGER",
              # sent / played "as the group": kept, so it stays hidden after a restart too
              "ALTER TABLE messages ADD COLUMN asg INTEGER DEFAULT 0",
-             "ALTER TABLE plays ADD COLUMN asg INTEGER DEFAULT 0"):
+             "ALTER TABLE plays ADD COLUMN asg INTEGER DEFAULT 0",
+             # a visit "as the group": it doesn't count for the person's own badges (that would give them away)
+             "ALTER TABLE sessions ADD COLUMN asg INTEGER DEFAULT 0"):
     try:
         _conn.execute(_sql)
     except sqlite3.OperationalError:

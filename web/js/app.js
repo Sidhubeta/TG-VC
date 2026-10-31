@@ -476,7 +476,7 @@ function openAudio() {
       h('p', { class: 'muted note' }, 'During a call the volume buttons change the call volume, which Android never lets go fully silent. Use these sliders to make voices or music quieter.'),
       h('div', { class: 'list' },
         switchRow('Noise isolation', noiseStatus(), V.noise, (v) => { setNoise(v).then(render); }),
-        switchRow('HD music while talking', 'Music keeps full quality when your mic is on. On the phone’s speaker others may hear a little echo — turn off if they do.', V.hdTalk, (v) => { setHdTalk(v).then(render); }),
+        switchRow('HD music while talking', isApplePhone ? 'Android only: iPhone always switches to call sound while a mic is on.' : 'Music keeps full quality when your mic is on. On the phone’s speaker others may hear a little echo — turn off if they do.', V.hdTalk, (v) => { setHdTalk(v).then(render); }),
         switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
   };
   const onDev = () => render();
@@ -689,7 +689,8 @@ function msgMenu(m) {
     h('div', { class: 'list' },
       actionRow('reply', 'Reply', () => { s.close(); historySheet?.close(); openChat(m); }),
       actionRow('copy', 'Copy text', () => { s.close(); copyText(m.text); }),
-      S.admin || isMod() || m.uid === S.uid ? actionRow('trash', 'Delete', () => { send({ t: 'chat.del', id: m.id }); s.close(); }, 'red') : null));
+      // (moderators: not an admin's message — the server refuses it)
+      S.admin || m.uid === S.uid || (isMod() && !m.adm && !S.parts.get(m.uid)?.admin) ? actionRow('trash', 'Delete', () => { send({ t: 'chat.del', id: m.id }); s.close(); }, 'red') : null));
   const s = sheet({ title: m.name, body });
 }
 function openHistory() {

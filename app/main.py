@@ -210,7 +210,11 @@ async def api_search(request: Request, uid, chat_id, st):
         return JSONResponse({"import": {"source": source, "url": q, "kind": kind, "title": name, "count": len(songs), "songs": songs[:50]}})
     vid, pl = music.parse_youtube(q)
     if pl:
-        title, tracks = await music.playlist(pl)
+        try:
+            title, tracks = await music.playlist(pl)
+        except Exception as e:
+            log.info("search playlist %s: %s", pl, e)
+            return err("Couldn't open that playlist — is it public? Try again in a moment")
         return JSONResponse({"playlist": {"id": pl, "title": title, "tracks": tracks}})
     if vid:
         try:
@@ -287,6 +291,7 @@ async def api_avatar(request: Request):
 EMOJI_DIR = os.path.join(config.DATA_DIR, "emoji")
 os.makedirs(EMOJI_DIR, exist_ok=True)
 EMOJI_CDN = "https://cdn.jsdelivr.net/npm/emoji-datasource-apple@15/img/apple/64/"
+_emoji_new: list[float] = []
 
 
 async def emoji(request: Request):
@@ -296,6 +301,14 @@ async def emoji(request: Request):
         return Response(status_code=404)
     path = os.path.join(EMOJI_DIR, name)
     if not os.path.exists(path):
+        # The page loads emoji before anyone is logged in, so this can't ask for a session. Instead the server
+        # fetches at most 600 new ones in 10 minutes (anyone could make it download the whole set).
+        now_ = time.time()
+        while _emoji_new and now_ - _emoji_new[0] > 600:
+            _emoji_new.pop(0)
+        if len(_emoji_new) >= 600:
+            return Response(status_code=503, headers={"Retry-After": "60"})
+        _emoji_new.append(now_)
         try:
             r = await music.http().get(EMOJI_CDN + name, timeout=8)
         except Exception:
@@ -705,7 +718,6 @@ async def api_invite(request: Request, uid, chat_id, st):
     group = [x for x in _invite_chat.get(chat_id, []) if t - x < 600]
     if len(group) >= 20:
         return err("Lots of people were invited just now — try again in a few minutes 🙂", 429)
-    _invite_chat[chat_id] = group + [t]
     info = await tg.member_status(chat_id, target, fresh=True)  # also gives the real name (not trusted from the app)
     name = info.get("name") or "Member"
     if not info["member"]:
@@ -715,6 +727,7 @@ async def api_invite(request: Request, uid, chat_id, st):
     if t - _invite_last.get((chat_id, target), 0) < 300:
         return err(f"{name} was invited a moment ago", 429)
     _invite_by[(chat_id, uid)] = recent + [t]
+    _invite_chat[chat_id] = group + [t]  # (counted only once it's going out: failed tries used to count too)
     _invite_last[(chat_id, target)] = t
     if len(_invite_last) > 5000 or len(_invite_by) > 5000:
         for k in [k for k, v in _invite_last.items() if t - v > 300]:
@@ -726,6 +739,9 @@ async def api_invite(request: Request, uid, chat_id, st):
     via = await tg.invite(chat_id, target, name, by, len(room.parts))
     if not via:
         _invite_last.pop((chat_id, target), None)
+        for lst in (_invite_by.get((chat_id, uid)), _invite_chat.get(chat_id)):  # (didn't go out: doesn't count)
+            if lst and t in lst:
+                lst.remove(t)
         return err("Couldn't send the invite — try again")
     return JSONResponse({"ok": True, "via": via, "name": name})
 
@@ -785,6 +801,8 @@ async def api_health(request: Request, uid, chat_id, st):
         except Exception as e:
             return JSONResponse({"ok": False, "detail": f"YouTube failed: {str(e)[:200]}"})
     items = []
+    if config.DEV_MODE:  # (anyone can log in as anyone: only for testing on a computer)
+        items.append({"name": "DEV_MODE", "ok": False, "detail": "DEV_MODE=1 is on: anyone can open the app as anyone. Remove it on Railway now."})
     tgs = tg.STATS
     if not config.BOT_TOKEN:
         items.append({"name": "Telegram bot", "ok": False, "detail": "BOT_TOKEN is not set"})
@@ -871,7 +889,11 @@ async def ws_endpoint(ws: WebSocket):
             t = time.time()
             conn.hits.append(t)
             if len(conn.hits) == conn.hits.maxlen and t - conn.hits[0] < 5:
-                continue  # flood protection
+                # flood protection: dropped (said once in a while, so a tap that does nothing isn't a mystery)
+                if t - conn.flood_told > 10:
+                    conn.flood_told = t
+                    await conn.send({"t": "toast", "text": "Slow down a little 🙂"})
+                continue
             if len(raw) > 64_000:  # ("Add all": 200 songs are ~40 KB; 8000 cut it off at ~45 songs)
                 continue
             try:
@@ -936,6 +958,8 @@ async def lifespan(app):
              asyncio.create_task(heartbeat_loop()), asyncio.create_task(pin.startup_reset()),
              asyncio.create_task(pin.countdown_loop()), asyncio.create_task(bg_tick_loop())]
     log.info("LiveKit %s", "enabled" if lk.enabled() else "NOT configured (voice disabled)")
+    if config.DEV_MODE and config.BOT_TOKEN:
+        log.error("DEV_MODE=1 is on with a real bot: anyone can open the app as anyone. Remove DEV_MODE.")
     try:
         await asyncio.to_thread(music._trim_cache, False, True)  # (half-finished downloads from before a restart)
     except Exception as e:

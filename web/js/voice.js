@@ -231,7 +231,8 @@ async function restoreMic() {
 // Back in the app (or the page unfrozen): if the voice chat is down, join now instead of after the retry wait.
 function wake() {
   if (document.hidden || stopped || !info) return;
-  if (!V.ready && !connecting) { clearTimeout(retryTimer); connect(); }
+  // (with a fresh token: the one we have lives 20 minutes, and an app minimized longer failed its first try)
+  if (!V.ready && !connecting) { clearTimeout(retryTimer); retry(); }
   else restoreMic();
 }
 document.addEventListener('visibilitychange', wake);
@@ -387,7 +388,8 @@ export async function setMic(on) {
   try {
     if (on) await refreshPermissions();
     await room.localParticipant.setMicrophoneEnabled(on, on ? micOpts() : undefined);
-    if (on) await applyNoise();
+    // (minimized, noise isolation crackles: it comes on when the app is open again — see the visibility handler)
+    if (on) { if (document.hidden) bgOff = true; else await applyNoise(); }
     V.mic = on;
     send({ t: 'mic', on });
     if (!on) { iosSession(false); releaseMicLater(); }

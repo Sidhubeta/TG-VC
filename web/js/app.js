@@ -535,9 +535,9 @@ async function openInvite() {
     btn.onclick = async () => {
       btn.disabled = true; btn.textContent = '…';
       try {
-        const r = await api('/api/invite', { body: { uid: p.uid } });
+        await api('/api/invite', { body: { uid: p.uid } });
         sent.add(p.uid); haptic('success');
-        toast(r.via === 'dm' ? `Invite sent to ${p.name}` : `${p.name} hasn’t started the bot, so they were mentioned in the group`, 3600);
+        toast(`${p.name} was invited in the group`, 3000);
         btn.textContent = 'Invited'; btn.classList.add('soft');
       } catch (e) { btn.disabled = false; btn.textContent = 'Invite'; toast(e.message, 3600, 'err'); }
     };
@@ -838,7 +838,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-bg': 'Back from the background', 'music-radio': 'Background stream failed', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;

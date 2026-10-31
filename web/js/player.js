@@ -12,9 +12,9 @@ function makeAudio() {
   a.crossOrigin = 'anonymous';
   // (a spare element waiting to be used must not steer the music)
   a.addEventListener('loadedmetadata', () => a === audio && !isSilence(a) && sync(true));
-  a.addEventListener('ended', () => a === audio && !isSilence(a) && onEnded());
+  a.addEventListener('ended', () => a === audio && !isSilence(a) && !P.radio && onEnded());
   a.addEventListener('playing', () => { if (a === audio) dead = { n: 0, at: 0 }; });
-  a.addEventListener('error', () => a === audio && !isSilence(a) && onAudioError());
+  a.addEventListener('error', () => a === audio && !isSilence(a) && (P.radio ? radioRetry() : onAudioError()));
   // Minimized Telegram freezes the page's timers, but the playing song still sends time updates: use them to
   // keep the music on track in the background.
   a.addEventListener('timeupdate', () => {
@@ -39,7 +39,7 @@ let kickTimer = null;
 function kickAudio(why) {
   clearTimeout(kickTimer);
   kickTimer = setTimeout(() => {
-    if (audio.paused || !playing() || P.localPaused || !audio.getAttribute('src') || isSilence(audio)) return;
+    if (audio.paused || !playing() || P.localPaused || !audio.getAttribute('src') || isSilence(audio) || P.radio) return;
     const t = audio.currentTime;
     audio.pause();
     setTimeout(() => {
@@ -211,6 +211,7 @@ function reportCaps() {
 function sync(force = false) {
   lastSync = Date.now();
   reportCaps();
+  if (P.radio) { if (audio.error || audio.networkState === 3) radioRetry(); return; } // (the server plays the room)
   let pr = predicted();
   // The room's clock says the song is over (our copy may be stopped a moment before its own "ended" fires):
   // count it as ended and go straight on to the next song, rather than pausing and waiting.
@@ -343,7 +344,7 @@ const back = () => { G?.c.resume().catch(() => {}); if (WA.on) getCtx(); sync(tr
 // Minimized, the app's timers stop; the server then sends a small tick every few seconds, and each one runs the
 // player's checks (a song that failed to load in the background used to wait for the app to be opened again).
 const tellBg = () => send({ t: 'bg', on: document.hidden });
-on('ws:tick', () => { if (document.hidden && Date.now() - lastSync > 900) sync(); });
+on('ws:tick', () => { P.bgTicks = (P.bgTicks || 0) + 1; if (document.hidden && Date.now() - lastSync > 900) sync(); });
 on('ws:init', () => { if (document.hidden) tellBg(); });
 // An effect runs the song through Web Audio, and Android starves Web Audio while Telegram is minimized: the song
 // crackled. So minimized, the song moves to the plain player (without the effect) and the effect comes back when
@@ -395,9 +396,42 @@ function effectsBack() {
     el.removeAttribute('src'); el.load();
   });
 }
+// ---- minimized: the room's own stream ----
+// A minimized Telegram can freeze the app entirely: the song playing goes on, but at its end nothing starts the
+// next one until the app is opened (the ticks above only help while the app still runs). So minimized, the player
+// plays the room's stream from the server (/api/radio): the server goes from song to song, follows skips, seeks
+// and pauses, and the phone only has to keep playing. Opened again, it's back on its own synced player.
+function startRadio() {
+  if (P.radio || WA.on || G || isApple || P.localPaused || !playing() || audio.paused || isSilence(audio) || !audio.getAttribute('src')) return;
+  endFade();
+  P.radio = { fails: 0 }; P.radioUsed = true;
+  audio.playbackRate = 1;
+  audio.src = media('/api/radio') + '&r=' + Date.now();
+  audio.play().catch(() => stopRadio());
+}
+function radioRetry() {
+  if (!P.radio) return;
+  if (++P.radio.fails > 5) { report('music-radio', 'stream kept failing'); return stopRadio(); }
+  audio.src = media('/api/radio') + '&r=' + Date.now();
+  audio.play().catch(() => {});
+}
+function stopRadio() {
+  if (!P.radio) return;
+  P.radio = null;
+  P.loadedQid = null; P.loadedTrack = null; // the room's song again, at the room's position
+  sync(true);
+}
 document.addEventListener('visibilitychange', () => {
   tellBg();
-  if (document.hidden) effectsToBackground(); else effectsBack();
+  if (document.hidden) {
+    P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false;
+    effectsToBackground(); startRadio();
+  } else {
+    stopRadio(); effectsBack();
+    // (for the logs: how a long time in the background went, so a phone that still stops can be told apart)
+    const away = (Date.now() - (P.hiddenAt || Date.now())) / 1000;
+    if (away > 90 && playing()) report('music-bg', `away=${Math.round(away)}s radio=${!!P.radioUsed} ticks=${P.bgTicks || 0} webaudio=${WA.on} fx=${!!G}`);
+  }
   reportCaps();
   if (!document.hidden) return back();
   if (!G && !WA.on) getCtx()?.suspend().catch(() => {}); // the sound-effects context sleeps while hidden (music doesn't use it)
@@ -1172,8 +1206,12 @@ function queueMenu(t, i) {
 // What played in this voice chat, who added it and when — grouped by day, more loads as you scroll.
 export function openPlayHistory() {
   const list = h('div'), foot = h('div', { class: 'inv-foot' });
-  let mine = false, next = 0, more = true, busy = false, gen = 0, lastDay = '';
+  let mine = false, next = 0, more = true, busy = false, gen = 0, lastDay = '', q = '', qTimer = null;
   const seg = h('div', { class: 'seg', style: { margin: '2px 0 10px' } });
+  // search: the song, the singer, or who played it
+  const search = h('input', { type: 'search', class: 'field', placeholder: 'Search song or who played it', 'aria-label': 'Search history',
+    style: { width: '100%', marginBottom: '8px' },
+    oninput: () => { clearTimeout(qTimer); qTimer = setTimeout(() => { const v = search.value.trim(); if (v !== q) { q = v; restart(); } }, 350); } });
   const drawSeg = () => seg.replaceChildren(...[[false, 'Everyone'], [true, 'Added by me']].map(([v, l]) =>
     h('button', { class: mine === v ? 'on' : '', onclick: () => { mine = v; drawSeg(); restart(); } }, l)));
   const day = (ts) => {
@@ -1182,13 +1220,13 @@ export function openPlayHistory() {
       : d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'short' });
   };
   const time = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-  const s = sheet({ title: 'Play history', body: h('div', null, seg, list, foot), tall: true, onClose: () => io.disconnect() });
+  const s = sheet({ title: 'Play history', body: h('div', null, search, seg, h('p', { class: 'muted note', style: { margin: '0 0 6px' } }, 'The last 24 hours'), list, foot), tall: true, onClose: () => io.disconnect() });
   const load = async () => {
     if (busy || !more) return;
     busy = true; const my = gen;
     foot.replaceChildren(h('div', { class: 'spinner', style: { margin: '14px auto' } }));
     try {
-      const r = await api(`/api/history?offset=${next}&limit=40${mine ? '&mine=1' : ''}`);
+      const r = await api(`/api/history?offset=${next}&limit=40${mine ? '&mine=1' : ''}${q ? '&q=' + encodeURIComponent(q) : ''}`);
       if (my !== gen) return;
       for (const t of r.tracks) {
         const d = day(t.ts);
@@ -1197,7 +1235,8 @@ export function openPlayHistory() {
         list.append(pressable(row, () => songMenu(t), () => songMenu(t)));
       }
       more = r.more; next = r.next;
-      foot.replaceChildren(list.children.length ? '' : h('div', { class: 'empty-note' }, mine ? 'You haven’t added songs here yet.' : 'Nothing has played in this voice chat yet.'));
+      foot.replaceChildren(list.children.length ? '' : h('div', { class: 'empty-note' }, q ? `Nothing found for “${q}” in the last 24 hours.`
+        : mine ? 'You haven’t added songs in the last 24 hours.' : 'Nothing has played in the last 24 hours.'));
     } catch (e) { if (my === gen) foot.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
     finally { if (my === gen) busy = false; }
   };

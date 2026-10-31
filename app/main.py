@@ -9,12 +9,12 @@ from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, badges, config, db, lk, members, music, pin, sudo, tg
+from . import auth, badges, config, db, lk, members, music, pin, radio, sudo, tg
 from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -241,6 +241,19 @@ async def api_stream(request: Request):
                               request.query_params.get("q", "medium"))
 
 
+async def api_radio(request: Request):
+    """The room's music as one endless stream, for a minimized app (see radio.py)."""
+    try:
+        uid, chat_id, _ = await session(request)
+    except Denied as d:
+        return Response(d.msg, status_code=d.code)
+    room = ROOMS.get(chat_id)
+    if not room or radio.busy():
+        return Response("not available", status_code=503)
+    return StreamingResponse(radio.stream(room, request), media_type="audio/mpeg",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
 async def api_avatar(request: Request):
     try:
         uid, chat_id, _ = await session(request)
@@ -313,13 +326,23 @@ async def api_lyrics(request: Request, uid, chat_id, st):
 
 @guarded()
 async def api_history(request: Request, uid, chat_id, st):
-    """Play history of this voice chat: what played, who added it, when. ?offset= for more, ?mine=1 for my songs."""
+    """Play history of this voice chat over the last 24 hours: what played, who added it, when. ?offset= for more,
+    ?mine=1 for my songs, ?q= to search the song, artist or who added it."""
     offset = max(0, int(_num(request.query_params.get("offset"), 0)))
     limit = max(10, min(100, int(_num(request.query_params.get("limit"), 50))))
     mine = request.query_params.get("mine") == "1"
-    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts,asg FROM plays WHERE chat_id=?"
-                      + (" AND by_uid=?" if mine else "") + " ORDER BY id DESC LIMIT ? OFFSET ?",
-                      (chat_id, uid, limit + 1, offset) if mine else (chat_id, limit + 1, offset))
+    q = (request.query_params.get("q") or "").strip()[:60]
+    where, args = "chat_id=? AND ts>?", [chat_id, time.time() - 86400]
+    if mine:
+        where += " AND by_uid=?"
+        args.append(uid)
+    if q:
+        like = "%" + q.replace("\\", "").replace("%", "").replace("_", " ") + "%"
+        # (someone who played as the group is found by the group's name, not their own)
+        where += " AND (title LIKE ? OR artist LIKE ? OR by_name LIKE ?)"
+        args += [like, like, like]
+    rows = await db.q("SELECT vid as id,title,artist,duration,by_uid,by_name,ts,asg FROM plays WHERE " + where
+                      + " ORDER BY id DESC LIMIT ? OFFSET ?", (*args, limit + 1, offset))
     more = len(rows) > limit
     rows = rows[:limit]
     from .room import pid_of
@@ -914,6 +937,7 @@ routes = [
     Route("/api/lk", api_lk_token),
     Route("/api/search", api_search),
     Route("/api/stream/{vid}/{kind}", api_stream),
+    Route("/api/radio", api_radio),
     Route("/api/thumb/{vid}", api_thumb),
     Route("/api/avatar/{eid}", api_avatar),
     Route("/emoji/{name}", emoji),

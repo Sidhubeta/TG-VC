@@ -128,16 +128,9 @@ async def forget_member(chat_id: int, uid: int):
 
 
 async def invite(chat_id: int, uid: int, name: str, by_name: str, live: int = 0) -> str | None:
-    """DM the person a Join button; if they never started the bot, mention them in the group instead."""
+    """Mention the person in the group, with a Join button. (Invites used to go to their private chat with the
+    bot first; they're only posted in the group now.)"""
     url = await group_link(chat_id)
-    title = await chat_title(chat_id)
-    try:
-        await call("sendMessage", chat_id=uid, parse_mode="HTML",
-                   text=f"🎧 <b>{_esc(by_name)}</b> invited you to the voice chat in <b>{_esc(title)}</b>",
-                   reply_markup=join_button(url))
-        return "dm"
-    except Exception:
-        pass
     g = await db.get_group(chat_id)
     params = {"chat_id": chat_id, "parse_mode": "HTML", "reply_markup": join_button(url),
               "text": f'🎧 <a href="tg://user?id={int(uid)}">{_esc(name)}</a>, <b>{_esc(by_name)}</b> invited you to the voice chat'}
@@ -254,17 +247,7 @@ async def play_help(chat_id: int, msg: dict, song: str = ""):
         return
     _play_help_at[chat_id] = time.time()
     url = await group_link(chat_id)
-    asked = f"To play <b>{_esc(song)}</b>, join the voice chat and search for it there.\n\n" if song else ""
-    text = (f"🎧 <b>Music plays in the voice chat!</b>\n{asked}"
-            "Tap the pinned <b>Voice Chat</b> message at the top of this group, or the button below, to join.\n\n"
-            "<b>Inside the voice chat you can:</b>\n"
-            "🎵 Play any song — search, or paste a YouTube or Spotify link\n"
-            "⏭ Queue songs, play next, skip, repeat, autoplay\n"
-            "🎤 Read synced lyrics, watch the music video\n"
-            "🎚 Add sound effects for everyone: Bass Boost, 8D, Slowed + Reverb…\n"
-            "🎙 Talk with your mic or camera, chat and send reactions\n"
-            "❤️ Like songs and save playlists\n\n"
-            "Everyone hears the same song at the same moment.")
+    text = f"🎧 Join the voice chat to play <b>{_esc(song)}</b> 👇" if song else "🎧 Songs play in the voice chat — join 👇"
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": join_button(url),
               "reply_parameters": {"message_id": msg["message_id"], "allow_sending_without_reply": True}}
     if msg.get("is_topic_message") and msg.get("message_thread_id"):

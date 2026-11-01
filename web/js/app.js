@@ -143,29 +143,8 @@ on('ws:init', (m) => {
     if (V.cam) send({ t: 'video', on: true });
     if (V.screen) send({ t: 'screen', on: true });
   }
-  renderHeader(); renderGrid(true); renderDock(); renderListen(!!m.musicTg);
+  renderHeader(); renderGrid(true); renderDock();
 });
-// ---- the music in the group's own Telegram voice chat ----
-// Telegram keeps its own voice chat going in the background, on the lock screen, on iPhone and Android: when the
-// server plays the music there, this bar opens it (the app stays the remote: queue, search, effects).
-function renderListen(on) {
-  let bar = $('#tg-listen');
-  if (!on) { bar?.remove(); return; }
-  if (bar) return;
-  bar = h('button', { id: 'tg-listen', class: 'tg-listen', onclick: openListen },
-    h('span', { class: 'tl-ic' }, icon('headphones')),
-    h('span', { class: 'tl-t' }, h('b', null, 'Listen in Telegram'), h('small', null, 'The music plays in the group’s voice chat — keeps going in the background')),
-    icon('expand'));
-  $('#np-card').after(bar);
-}
-async function openListen() {
-  haptic('light');
-  try {
-    const { link } = await api('/api/listen');
-    if (tg?.openTelegramLink && /^https:\/\/t\.me\//.test(link)) tg.openTelegramLink(link);
-    else location.href = link;
-  } catch (e) { toast(e.message, 3500, 'err'); }
-}
 on('fatal', ({ title, text }) => { leaveVoice(); stopMusic(); $('#room').hidden = true; gate(title, text, h('button', { class: 'btn soft', onclick: () => tg?.close?.() }, 'Close')); });
 on('ws:down', () => toast('Reconnecting…', 1500));
 on('ws:kicked', (m) => { closeWS(); emit('fatal', { title: m.ban ? 'Banned' : 'Removed', text: m.reason || (m.ban ? 'An admin banned you from this voice chat.' : 'An admin removed you from this voice chat.') }); });
@@ -935,43 +914,10 @@ function adminHealth(c) {
             h('span', { class: 'lab' }, `${PROBLEM[d.kind] || d.kind} — ${d.name}`, h('small', null, `${fmtDate(d.ts)} · ${d.device} · ${d.detail}`))))))
         : h('p', { class: 'muted note' }, 'None reported. 🎉'),
       h('button', { class: 'btn sm soft', style: { marginTop: '10px' }, onclick: load }, 'Refresh'),
-      S.owner && r.items.some(it => it.assistant) ? assistantBox(load) : null,
       S.owner ? sudoBox() : null);
   };
   load();
   return () => { alive = false; };
-}
-// ---- the assistant account (plays the music into the group's Telegram voice chat): the owner logs it in here ----
-function assistantBox(reload) {
-  const box = h('div');
-  const field = (ph, type = 'text') => h('input', { class: 'field', placeholder: ph, type, autocomplete: 'off', style: { flex: 1 } });
-  const step = (label, input, key, note) => {
-    const go = async () => {
-      const v = input.value.trim(); if (!v) return;
-      btn.disabled = true;
-      try {
-        const r = await api('/api/assistant', { body: { [key]: v } });
-        if (r.next === 'code') draw('code');
-        else if (r.next === 'password') draw('password');
-        else { toast(`Assistant logged in: ${r.name || ''} ${r.username ? '@' + r.username : ''}`, 4000); reload(); }
-      } catch (e) { toast(e.message, 5000, 'err'); btn.disabled = false; }
-    };
-    const btn = h('button', { class: 'btn sm', onclick: go }, label);
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-    return h('div', null, note ? h('p', { class: 'muted note' }, note) : null,
-      h('div', { style: { display: 'flex', gap: '8px', marginTop: '6px' } }, input, btn));
-  };
-  const draw = (what) => box.replaceChildren(
-    h('div', { class: 'grp-h' }, 'Music assistant'),
-    what === 'phone' ? step('Send code', field('+91 98765 43210', 'tel'), 'phone', 'A normal Telegram account (a spare number is best) that plays the music into the group’s voice chat. Telegram sends it a login code.')
-      : what === 'code' ? step('Log in', field('Code from Telegram', 'text'), 'code', 'Type the code Telegram just sent to that account (don’t forward it — Telegram blocks forwarded codes).')
-      : step('Log in', field('2-step verification password', 'password'), 'password', 'This account has a 2-step verification password.'),
-    h('button', { class: 'btn sm soft', style: { marginTop: '8px' }, onclick: async () => {
-      if (!(await confirmBox('Log the assistant out? The music goes back to the app.', 'Log out', true))) return;
-      try { await api('/api/assistant', { body: { logout: true } }); toast('Logged out'); reload(); } catch (e) { toast(e.message, 3000, 'err'); }
-    } }, 'Log the assistant out'));
-  draw('phone');
-  return box;
 }
 // ---- sudo users: the bot's owner picks who else sees the Health page (also /addsudo in Telegram) ----
 function sudoBox() {

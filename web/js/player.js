@@ -231,7 +231,6 @@ const VOICE_LAG = 0.15; // the voice chat's own delay: the video waits for the s
 const VOICE_GRACE = 6000;
 let voiceGoneAt = 0, lastViaVoice = null;
 const viaVoice = () => {
-  if (P.tgMode) return true; // (the music plays in the group's own Telegram voice chat: nothing to play here)
   if (!P.voiceMode) return false;
   if (musicInVoice()) { voiceGoneAt = 0; return true; }
   if (lastViaVoice === false) return false;
@@ -1181,7 +1180,7 @@ const queueSig = () => { const m = S.music; return [m.loop, m.autoplay, can('que
 // ======================= server updates =======================
 let lastQid = null, lastTimeline = '', lastFx = '';
 on('ws:music', (m) => onMusic(m.m));
-on('ws:init', (m) => { P.caps = null; P.voiceMode = !!m.musicVoice; P.tgMode = !!m.musicTg; onMusic(m.music); reportCaps(); }); // (a new connection starts as "can't blend")
+on('ws:init', (m) => { P.caps = null; P.voiceMode = !!m.musicVoice; onMusic(m.music); reportCaps(); }); // (a new connection starts as "can't blend")
 function onMusic(m) {
   if (m.queueSame) m.queue = S.music?.queue || []; // (the server leaves the queue out when it didn't change)
   S.music = m;

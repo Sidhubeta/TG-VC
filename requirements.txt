@@ -11,4 +11,3 @@ telethon>=1.36
 tzdata
 livekit>=1.0
 numpy>=1.26
-py-tgcalls>=2.2

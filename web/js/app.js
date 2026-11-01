@@ -14,6 +14,7 @@ startEmoji();
 function gate(title, text, action) {
   const g = $('#gate');
   g.hidden = false;
+  g.classList.remove('join');
   g.querySelector('.box').replaceChildren(
     title === 'loading' ? h('div', { class: 'spinner' }) : h('div', { style: { fontSize: '44px' } }, '🎧'),
     h('h1', null, title === 'loading' ? 'Joining' : title), h('p', null, text), action || '');
@@ -45,9 +46,44 @@ async function boot() {
   }
   Object.assign(S, { session: r.session, uid: r.uid, chat: r.chat, admin: r.admin, group: r.group, bot: r.bot || '' });
   S.lk = r.livekit;
+  // The voice chat and the music connect behind the Join card, so the tap that joins can start their sound at once.
+  if (needJoin) showJoin();
   connectWS({ asGroup: store.get('asGroup:' + r.chat, false) && r.admin });
   try { tg?.enableClosingConfirmation?.(); } catch {}
 }
+// ---- Join card ----
+// Phones (Telegram on Android, iPhone) keep a page silent until it's tapped: the music, the voice chat and the
+// effects stay quiet, and a hint had to ask for a tap later. Like Telegram's own voice chat, opening the app shows a
+// Join card first; that one tap is what lets every sound play from then on.
+const devQs = new URLSearchParams(location.search);
+const needJoin = !(devQs.get('dev') && !devQs.get('join')); // (the test pages skip it unless they ask for it)
+let joined = false;
+function showJoin() {
+  const parts = S.parts?.size ? [...S.parts.values()].filter(p => p.uid !== S.uid) : [];
+  const n = parts.length;
+  const btn = h('button', { class: 'btn block join-btn', onclick: join }, icon('headphones'), 'Join voice chat');
+  $('#gate').hidden = false;
+  $('#gate').classList.add('join');
+  $('#gate').querySelector('.box').replaceChildren(
+    avatarEl({ uid: S.chat, name: S.group || 'Group', photo: S.chat ? `/api/avatar/${S.chat}` : '' }, 'join-av'),
+    h('h1', null, S.room?.settings?.title || S.group || 'Voice Chat'),
+    h('p', null, S.parts?.size ? (n ? `${n} ${n === 1 ? 'person is' : 'people are'} here` : 'Nobody else is here yet') : 'Connecting…'),
+    n ? h('div', { class: 'join-faces' }, ...parts.slice(0, 5).map(p => avatarEl(p, 'jf'))) : null,
+    S.music?.current ? h('p', { class: 'join-np' }, icon('music'), ' ', S.music.current.title) : null,
+    btn);
+}
+function join() {
+  joined = true;
+  haptic('medium');
+  unlockAll(); // (inside the tap: the music, the voice chat and the sounds may play from now on)
+  $('#gate').classList.remove('join');
+  if (S.parts?.size) $('#gate').hidden = true;
+  else gate('loading', 'Connecting to the voice chat…');
+}
+// (after the room's own handlers have updated the list)
+on('ws:p.join', () => setTimeout(() => { if (needJoin && !joined && S.parts?.size) showJoin(); }));
+on('ws:p.leave', () => setTimeout(() => { if (needJoin && !joined && S.parts?.size) showJoin(); }));
+
 // Browsers only allow sound after a tap. Instead of a "Tap to listen" button, any tap anywhere starts it.
 // Phones count only the end of a tap (touchend / click) as permission for sound, not the moment the finger
 // lands; listening to pointerdown alone is why only the "sound off" button itself used to bring the music back.
@@ -91,7 +127,8 @@ on('ws:init', (m) => {
   // leaving and joining again starts over.
   S.msgs = [...m.chat].sort((a, b) => a.id - b.id);
   if (historySheet) { historySheet.close(); historySheet = null; }
-  $('#gate').hidden = true;
+  if (needJoin && !joined) showJoin(); // (still on the Join card: it now shows who's in)
+  else $('#gate').hidden = true;
   $('#room').hidden = false;
   if (!started) {
     started = true;

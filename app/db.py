@@ -56,6 +56,7 @@ CREATE INDEX IF NOT EXISTS ix_listens_uid ON listens(uid, ts);
 CREATE TABLE IF NOT EXISTS chat_stats(chat_id INTEGER, uid INTEGER, day INTEGER, n INTEGER, PRIMARY KEY(chat_id, uid, day));
 CREATE TABLE IF NOT EXISTS sudo(uid INTEGER PRIMARY KEY, name TEXT, username TEXT, added_by INTEGER, ts REAL);
 CREATE TABLE IF NOT EXISTS room_state(chat_id INTEGER PRIMARY KEY, data TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS deletions(chat_id INTEGER, message_id INTEGER, at REAL, PRIMARY KEY(chat_id, message_id));
 CREATE TABLE IF NOT EXISTS members(
   chat_id INTEGER, uid INTEGER, name TEXT, username TEXT, seen REAL, PRIMARY KEY(chat_id, uid));

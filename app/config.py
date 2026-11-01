@@ -43,6 +43,10 @@ VIDEO_CACHE_MB = _int("VIDEO_CACHE_MB", 600)  # 0 = don't cache videos
 # The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)
 # The music played into the voice chat by the server (one way for every phone: no tap, goes on in the background)
 MUSIC_IN_VOICE = _env("MUSIC_IN_VOICE").lower() in ("1", "true", "yes", "on")
+# The music played into the group's own Telegram voice chat by an assistant account (see assistant.py): Telegram keeps
+# it going in the background, on the lock screen, on iPhone and Android. Takes the place of MUSIC_IN_VOICE when on.
+MUSIC_IN_TG_VC = _env("MUSIC_IN_TG_VC").lower() in ("1", "true", "yes", "on")
+ASSISTANT_SESSION = _env("ASSISTANT_SESSION")  # (optional: a Telethon string session; else log in on the Health page)
 _owner = _env("OWNER_ID").strip()
 OWNER_ID = int(_owner) if _owner.isdigit() else 0
 

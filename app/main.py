@@ -14,7 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import auth, badges, config, db, lk, members, music, pin, radio, sudo, tg, voicemusic
+from . import assistant, auth, badges, config, db, lk, members, music, pin, radio, sudo, tg, voicemusic
 from .room import Conn, ROOMS, bg_tick_loop, get_room, heartbeat_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -775,6 +775,36 @@ async def api_sudo(request: Request, uid, chat_id, st):
     return JSONResponse({"users": await sudo.listing()})
 
 
+# ---------------- the music in the group's own Telegram voice chat ----------------
+@guarded()
+async def api_listen(request: Request, uid, chat_id, st):
+    """The link that opens the group's Telegram voice chat (where the music plays when MUSIC_IN_TG_VC is on)."""
+    if voicemusic.mode() != "telegram":
+        return err("The music plays in the app", 404)
+    link = await assistant.listen_link(chat_id)
+    return JSONResponse({"link": link}) if link else err("Couldn't get a link — open the group and tap the voice chat bar")
+
+
+@guarded()
+async def api_assistant(request: Request, uid, chat_id, st):
+    """The bot's owner logs the assistant account in: {phone} → Telegram sends a code → {code} → ({password})."""
+    if not sudo.is_owner(uid):
+        return err("Only the bot's owner can do this", 403)
+    body = await _json(request)
+    if body.get("logout"):
+        await assistant.logout()
+        return JSONResponse({"ok": True, "next": "logged_out"})
+    if body.get("phone"):
+        res = await assistant.login_start(str(body["phone"]).strip()[:20])
+    elif body.get("code"):
+        res = await assistant.login_code(str(body["code"])[:12])
+    elif body.get("password"):
+        res = await assistant.login_password(str(body["password"])[:200])
+    else:
+        return err("Send the phone number first")
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
+
 # ---------------- health (the bot's owner and sudo users) ----------------
 _started = time.time()
 
@@ -825,6 +855,7 @@ async def api_health(request: Request, uid, chat_id, st):
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
     items.append({"name": "PO token provider", **(await music.pot_check())})
     items.append({"name": "Music in the voice chat", **voicemusic.status()})
+    items.append({"name": "Music in Telegram's voice chat", **assistant.status()})
     n403 = music.refused_last_hour()
     items.append({"name": "YouTube song links", "ok": n403 < 10,
                   "detail": "No refused links in the last hour" if not n403 else
@@ -1004,6 +1035,8 @@ routes = [
     Route("/api/invite", api_invite, methods=["GET", "POST"]),
     Route("/api/health", api_health, methods=["GET", "POST"]),
     Route("/api/sudo", api_sudo, methods=["GET", "POST"]),
+    Route("/api/listen", api_listen),
+    Route("/api/assistant", api_assistant, methods=["POST"]),
     Route("/api/badges", api_badges),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),

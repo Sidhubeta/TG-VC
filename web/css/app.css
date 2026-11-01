@@ -998,3 +998,30 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
   .dk .c { width: 44px; height: 44px; }
   .mic { width: 88px; height: 88px; margin: -18px 2px 0; }
 }
+
+/* ---- Join card (one tap opens every sound: music, voice chat, effects) ---- */
+#gate.join .box { max-width: 320px; gap: 12px; }
+#gate .join-av { width: 96px; height: 96px; border-radius: 50%; overflow: hidden; display: grid; place-items: center;
+  background: var(--g); color: #fff; font-size: 34px; font-weight: 700; box-shadow: 0 10px 40px rgba(0, 0, 0, .35); }
+#gate .join-av img { width: 100%; height: 100%; object-fit: cover; transition: opacity .2s; }
+#gate .join-faces { display: flex; justify-content: center; margin: 2px 0 4px; }
+#gate .join-faces .jf { width: 34px; height: 34px; border-radius: 50%; overflow: hidden; display: grid; place-items: center;
+  background: var(--g); color: #fff; font-size: 12px; font-weight: 700; margin-left: -8px; border: 2px solid var(--bg); }
+#gate .join-faces .jf:first-child { margin-left: 0; }
+#gate .join-faces .jf img { width: 100%; height: 100%; object-fit: cover; }
+#gate .join-np { font-size: 14px; display: flex; align-items: center; gap: 6px; max-width: 100%; }
+#gate .join-np .ico { width: 16px; height: 16px; flex: none; }
+#gate .join-btn { margin-top: 10px; height: 54px; font-size: 17px; border-radius: 16px; }
+#gate .join-btn .ico { width: 22px; height: 22px; }
+#gate.join { background: rgba(10, 14, 19, .9); -webkit-backdrop-filter: blur(22px) saturate(1.2); backdrop-filter: blur(22px) saturate(1.2); }
+:root.light #gate.join { background: rgba(255, 255, 255, .85); }
+
+/* ---- "Listen in Telegram" (the music in the group's own voice chat) ---- */
+.tg-listen { display: flex; align-items: center; gap: 12px; margin: 10px 16px 0; padding: 12px 14px; border-radius: 16px;
+  background: linear-gradient(135deg, rgba(43, 143, 232, .22), rgba(31, 178, 216, .14)); color: var(--fg); text-align: left; width: calc(100% - 32px); }
+.tg-listen .tl-ic { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; background: var(--tg-blue, #2b8fe8); color: #fff; flex: none; }
+.tg-listen .tl-ic .ico { width: 20px; height: 20px; }
+.tg-listen .tl-t { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.tg-listen .tl-t b { font-size: 15px; }
+.tg-listen .tl-t small { font-size: 12.5px; color: var(--fg2); }
+.tg-listen > .ico { width: 18px; height: 18px; opacity: .7; flex: none; }

@@ -148,3 +148,19 @@ the same moment for everyone, no "tap to hear", and it keeps playing with Telegr
 Effects, crossfade, skip, seek and pause are made on the server. Each phone's volume slider and "pause for me" still
 work. If a phone's voice isn't connected, that phone plays the music itself as before. The Health page shows
 whether it's on and working.
+
+## Music in the group's own Telegram voice chat (MUSIC_IN_TG_VC=1)
+A web page can't keep playing once the phone puts Telegram in the background, and an iPhone turns all its sound into
+call sound while a mic is on. Telegram's own voice chat has neither problem. With `MUSIC_IN_TG_VC=1` an **assistant
+account** (a normal Telegram account, a spare number is best) plays the room's music into the group's Telegram voice
+chat; the app stays the remote (queue, search, effects, playlists) and shows a **Listen in Telegram** bar.
+
+1. Set `TG_API_ID` and `TG_API_HASH` (my.telegram.org → API development tools) and `MUSIC_IN_TG_VC=1`.
+2. Open the app → More → Manage → **Health** (the bot's owner): under **Music assistant** enter the account's phone
+   number, then the code Telegram sends it (and its 2-step password, if it has one). The login is kept in the database.
+3. The assistant joins each group by itself (through an invite link the bot makes) and starts the voice chat. To start
+   it, it must be an admin that may manage voice chats: the bot makes it one if the bot may add admins; otherwise make
+   it an admin yourself, or start the voice chat by hand.
+
+It takes the place of `MUSIC_IN_VOICE` while it's on. The music keeps playing while people listen in Telegram even with
+nobody in the app; after 10 minutes without music the assistant leaves the voice chat.

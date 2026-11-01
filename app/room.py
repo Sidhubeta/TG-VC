@@ -483,7 +483,8 @@ class Room:
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
                          "music": self.music_state(), "chat": [self.chat_view(m, p) for m in self.chat if m["ts"] >= since],
                          "admin": admin,
-                         "musicVoice": voicemusic.enabled(),  # (the music comes through the voice chat)
+                         "musicVoice": voicemusic.mode() == "livekit",  # (the music comes through the app's voice chat)
+                         "musicTg": voicemusic.mode() == "telegram",  # (the music is in the group's Telegram voice chat)
                          "sudo": bool(getattr(conn, "sudo", False)),  # (bot owner / sudo user: sees the Health tab)
                          "owner": bool(getattr(conn, "owner", False)),  # (the bot's owner: manages sudo users)
                          "group": self.group_title,
@@ -625,7 +626,8 @@ class Room:
         try:
             await asyncio.sleep(EMPTY_GRACE)
             async with self._lock:
-                if not self.parts and self.status == "playing":
+                # (with the music in Telegram's own voice chat people listen there without the app: it goes on)
+                if not self.parts and self.status == "playing" and voicemusic.mode() != "telegram":
                     self.pos = self.cur_pos()
                     self.upd = now()
                     self.status = "paused"
@@ -1823,7 +1825,7 @@ async def bg_tick_loop():
     while True:
         await asyncio.sleep(3)
         for r in list(ROOMS.values()):
-            if r.parts:
+            if r.parts or voicemusic.mode() == "telegram":
                 voicemusic.ensure(r)  # (the voice chat's music player came back after a failure, or never started)
             if r.status not in ("playing", "loading"):
                 continue

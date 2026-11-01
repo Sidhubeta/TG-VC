@@ -13,16 +13,18 @@ import logging
 import time
 from collections import deque
 
-from . import config, lk, music
+from . import assistant, config, lk, music
 
 log = logging.getLogger("voicemusic")
 
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 try:  # the LiveKit SDK for Python (a server-side participant)
     from livekit import rtc
-    import numpy as np
 except Exception as _e:  # pragma: no cover
     rtc = None
-    np = None
     log.info("LiveKit Python SDK not available: %s", _e)
 
 IDENTITY = "music"
@@ -40,8 +42,91 @@ STATS = {"errors": 0, "last_error": "", "last_error_at": 0.0, "underruns": 0}
 logging.getLogger("livekit").setLevel(logging.WARNING)  # (the SDK says a lot at INFO)
 
 
+def mode() -> str | None:
+    """Where the server plays the music: "telegram" (the group's own Telegram voice chat, by the assistant),
+    "livekit" (the app's voice chat), or None (each phone plays it itself)."""
+    if np is None:
+        return None
+    if assistant.enabled():
+        return "telegram"
+    if config.MUSIC_IN_VOICE and lk.enabled() and rtc is not None:
+        return "livekit"
+    return None
+
+
 def enabled() -> bool:
-    return bool(config.MUSIC_IN_VOICE) and lk.enabled() and rtc is not None
+    return mode() is not None
+
+
+class _LiveKitSink:
+    """The app's voice chat: the server joins it as "Music"."""
+
+    def __init__(self, chat_id: int):
+        self.chat_id, self.lkroom, self.source = chat_id, None, None
+
+    async def connect(self):
+        self.lkroom = rtc.Room()
+        token = lk.join_token(self.chat_id, IDENTITY, "Music", True)
+        await self.lkroom.connect(config.LIVEKIT_URL, token)
+        self.source = rtc.AudioSource(RATE, CH, queue_size_ms=QUEUE_MS)
+        track = rtc.LocalAudioTrack.create_audio_track("music", self.source)
+        opts = rtc.TrackPublishOptions()
+        opts.source = rtc.TrackSource.SOURCE_SCREENSHARE_AUDIO  # (music, not a voice: no voice processing)
+        opts.dtx = False
+        opts.red = False
+        opts.audio_encoding.max_bitrate = 128000
+        await self.lkroom.local_participant.publish_track(track, opts)
+        log.info("music: playing into the app's voice chat of %s", self.chat_id)
+
+    def connected(self) -> bool:
+        return self.lkroom.isconnected()
+
+    def queued(self) -> float:
+        return float(getattr(self.source, "queued_duration", 0) or 0)
+
+    def clear(self):
+        self.source.clear_queue()
+
+    async def capture(self, data: bytes):
+        await self.source.capture_frame(rtc.AudioFrame(data, RATE, CH, FRAME))  # (waits: real time)
+
+    async def close(self):
+        if self.lkroom:
+            await self.lkroom.disconnect()
+
+
+class _TelegramSink:
+    """The group's own Telegram voice chat: the assistant account plays into it (10 ms pieces, in real time)."""
+    LEAD = 0.06  # (a little ahead of real time, so a busy moment on the server isn't a gap)
+
+    def __init__(self, chat_id: int):
+        self.chat_id, self.end = chat_id, 0.0
+
+    async def connect(self):
+        await assistant.join_call(self.chat_id)
+        log.info("music: playing into the Telegram voice chat of %s", self.chat_id)
+
+    def connected(self) -> bool:
+        return assistant.in_call(self.chat_id)
+
+    def queued(self) -> float:
+        return max(0.0, self.end - time.monotonic())
+
+    def clear(self):
+        self.end = time.monotonic()  # (Telegram has only a few hundredths of a second already: that plays out)
+
+    async def capture(self, data: bytes):
+        self.end = max(self.end, time.monotonic())
+        half = len(data) // 2
+        for part in (data[:half], data[half:]):
+            await assistant.send(self.chat_id, part)
+            self.end += 0.01
+        wait = self.end - time.monotonic() - self.LEAD
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+    async def close(self):
+        await assistant.leave(self.chat_id)
 
 
 def _sig(room) -> tuple:
@@ -189,25 +274,10 @@ def _near_end(item: dict, sig) -> bool:
 class Player:
     def __init__(self, room):
         self.room = room
-        self.lkroom = None
-        self.source = None
+        self.sink = _TelegramSink(room.chat_id) if mode() == "telegram" else _LiveKitSink(room.chat_id)
         self.voices: list[_Voice] = []
         self.started = time.time()
         self.task = asyncio.get_running_loop().create_task(self._run())
-
-    async def _connect(self):
-        self.lkroom = rtc.Room()
-        token = lk.join_token(self.room.chat_id, IDENTITY, "Music", True)
-        await self.lkroom.connect(config.LIVEKIT_URL, token)
-        self.source = rtc.AudioSource(RATE, CH, queue_size_ms=QUEUE_MS)
-        track = rtc.LocalAudioTrack.create_audio_track("music", self.source)
-        opts = rtc.TrackPublishOptions()
-        opts.source = rtc.TrackSource.SOURCE_SCREENSHARE_AUDIO  # (music, not a voice: no voice processing)
-        opts.dtx = False
-        opts.red = False
-        opts.audio_encoding.max_bitrate = 128000
-        await self.lkroom.local_participant.publish_track(track, opts)
-        log.info("music: playing into the voice chat of %s", self.room.chat_id)
 
     async def _change(self, old_sig, sig):
         """The room moved: next song (crossfade if the room blends), skip, seek, pause, other effects."""
@@ -224,8 +294,8 @@ class Player:
         fade = xf or (0.08 if same_song else 0.05)
         for v in self.voices:
             v.fade_out(fade)
-        if not xf and self.source and any(not v.finished() for v in self.voices):
-            self.source.clear_queue()  # (a skip, a seek or a pause is heard at once, not after the buffer)
+        if not xf and any(not v.finished() for v in self.voices):
+            self.sink.clear()  # (a skip, a seek or a pause is heard at once, not after the buffer)
         self._item = room.current
         if playing:
             # (found in the background: waiting here for a song still downloading starved the old one's fade-out
@@ -235,8 +305,7 @@ class Player:
             self.voices.append(_Voice(_source_args(room, self._ahead), fade_in=fade if (xf or same_song) else 0.02))
 
     def _ahead(self) -> float:
-        q = getattr(self.source, "queued_duration", None) if self.source else None
-        return max(START_LAG, float(q or 0))
+        return max(START_LAG, self.sink.queued())
 
     async def _run(self):
         self._item = None
@@ -244,15 +313,16 @@ class Player:
         empty_since = quiet_since = None
         pend_at = 0.0
         try:
-            await self._connect()
+            await self.sink.connect()
             _retry_at.pop(self.room.chat_id, None)
             nxt = time.monotonic()
             while True:
                 room = self.room
-                if not self.lkroom.isconnected():
+                if not self.sink.connected():
                     # thrown out of the voice chat (LiveKit restarted, the network gave up): join again soon
                     raise RuntimeError("left the voice chat")
-                if not room.parts:
+                # (in Telegram's voice chat people listen without the app open: only the app's voice chat empties)
+                if not room.parts and isinstance(self.sink, _LiveKitSink):
                     empty_since = empty_since or time.monotonic()
                     if time.monotonic() - empty_since > 60:  # nobody here: leave the voice chat
                         return
@@ -297,7 +367,7 @@ class Player:
                     continue
                 data = np.clip(mix, -32768, 32767).astype(np.int16).tobytes()
                 nxt = time.monotonic()
-                await self.source.capture_frame(rtc.AudioFrame(data, RATE, CH, FRAME))  # (waits: real time)
+                await self.sink.capture(data)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -315,8 +385,7 @@ class Player:
             if _players.get(self.room.chat_id) is self:
                 _players.pop(self.room.chat_id, None)
             try:
-                if self.lkroom:
-                    await self.lkroom.disconnect()
+                await self.sink.close()
             except Exception:
                 pass
 
@@ -326,7 +395,7 @@ class Player:
 
 def ensure(room):
     """A player for this room while people are in it (started on the first join, ends a minute after the last)."""
-    if not enabled() or not room.parts:
+    if not enabled() or (not room.parts and mode() != "telegram"):
         return
     p = _players.get(room.chat_id)
     if p and p.alive():
@@ -339,7 +408,10 @@ def ensure(room):
 
 
 def status() -> dict:
-    if not config.MUSIC_IN_VOICE:
+    where = "Telegram voice chat" if mode() == "telegram" else "voice chat"
+    if mode() == "telegram":
+        pass
+    elif not config.MUSIC_IN_VOICE:
         return {"ok": None, "detail": "Off — phones play the music themselves (set MUSIC_IN_VOICE=1 to play it in the voice chat)"}
     if rtc is None:
         return {"ok": False, "detail": "The LiveKit Python SDK is missing (pip install livekit numpy)"}
@@ -349,6 +421,6 @@ def status() -> dict:
     # (an old error doesn't keep it red: only one in the last 10 minutes with no voice chat playing now)
     recent = STATS["last_error_at"] and time.time() - STATS["last_error_at"] < 600
     return {"ok": n > 0 or not recent,
-            "detail": f"On · playing in {n} voice chat{'s' if n != 1 else ''}"
+            "detail": f"On · playing in {n} {where}{'s' if n != 1 else ''}"
             + (f" · {STATS['underruns']} gap(s) of 20 ms" if STATS["underruns"] else "")
             + (f" · {STATS['errors']} error(s), last: {STATS['last_error']}" if STATS["errors"] else "")}

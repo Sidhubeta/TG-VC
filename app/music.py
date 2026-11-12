@@ -966,15 +966,17 @@ async def piece(vid: str, k: int, quality: str) -> Response:
 _thumbs: "OrderedDict[str, bytes | None]" = OrderedDict()  # small in-memory LRU so ytimg isn't hit on every view
 
 
-async def thumb(vid: str) -> Response:
+async def thumb(vid: str, small: bool = False) -> Response:
+    """A song's cover. small: the 480 px picture, for rows and cards (the full one is 1280 px, ~10x the bytes)."""
     if not valid_id(vid):
         return Response(status_code=404)
-    if vid in _thumbs:
-        _thumbs.move_to_end(vid)
-        data = _thumbs[vid]
+    key = vid + ("/s" if small else "")
+    if key in _thumbs:
+        _thumbs.move_to_end(key)
+        data = _thumbs[key]
     else:
         data, failed = None, False
-        for q in ("maxresdefault", "hqdefault", "mqdefault"):
+        for q in (("hqdefault", "mqdefault") if small else ("maxresdefault", "hqdefault", "mqdefault")):
             try:
                 r = await http().get(f"https://i.ytimg.com/vi/{vid}/{q}.jpg")
                 if r.status_code == 200 and len(r.content) > 2000:
@@ -983,7 +985,7 @@ async def thumb(vid: str) -> Response:
             except Exception:
                 failed = True
         if data or not failed:  # don't remember network errors as "no thumbnail"
-            _thumbs[vid] = data
+            _thumbs[key] = data
             # by size, not count: big covers are ~150 KB each, 300 of them took ~45 MB
             total = sum(len(v or b"") for v in _thumbs.values())
             while _thumbs and (total > 16 * 1024 * 1024 or len(_thumbs) > 600):

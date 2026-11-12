@@ -13,7 +13,7 @@ import logging
 import time
 from collections import deque
 
-from . import music
+from . import music, voicemusic
 
 log = logging.getLogger("radio")
 KBPS = 96
@@ -34,7 +34,8 @@ def busy() -> bool:
 def _sig(room) -> tuple:
     """What the room is playing; a change means the station starts over from the room's new position."""
     c = room.current
-    return (c and c["qid"], room.status, round(room.upd, 2), round(room.pos, 2), room.fx["rate"])
+    # (the effects too: the stream is made with them, so a minimized phone keeps hearing the room's effect)
+    return (c and c["qid"], room.status, round(room.upd, 2), round(room.pos, 2), tuple(sorted(room.fx.items())))
 
 
 def _at_end(room) -> bool:
@@ -74,9 +75,11 @@ async def _source(room):
     if headers:
         args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
     args += ["-ss", f"{max(0.0, pos):.2f}", "-i", src]
-    if rate != 1:
-        # Slowed / Nightcore: faster or slower with the pitch, like the app plays it (the room's clock runs at it)
-        args += ["-af", f"aresample=44100,asetrate={44100 * rate:.0f},aresample=44100"]
+    # The room's effect is made here (bass, mids, treble, reverb, 8D, Slowed / Nightcore): minimized, the phone
+    # can't run its own effects, and the song used to play plain until the app was opened again.
+    fl = voicemusic._filters(room.fx)
+    if fl:
+        args += ["-af", ",".join(fl)]
     if end:
         args += ["-t", f"{(end - pos) / rate:.2f}"]
     return args

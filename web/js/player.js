@@ -948,7 +948,7 @@ export function renderCard() {
   if (!t) {
     el.onclick = () => openSearch('home');
     el.append(h('div', { class: 'art' }, icon('music')),
-      h('div', { class: 'meta' }, h('div', { class: 'ttl' }, 'Nothing playing'), h('div', { class: 'art-sub' }, canAdd() ? 'Tap to search, or paste a YouTube, Spotify or SoundCloud link' : 'Admins will play music here')),
+      h('div', { class: 'meta' }, h('div', { class: 'ttl' }, 'Nothing playing'), h('div', { class: 'art-sub' }, canAdd() ? 'Tap to add a song' : 'Admins will play music here')),
       canAdd() ? h('div', { class: 'ctl' }, h('button', { 'aria-label': 'Search', onclick: (e) => { e.stopPropagation(); openSearch(); } }, icon('plus'))) : null);
     return;
   }
@@ -1154,6 +1154,7 @@ setInterval(tickUI, 250);
 
 export function refresh() {
   renderCard();
+  renderMini();
   if (!NP.el) return;
   const t = cur();
   if (!t) { if (NP.open) closeNP(); return; }
@@ -1271,7 +1272,7 @@ function renderQueue(st) {
         m.queue.length ? h('button', { class: 'round' + (can('queue') ? '' : ' locked'), 'aria-label': 'Clear queue', onclick: async () => { if (!can('queue')) return deny('queue'); if (await confirmBox('Clear the whole queue?', 'Clear', true)) send({ t: 'music.clear' }); } }, icon('trash')) : null,
         h('button', { class: 'round', 'aria-label': 'Play history', onclick: openPlayHistory }, icon('history')),
         canAdd() ? h('button', { class: 'round', 'aria-label': 'Add songs', onclick: () => openSearch('search') }, icon('plus')) : null)));
-  if (!m.queue.length) box.append(h('p', { style: { color: 'rgba(255,255,255,.6)', margin: '14px 0' } }, m.autoplay ? 'Autoplay is on — similar songs will play when the queue ends.' : 'Queue is empty. When this song ends, the music stops.'));
+  if (!m.queue.length) box.append(h('p', { style: { color: 'rgba(255,255,255,.6)', margin: '14px 0' } }, m.autoplay ? 'Autoplay is on.' : 'Queue is empty.'));
   m.queue.forEach((t, i) => box.append(trackRow(t, {
     sub: `${t.artist}${t.by ? ' · ' + t.by : ''}`,
     btn: icon('more'),
@@ -1430,7 +1431,7 @@ function openFx() {
       slider('treble', 'Treble', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
       slider('reverb', 'Reverb', 0, 0.8, 0.01, v => Math.round(v * 100) + '%', allowed),
       slider('rate', 'Speed', 0.7, 1.4, 0.05, v => Number(v).toFixed(2) + '×', allowed),
-      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '12px' } }, 'Everyone in the voice chat hears this effect, in sync. 8D sounds best with headphones.'));
+      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '12px' } }, 'Everyone hears this effect.'));
   };
   // redraw when someone else changes it (not on the echo of our own slider, which would break the drag)
   const onFx = () => {
@@ -1474,11 +1475,32 @@ function buildBrowse() {
     h('div', { class: 'br-top' }, h('div', { class: 'grab' }, h('i')),
       h('button', { class: 'br-close', 'aria-label': 'Close', onclick: closeBrowse }, icon('down'))),
     h('div', { class: 'br-scroll', id: 'br-scroll' }),
+    h('div', { class: 'br-mini', id: 'br-mini', hidden: true }),
     h('nav', { class: 'br-tabs', id: 'br-tabs' }));
   document.body.append(el);
   dragToClose(el, [el.querySelector('.br-top')], closeBrowse);
   BR.el = el;
+  renderMini();
   return el;
+}
+// The song playing, as a small glass bar over the music page (like Apple Music's mini player): tap it for the player.
+let miniSig = '';
+function renderMini() {
+  const el = BR.el?.querySelector('#br-mini'); if (!el) return;
+  const t = cur();
+  const isPlay = playing() && !P.localPaused;
+  const sig = t ? [t.qid, t.title, t.artist, isPlay].join('|') : '';
+  if (sig === miniSig && (el.hidden || el.firstChild)) return;
+  miniSig = sig;
+  el.hidden = !t;
+  BR.el.classList.toggle('has-mini', !!t);
+  if (!t) return el.replaceChildren();
+  el.onclick = () => { closeBrowse(); openNP(); };
+  el.replaceChildren(
+    h('div', { class: 'bm-art', style: { backgroundImage: `url("${media(t.thumb)}")` } }),
+    h('div', { class: 'bm-t' }, h('b', null, t.title), t.artist ? h('small', null, t.artist) : null),
+    h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
+    h('button', { 'aria-label': 'Next', onclick: (e) => { e.stopPropagation(); next(); } }, icon('next', 'fill')));
 }
 function setTab(t) { BR.tab = t; BR.view = null; BR.sub = null; haptic('select'); renderBrowse(); }
 function renderBrowse() {

@@ -4,7 +4,7 @@ import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
   allowDeviceList, noiseStatus, screenSupported, setCam, setMic, setNoise, setRoomVolume, setScreen, setVolume, startVoice, toggleMuteForMe,
-  restartVoice, setHdTalk, unblockAudio, useDevice,
+  restartVoice, unblockAudio, useDevice,
 } from './voice.js';
 import { recorder } from './recorder.js';
 import { startEmoji } from './emoji.js';
@@ -494,12 +494,12 @@ function openAudio() {
     } else if (outs.length > 1) {
       speaker = h('div', { class: 'list' }, ...outs.map((d, i) => choice('audiooutput', d, [d.deviceId === 'default' ? 'Automatic' : d.label || `Speaker ${i + 1}`, null, /bluetooth|airpods|buds/i.test(d.label) ? 'bt' : 'speaker'], curOut)));
     } else if (!named && !isApplePhone) {
-      speaker = h('div', null, h('p', { class: 'muted note' }, 'Allow the microphone once so your phone can list its speakers, earpiece and Bluetooth devices.'),
+      speaker = h('div', null, h('p', { class: 'muted note' }, 'Allow the microphone once to see your sound devices.'),
         h('button', { class: 'btn sm block', onclick: async () => { await allowDeviceList(); render(); } }, 'Show sound devices'));
     } else {
       speaker = h('p', { class: 'muted note' }, isApplePhone
-        ? 'On iPhone, choose the iPhone speaker, AirPods or Bluetooth from Control Center (long-press the music card, then the AirPlay icon).'
-        : 'Your phone picks the speaker itself: connect Bluetooth or earphones and the sound moves there.');
+        ? 'On iPhone, pick the speaker or AirPods in Control Center.'
+        : 'Connect Bluetooth or earphones and the sound moves there.');
     }
     const mics = ins.filter(d => !routeOf(d) && d.deviceId !== 'communications');
     body.replaceChildren(
@@ -511,10 +511,8 @@ function openAudio() {
       h('div', { class: 'list' },
         volRow('group', 'Voices', getRoomVolume(), setRoomVolume),
         volRow('music', 'Music', getMusicVolume(), (v) => { unlockAudio(); setMusicVolume(v); })),
-      h('p', { class: 'muted note' }, 'During a call the volume buttons change the call volume, which Android never lets go fully silent. Use these sliders to make voices or music quieter.'),
       h('div', { class: 'list' },
         switchRow('Noise isolation', noiseStatus(), V.noise, (v) => { setNoise(v).then(render); }),
-        switchRow('HD music while talking', isApplePhone ? 'Android only: iPhone always switches to call sound while a mic is on.' : 'Music keeps full quality when your mic is on. On the phone’s speaker others may hear a little echo — turn off if they do.', V.hdTalk, (v) => { setHdTalk(v).then(render); }),
         switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
   };
   const onDev = () => render();
@@ -529,7 +527,7 @@ function openMore() {
   const p = me();
   const body = h('div',
     S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Manage voice chat', () => { s.close(); openAdmin(); }, 'acc',
-      adminAlerts ? `${adminAlerts} new alert${adminAlerts > 1 ? 's' : ''}` : 'Settings, logs, safety, recording')) : null,
+      adminAlerts ? `${adminAlerts} new alert${adminAlerts > 1 ? 's' : ''}` : null)) : null,
     // a sudo user who isn't an admin of this group: just the Health page
     S.sudo && !S.admin ? h('div', { class: 'list' }, actionRow('shield', 'Health', () => {
       s.close();
@@ -537,14 +535,14 @@ function openMore() {
       let stop = null;
       sheet({ title: 'Health', body, tall: true, onClose: () => stop?.() });
       stop = adminHealth(body);
-    }, 'acc', 'Is everything working?')) : null,
+    }, 'acc')) : null,
     h('div', { class: 'list' },
       p && !p.canSpeak ? actionRow('hand', p.hand ? 'Lower hand' : 'Raise hand', () => { send({ t: 'hand', up: !p.hand }); s.close(); }) : null,
       actionRow('user-plus', 'Invite members', () => { s.close(); openInvite(); }),
       actionRow('music', 'Music player', () => { s.close(); openNP(); }),
       actionRow('search', 'Browse music', () => { s.close(); openSearch('home'); }),
-      actionRow('history', 'Play history', () => { s.close(); openPlayHistory(); }, '', 'What played and who added it'),
-      actionRow('history', 'Recent messages', () => { s.close(); openHistory(); }, '', S.admin ? 'Last 48 hours' : 'Since you joined'),
+      actionRow('history', 'Play history', () => { s.close(); openPlayHistory(); }),
+      actionRow('reply', 'Recent messages', () => { s.close(); openHistory(); }),
       S.room.settings?.soundboard ? actionRow('sound', 'Soundboard', () => { s.close(); openBoard(); }) : null,
       screenSupported() && p?.canSpeak ? actionRow('screen', V.screen ? 'Stop sharing screen' : 'Share screen', () => { s.close(); setScreen(!V.screen); }) : null),
     h('div', { class: 'list' },
@@ -556,7 +554,7 @@ function openMore() {
 function openBoard() {
   const body = h('div', h('div', { class: 'sb' }, ...BOARD.map(([id, e, label]) =>
     h('button', { onclick: () => { haptic('light'); send({ t: 'sound', id }); } }, h('span', null, e), label))),
-    h('p', { class: 'muted', style: { fontSize: '13px' } }, 'Everyone in the room hears these.'));
+    null);
   sheet({ title: 'Soundboard', body });
 }
 on('ws:sound', (m) => {
@@ -605,10 +603,10 @@ async function openInvite() {
       more = r.more; next = r.next;
       note.textContent = r.only_admins ? 'This group hides its member list, so you can invite its admins.'
         : r.source === 'full' ? (r.total != null ? `${r.total} members` : '')
-        : 'Admins and the members the bot has seen in the group.';
+        : 'People the bot has seen in the group.';
       if (r.hint) note.append(h('span', { class: 'inv-hint' }, r.privacy
-        ? ' To list more people: in @BotFather send /setprivacy → choose the bot → Disable. To list everyone, set TG_API_ID and TG_API_HASH (my.telegram.org).'
-        : ' To list everyone in the group, set TG_API_ID and TG_API_HASH (from my.telegram.org) on the server.'));
+        ? ' To list more people, turn off the bot’s privacy mode in @BotFather.'
+        : ' To list everyone, set TG_API_ID and TG_API_HASH on the server.'));
       foot.replaceChildren(!shown ? h('div', { class: 'empty-note' }, q ? 'Nobody found.' : 'Nobody to invite right now.') : '');
       if (more && sh.body.scrollHeight <= sh.body.clientHeight + 40) { busy = false; return load(); } // fill the screen
     } catch (e) {
@@ -735,8 +733,7 @@ function openHistory() {
   historySheet?.close();
   const list = h('div', { class: 'chat-list' }, ...S.msgs.map(msgEl));
   if (!S.msgs.length) list.append(h('div', { class: 'empty-note' }, S.admin ? 'No messages in the last 48 hours.' : 'No messages since you joined.'));
-  const note = S.admin ? 'As an admin you see the last 48 hours. Tap a message to reply.'
-    : 'Messages since you joined. When you leave the voice chat they’re gone for you. Tap a message to reply.';
+  const note = S.admin ? 'The last 48 hours. Tap a message to reply.' : 'Messages since you joined. Tap a message to reply.';
   const body = h('div', null, h('p', { class: 'muted note' }, note), list);
   historySheet = sheet({ title: 'Recent messages', body, tall: true, onClose: () => { historySheet = null; } });
   setTimeout(() => (historySheet && (historySheet.body.scrollTop = historySheet.body.scrollHeight)), 50);
@@ -795,16 +792,16 @@ function adminRoom(c) {
       h('button', { class: 'btn sm', onclick: () => { send({ t: 'admin.settings', settings: { title: title.value, description: desc.value } }); toast('Saved'); } }, 'Save')),
     h('div', { class: 'grp-h' }, 'Permissions'),
     h('div', { class: 'list' },
-      switchRow('New participants can speak', 'Off: they join as listeners and raise a hand', st.new_can_speak, v => set('new_can_speak', v)),
-      switchRow('Lock voice chat', 'No new people can join', st.locked, v => set('locked', v)),
+      switchRow('New participants can speak', null, st.new_can_speak, v => set('new_can_speak', v)),
+      switchRow('Lock voice chat', null, st.locked, v => set('locked', v)),
       switchRow('Soundboard', null, st.soundboard, v => set('soundboard', v)),
-      switchRow('Join & leave sounds', 'For everyone', st.join_sound, v => set('join_sound', v))),
+      switchRow('Join & leave sounds', null, st.join_sound, v => set('join_sound', v))),
     h('div', { class: 'list' },
       actionRow('mic-off', 'Mute everyone', () => { send({ t: 'admin.muteall' }); haptic('warning'); }, '', 'Everyone except admins'),
       actionRow('mic', 'Let everyone speak again', () => send({ t: 'admin.unmuteall' }))),
     h('div', { class: 'grp-h' }, 'Private link'),
     h('div', { class: 'list' },
-      actionRow('link', 'Copy invite link', () => { pendingLink = (url) => copyText(url); send({ t: 'admin.link' }); }, '', 'Only members of this group can use it'),
+      actionRow('link', 'Copy invite link', () => { pendingLink = (url) => copyText(url); send({ t: 'admin.link' }); }),
       actionRow('lock', 'Reset link', async () => { if (await confirmBox('The old link will stop working. Members need the new one (/vc in the group).', 'Reset link', true)) { pendingLink = (url) => { copyText(url); toast('New link copied'); }; send({ t: 'admin.resetlink' }); } }, 'red')),
     h('div', { class: 'grp-h' }, 'Recording'),
     recBox,
@@ -820,8 +817,8 @@ function adminRoom(c) {
       mine ? h('div', { style: { margin: '8px 0 0' } }, name) : null,
       h('div', { class: 'list' },
         rec.on
-          ? actionRow('rec', mine ? 'Stop recording and send' : 'Another admin is recording', () => { if (mine) { send({ t: 'rec.name', name: name.value }); recorder.stop(name.value); } }, 'red', mine ? 'The bot sends the file to your private chat' : null)
-          : actionRow('rec', 'Start recording', startRecording, '', 'Records voices and music. The bot sends the file only to you, in private')));
+          ? actionRow('rec', mine ? 'Stop recording and send' : 'Another admin is recording', () => { if (mine) { send({ t: 'rec.name', name: name.value }); recorder.stop(name.value); } }, 'red', null)
+          : actionRow('rec', 'Start recording', startRecording, '', 'The bot sends it to you in private')));
   };
   drawRec();
   on('room:changed', drawRec);
@@ -874,7 +871,6 @@ function adminMusic(c) {
   const draw = () => {
     const st = S.room.settings || {}, ev = st.music_everyone || {}, djs = st.music_dj || {};
     c.replaceChildren(
-      h('p', { class: 'muted note' }, 'Admins can always do everything. Choose what everyone else can do, and give chosen people their own rights as music DJs.'),
       h('div', { class: 'grp-h' }, 'Everyone can'),
       h('div', { class: 'list' }, ...MUSIC_PERMS.map(([k, label, sub]) => switchRow(label, sub || null, !!ev[k], v => send({ t: 'admin.musicperms', everyone: { [k]: v } })))),
       h('div', { class: 'grp-h' }, 'Music DJs'),
@@ -939,7 +935,7 @@ function sudoBox() {
   api('/api/sudo').then(r => draw(r.users), () => {});
   return h('div', null,
     h('div', { class: 'grp-h' }, 'Sudo users'),
-    h('p', { class: 'muted note' }, 'They see this page too. Add as many as you like: here, or with /addsudo in Telegram (a user id, an @username, or as a reply to their message).'),
+    h('p', { class: 'muted note' }, 'They see this page too. You can also use /addsudo in Telegram.'),
     list,
     h('div', { style: { display: 'flex', gap: '8px', marginTop: '8px' } }, input, h('button', { class: 'btn sm', onclick: add }, 'Add')));
 }
@@ -949,7 +945,7 @@ function adminTeam(c, go) {
   const draw = () => {
     const st = S.room.settings || {}, mods = st.mods || {}, djs = st.music_dj || {};
     c.replaceChildren(
-      h('p', { class: 'muted note' }, 'Admins can do everything. Moderators look after people: mute or unmute, make listener or speaker, remove from the voice chat, delete messages (not ban, settings or recording). Music DJs get the music rights you choose.'),
+      h('p', { class: 'muted note' }, 'Moderators can mute, move and remove people. Music DJs get the music rights you choose.'),
       h('div', { class: 'grp-h' }, 'Moderators'),
       h('div', { class: 'list' },
         ...Object.entries(mods).map(([uid, m]) => actionRow('shield', m.name, async () => {
@@ -1085,7 +1081,7 @@ async function adminSafety(c) {
   c.replaceChildren(
     h('div', { class: 'grp-h' }, 'Needs a look (in the room now)'),
     flagged.length ? h('div', { class: 'list' }, ...flagged.map(p => h('button', { class: 'row', onclick: () => openParticipant(p.uid) },
-      h('span', { style: { fontSize: '18px' } }, '⚠️'), h('span', { class: 'lab' }, p.name, h('small', null, p.flags.join(' · ')))))) : h('p', { class: 'muted', style: { fontSize: '14px' } }, 'Nobody suspicious right now. People who join in a flood, rejoin over and over, or get reported show up here.'),
+      h('span', { style: { fontSize: '18px' } }, '⚠️'), h('span', { class: 'lab' }, p.name, h('small', null, p.flags.join(' · ')))))) : h('p', { class: 'muted', style: { fontSize: '14px' } }, 'Nobody suspicious right now.'),
     h('div', { class: 'grp-h' }, 'Reports'),
     r.reports.length ? h('div', { class: 'list' }, ...r.reports.map(x => h('div', { class: 'rep' },
       h('div', { class: 'rt' }, icon('flag'), h('div', null, h('b', null, `${x.name}`), h('small', null, `Reported by ${x.by_name} · ${fmtDate(x.ts)}`), h('small', null, x.reason || 'No reason given'))),

@@ -1145,3 +1145,72 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
   .sheet .seg button { font-size: 12px; padding: 0 2px; }
   .row { padding-left: 14px; padding-right: 14px; }
 }
+
+/* =====================================================================
+   Liquid glass + the music page as Apple Music
+   (blur only on small floating pieces: full-screen blurs are what made phones lag)
+   ===================================================================== */
+.br-tabs, .br-mini, .br-close, .br-back, .top .icon-btn, .dk .c, .toast, .cpop, .np .round, .close-x, .vbtn, .fv-close, .cc-art .cc-add, .tap-hint, #composer {
+  -webkit-backdrop-filter: blur(22px) saturate(1.8) !important; backdrop-filter: blur(22px) saturate(1.8) !important; }
+.br-tabs, .br-mini, .br-close, .br-back, .top .icon-btn, .dk .c, .np .round, .vbtn, .fv-close {
+  background: linear-gradient(135deg, rgba(255, 255, 255, .16), rgba(255, 255, 255, .06));
+  border: .5px solid rgba(255, 255, 255, .18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22), inset 0 -1px 0 rgba(0, 0, 0, .25), 0 8px 24px rgba(0, 0, 0, .35); }
+.toast, .cpop, #composer { background: rgba(44, 44, 46, .72); border: .5px solid rgba(255, 255, 255, .14); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .14), 0 10px 30px rgba(0, 0, 0, .45); }
+.toast.err { background: rgba(255, 69, 58, .88); }
+.dk.on .c { background: #fff; color: #000; border-color: transparent; }
+.dk.red .c { background: linear-gradient(135deg, rgba(255, 69, 58, .34), rgba(255, 69, 58, .16)); border-color: rgba(255, 69, 58, .35); }
+.close-x { background: rgba(118, 118, 128, .36); }
+
+/* ---- Apple Music ---- */
+.br { background: #000; --am: #fa2d48; }
+.br-scroll { padding-bottom: calc(96px + var(--safe-b)); }
+.br.has-mini .br-scroll { padding-bottom: calc(164px + var(--safe-b)); }
+.br-h1 { padding: 14px 20px 6px; }
+.br-h1 h1 { font-size: 34px; font-weight: 700; letter-spacing: -.02em; }
+.br-sec { padding: 26px 20px 12px; align-items: center; }
+.br-sec h2 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+.br-sec button { color: var(--am); font-size: 17px; }
+.br-sub h2 { font-size: 22px; }
+.cc { width: 158px; }
+.cc-art { width: 158px; height: 158px; border-radius: 10px; box-shadow: none; }
+.cc-t { font-size: 15px; margin-top: 8px; }
+.cc-a { font-size: 15px; color: rgba(235, 235, 245, .6); }
+.pl-art { border-radius: 10px; }
+.gt { height: 110px; border-radius: 12px; }
+.gt.big { height: 136px; }
+.gt span { font-size: 17px; font-weight: 700; }
+.br .trk { padding: 6px 0; }
+.br .trk .ta { width: 50px; height: 50px; border-radius: 6px; }
+.br .trk .tt { font-size: 17px; }
+.br .trk .ts { font-size: 15px; }
+.br .trk .tb, .br .trk.added .tb, .br .list .row.acc, .br .list .row.acc .ico { color: var(--am); }
+.br .list { background: #1c1c1e; }
+.br .searchbar { height: 38px; border-radius: 11px; }
+.br .searchbar input { font-size: 17px; }
+.top-res { background: #1c1c1e; border-radius: 14px; }
+.br .btn, .top-res .btn { background: var(--am); color: #fff; }
+/* Play / Shuffle, the Apple Music way: two grey buttons with red labels */
+.col-hero h1 { font-size: 34px; font-weight: 700; }
+.br .col-btns .btn, .br .col-btns .btn:not(.soft):not(.danger), .br .col-btns .btn.soft { background: rgba(118, 118, 128, .3); color: var(--am); border-radius: 12px; height: 50px; font-size: 17px; }
+.br .col-btns .btn.danger { color: var(--danger); }
+.col-hero .col-btns .btn, .col-hero .col-btns .btn:not(.soft):not(.danger), .col-hero .col-btns .btn.soft { background: rgba(255, 255, 255, .22); color: #fff; }
+.cc-art .cc-ok { background: var(--am); }
+.br .spinner { border-top-color: var(--am); }
+/* the tab bar floats as a glass capsule; the selected tab is a lighter bubble */
+.br-tabs { position: absolute; left: 14px; right: 14px; bottom: calc(10px + var(--safe-b)); z-index: 5; padding: 4px; border-radius: 36px; border-top: .5px solid rgba(255, 255, 255, .18); gap: 2px; }
+.br-tabs button { border-radius: 30px; padding: 7px 0 5px; color: rgba(255, 255, 255, .78); font-size: 10px; font-weight: 600; transition: background .25s, color .2s; }
+.br-tabs button .ico { width: 24px; height: 24px; }
+.br-tabs button.on { color: var(--am); background: rgba(255, 255, 255, .14); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16); }
+/* mini player: a glass bar above the tab bar */
+.br-mini { position: absolute; left: 14px; right: 14px; bottom: calc(78px + var(--safe-b)); z-index: 5; height: 58px; border-radius: 22px;
+  display: flex; align-items: center; gap: 10px; padding: 0 8px 0 9px; animation: tin .3s var(--spring) both; }
+.br-mini .bm-art { width: 40px; height: 40px; border-radius: 8px; background: #2c2c2e center/cover; flex: none; }
+.br-mini .bm-t { flex: 1; min-width: 0; display: grid; }
+.br-mini .bm-t b { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.br-mini .bm-t small { font-size: 12.5px; color: rgba(235, 235, 245, .6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.br-mini button { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; flex: none; }
+.br-mini button:active { background: rgba(255, 255, 255, .12); transform: scale(.9); }
+.br-mini button .ico { width: 24px; height: 24px; }
+/* (the two bars sit over scrolling artwork and text: a darker glass keeps their labels readable) */
+.br-tabs, .br-mini { background: linear-gradient(135deg, rgba(72, 72, 76, .66), rgba(28, 28, 30, .7)); }

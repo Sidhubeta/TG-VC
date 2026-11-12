@@ -9,21 +9,14 @@ let roomVol = store.get('roomVol', 1);
 export const V = {
   ready: false, mic: false, cam: false, screen: false, facing: 'user',
   noise: store.get('noise', true), speaking: new Set(),
-  // HD music while talking: the phone's own echo cancelling is what switches its sound to "call" mode (thin, mono
-  // music, call volume) while the mic is on. Without it the sound stays in media mode. The browser's noise
-  // reduction and our noise isolation stay on; with the phone's speaker others may hear a little echo.
-  hdTalk: store.get('hdTalk', true),
 };
+// Echo cancelling stays on: a phone with its mic open is in "call" sound whatever is asked for here (Android's
+// browser does that for every open mic, iPhone too), so leaving it off only added echo. What helps is not keeping the
+// mic open: see setMic.
 const micOpts = () => {
   const mic = store.get('dev:audioinput', '');
-  return { echoCancellation: !V.hdTalk, noiseSuppression: true, autoGainControl: true, channelCount: 1, ...(mic ? { deviceId: mic } : {}) };
+  return { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, ...(mic ? { deviceId: mic } : {}) };
 };
-export async function setHdTalk(on) {
-  V.hdTalk = on;
-  store.set('hdTalk', on);
-  const track = room?.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone)?.audioTrack;
-  if (track) { try { await track.restartTrack(micOpts()); await applyNoise(); } catch (e) { console.warn(e); } }
-}
 
 async function loadSDK() {
   if (LK) return LK;
@@ -365,20 +358,14 @@ function iosSession(recording) {
 }
 iosSession(false);
 
-// A mic that's off is let go after a little while. While a phone records it keeps all its sound in "call" mode, so a
-// muted-but-open mic sent the music out of the call's speaker at the call's volume. Not at once: reopening the mic
-// takes a moment and cut the first word off when someone just paused for a second.
-const MIC_RELEASE = 20000;
+// A mic that's off is let go at once. While a phone has a mic open it keeps all its sound in "call" mode (thin,
+// quiet music from the call speaker): a muted-but-open mic kept the music sounding like a phone call. It used to be
+// let go 20 s later; now the music is back to normal sound the moment the mic goes off.
 let micReleaseTimer = null;
-function releaseMicLater() {
-  clearTimeout(micReleaseTimer);
-  micReleaseTimer = setTimeout(async () => {
-    if (V.mic || !room) return;
-    const pub = room.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone);
-    if (!pub?.track) return;
-    try { await room.localParticipant.unpublishTrack(pub.track, true); } catch (e) { console.warn(e); }
-    emit('voice:session', 'play'); // (the phone goes back to media sound: nudge the music)
-  }, MIC_RELEASE);
+async function releaseMic() {
+  const pub = room?.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone);
+  if (pub?.track) await room.localParticipant.unpublishTrack(pub.track, true);
+  else await room?.localParticipant.setMicrophoneEnabled(false);
 }
 export async function setMic(on) {
   if (!room || !V.ready) { toast('Voice is still connecting'); return false; }
@@ -387,12 +374,13 @@ export async function setMic(on) {
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
     if (on) await refreshPermissions();
-    await room.localParticipant.setMicrophoneEnabled(on, on ? micOpts() : undefined);
+    if (on) await room.localParticipant.setMicrophoneEnabled(true, micOpts());
+    else await releaseMic();
     // (minimized, noise isolation crackles: it comes on when the app is open again — see the visibility handler)
     if (on) { if (document.hidden) bgOff = true; else await applyNoise(); }
     V.mic = on;
     send({ t: 'mic', on });
-    if (!on) { iosSession(false); releaseMicLater(); }
+    if (!on) iosSession(false);
     // the phone switches its audio between "media" and "call" mode as the mic starts/stops (Android too):
     // a playing song can go silent right then, so the music player gets a nudge
     emit('voice:session', on ? 'record' : 'play');

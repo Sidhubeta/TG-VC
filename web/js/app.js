@@ -24,8 +24,9 @@ async function boot() {
   try {
     tg?.ready(); tg?.expand(); goFullscreen();
     tg?.disableVerticalSwipes?.();
-    try { tg?.setHeaderColor?.(tg.colorScheme === 'light' ? '#ffffff' : '#000000'); tg?.setBackgroundColor?.(tg.colorScheme === 'light' ? '#ffffff' : '#000000'); } catch {}
-    if (tg?.colorScheme === 'light') document.documentElement.classList.add('light');
+    // The app has one (dark) look: Telegram's own bars take its colour, also for people on Telegram's light theme
+    // (they got a white header and a white Join card over the dark app).
+    try { tg?.setHeaderColor?.('#000000'); tg?.setBackgroundColor?.('#000000'); tg?.setBottomBarColor?.('#000000'); } catch {}
   } catch {}
   gate('loading', 'Connecting to the voice chat…');
   const qs = new URLSearchParams(location.search);

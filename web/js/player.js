@@ -1104,6 +1104,7 @@ function closeNP() {
 function setView(v) {
   NP.view = v;
   if (!NP.el) return;
+  NP.el.classList.toggle('listview', v !== 'art'); // (queue / lyrics: they get more of the screen on short phones)
   ['lyr', 'q'].forEach(k => NP.el.querySelector('#tab-' + k).classList.toggle('on', (k === 'lyr' && v === 'lyrics') || (k === 'q' && v === 'queue')));
   renderStage();
 }

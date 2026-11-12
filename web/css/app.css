@@ -1214,3 +1214,55 @@ button:not(:disabled):active, [role="button"]:active { transition-duration: .08s
 .br-mini button .ico { width: 24px; height: 24px; }
 /* (the two bars sit over scrolling artwork and text: a darker glass keeps their labels readable) */
 .br-tabs, .br-mini { background: linear-gradient(135deg, rgba(72, 72, 76, .66), rgba(28, 28, 30, .7)); }
+
+/* =====================================================================
+   Smooth: the player was the one slow screen (about 20 frames a second on a slow phone, everything else 60).
+   Its three colour blobs were big elements with a 60–80 px blur filter, re-blurred as they drifted. They are soft
+   radial gradients now (the same look, nothing to blur) and only move with transform.
+   ===================================================================== */
+.np .bg i { filter: none !important; width: 110%; height: 80%; opacity: .85; will-change: transform; }
+.np .bg i:nth-child(1) { background: radial-gradient(closest-side, var(--c2) 0, transparent 100%); left: -35%; top: -12%; }
+.np .bg i:nth-child(2) { background: radial-gradient(closest-side, var(--c3) 0, transparent 100%); right: -35%; bottom: -10%; }
+.np .bg i:nth-child(3) { background: radial-gradient(closest-side, var(--c1) 0, transparent 100%); left: 0; top: 22%; }
+/* glass that has nothing moving behind it keeps its look without a live blur (a blur over the drifting colours of
+   the player, or over a still background, costs frames and shows nothing) */
+.np .round, .top .icon-btn, .dk .c, .close-x, .vbtn, .fv-close, .br-close, .br-back, .cc-art .cc-add, .tap-hint {
+  -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+
+/* =====================================================================
+   One Apple Music look for the whole app (room, sheets, player, music page): the red accent everywhere
+   ===================================================================== */
+:root, :root.light { --accent: #fa2d48; --am: #fa2d48; }
+.invite-row { color: var(--accent) !important; }
+.invite-row .pav .ico { color: var(--accent); }
+.prow .pname .tag { color: var(--accent); background: rgba(250, 45, 72, .16); }
+.prow .psub.blue { color: var(--fg2); }
+.msg.mine .bub, .sheet .msg.mine .bub { background: #0a84ff; }   /* (your own messages stay iMessage blue) */
+.btn.soft { color: var(--accent); }
+.reacts button.mine { background: rgba(250, 45, 72, .3); }
+.row.route.on .lab, .row.route .ico:last-child, .row.route.on > .ico:first-child { color: var(--accent); }
+.pick.next .ico { color: var(--accent); }
+input[type=range] { color: var(--accent); }
+.np input[type=range], .np .vol input { color: #fff; }
+.sheet .slider-row { color: var(--accent); }
+.spinner { border-top-color: var(--accent); }
+/* the room's music card: a glass bar, like Apple Music's mini player */
+.np-card { background: linear-gradient(135deg, rgba(255, 255, 255, .13), rgba(255, 255, 255, .05)); border: .5px solid rgba(255, 255, 255, .14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .14), 0 8px 24px rgba(0, 0, 0, .3); border-radius: 18px; }
+.np-card .art { border-radius: 10px; }
+.np-card .bar { background: var(--accent); opacity: 1; height: 2.5px; }
+/* player: Apple Music's proportions */
+.np .big-art { border-radius: 14px; }
+.np .info h2 { font-size: 22px; font-weight: 700; }
+.np .info p { font-size: 20px; }
+.scrub .tr { height: 7px; border-radius: 4px; }
+.scrub.drag .tr { height: 12px; }
+.np .qv .qbtns button { border-radius: 12px; height: 44px; font-size: 15px; background: rgba(255, 255, 255, .14); }
+.np .qv .qbtns button.on { background: #fff; color: #000; }
+.np .qv .qh { font-size: 20px; }
+.np .qv .trk .tt { font-size: 16px; }
+.np .qv .trk .tb { color: #fff; }
+/* long lists: rows off the screen aren't laid out or painted until they're scrolled to */
+.trk, .prow, .msg, .sheet .row { content-visibility: auto; contain-intrinsic-size: auto 60px; }
+/* toasts come down from the very top, like iOS banners (they used to cover the music card's buttons) */
+#toasts { top: calc(var(--top-safe) + 8px); }

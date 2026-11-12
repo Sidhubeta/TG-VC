@@ -124,6 +124,9 @@ function predicted() {
   return { track: ring[0], pos: startOf(ring[0]) };
 }
 
+// A song's cover for rows, cards and the small bars: the small picture (the full one is 1280 px wide — dozens of
+// those in a list made scrolling heavy and used ten times the data). The big artwork in the player uses the full one.
+const cover = (t) => media(t.thumb || '/api/thumb/' + t.id) + '&z=s';
 function audioSrc(t) { return media(`/api/stream/${t.id}/audio?c=${CODEC}&q=${P.aq}`); }
 
 function load(t) {
@@ -958,7 +961,7 @@ export function renderCard() {
   el.classList.toggle('has-video', showVid);
   el.append(
     showVid ? videoBox('card-vid') : null,
-    h('div', { class: 'art', style: { backgroundImage: `url("${media(t.thumb)}")` } }),
+    h('div', { class: 'art', style: { backgroundImage: `url("${cover(t)}")` } }),
     h('div', { class: 'meta' },
       h('div', { class: 'ttl' }, h('span', { class: 'eq' }, h('i'), h('i'), h('i')), t.title),
       h('div', { class: 'art-sub' }, t.artist + (t.by ? ` · added by ${t.by}` : ''))),
@@ -1191,7 +1194,7 @@ function onMusic(m) {
   if ((t?.qid ?? null) !== lastQid) {
     lastQid = t?.qid ?? null;
     NP.lyrics = null;
-    if (t) extractColors(media(t.thumb));
+    if (t) extractColors(cover(t));
     if (NP.open) renderStage();
   }
   // Re-align playback only when the timeline really changed (new song, pause, seek, speed). The old code
@@ -1337,7 +1340,7 @@ export function openPlayHistory() {
 // ======================= track helpers =======================
 function trackRow(t, { sub, btn, onBtn, onClick, now: isNow } = {}) {
   return h('div', { class: 'trk' + (isNow ? ' now' : ''), onclick: onClick || null },
-    h('div', { class: 'ta', style: { backgroundImage: `url("${media(t.thumb || '/api/thumb/' + t.id)}")` } }),
+    h('div', { class: 'ta', style: { backgroundImage: `url("${cover(t)}")` } }),
     h('div', { class: 'tm' }, h('div', { class: 'tt' }, t.title), h('div', { class: 'ts' }, sub ?? `${t.artist}${t.duration ? ' · ' + fmtTime(t.duration) : ''}`)),
     btn ? h('button', { class: 'tb', onclick: (e) => { e.stopPropagation(); onBtn?.(e); } }, btn) : null);
 }
@@ -1497,7 +1500,7 @@ function renderMini() {
   if (!t) return el.replaceChildren();
   el.onclick = () => { closeBrowse(); openNP(); };
   el.replaceChildren(
-    h('div', { class: 'bm-art', style: { backgroundImage: `url("${media(t.thumb)}")` } }),
+    h('div', { class: 'bm-art', style: { backgroundImage: `url("${cover(t)}")` } }),
     h('div', { class: 'bm-t' }, h('b', null, t.title), t.artist ? h('small', null, t.artist) : null),
     h('button', { 'aria-label': isPlay ? 'Pause' : 'Play', onclick: (e) => { e.stopPropagation(); togglePlay(); } }, icon(isPlay ? 'pause' : 'play', 'fill')),
     h('button', { 'aria-label': 'Next', onclick: (e) => { e.stopPropagation(); next(); } }, icon('next', 'fill')));
@@ -1563,7 +1566,7 @@ function pressable(el, onTap, onHold) {
 }
 function songCard(t) {
   const el = h('div', { class: 'cc' + (BR.added.has(t.id) ? ' added' : ''), role: 'button', tabindex: 0 },
-    h('div', { class: 'cc-art', style: { backgroundImage: `url("${media(t.thumb || '/api/thumb/' + t.id)}")` } },
+    h('div', { class: 'cc-art', style: { backgroundImage: `url("${cover(t)}")` } },
       h('span', { class: 'cc-add' }, icon('plus')), h('span', { class: 'cc-ok' }, icon('check'))),
     h('div', { class: 'cc-t' }, t.title), h('div', { class: 'cc-a' }, t.artist));
   return pressable(el, () => songMenu(t), () => songMenu(t));
@@ -1674,7 +1677,7 @@ async function renderLibrary(sc, openId = null) {
           if (name) { await api('/api/playlists', { body: { name } }); showList(); }
         }, 'acc')),
       h('div', { class: 'gt-grid two' }, ...pls.map(p => h('button', { class: 'pl-tile', onclick: () => showPlaylist(p.id) },
-        h('div', { class: 'pl-art', style: { backgroundImage: p.thumb ? `url("${media(p.thumb)}")` : '' } }, p.thumb ? null : icon(p.name === 'Liked Songs' ? 'heart' : 'music')),
+        h('div', { class: 'pl-art', style: { backgroundImage: p.thumb ? `url("${cover(p)}")` : '' } }, p.thumb ? null : icon(p.name === 'Liked Songs' ? 'heart' : 'music')),
         h('div', { class: 'cc-t' }, p.name), h('div', { class: 'cc-a' }, `${p.count} songs`)))));
   };
   const backBtn = () => h('button', { class: 'br-back inline', 'aria-label': 'Back', onclick: showList }, icon('down'));
@@ -1737,7 +1740,7 @@ function renderSearchTab(sc) {
         const pl = r.playlist;
         results.replaceChildren(
           h('div', { class: 'pl-card' },
-            h('div', { class: 'ta', style: { backgroundImage: pl.tracks[0] ? `url("${media(pl.tracks[0].thumb)}")` : '' } }),
+            h('div', { class: 'ta', style: { backgroundImage: pl.tracks[0] ? `url("${cover(pl.tracks[0])}")` : '' } }),
             h('div', { style: { flex: 1, minWidth: 0 } },
               h('div', { style: { fontWeight: 700, fontSize: '17px' } }, pl.title),
               h('div', { class: 'muted', style: { fontSize: '13px', margin: '2px 0 10px' } }, `${pl.tracks.length} songs`),
@@ -1750,7 +1753,7 @@ function renderSearchTab(sc) {
       } else {
         const [top, ...rest] = r.tracks;
         const topCard = h('div', { class: 'top-res' },
-          h('div', { class: 'ta', style: { backgroundImage: `url("${media(top.thumb)}")` } }),
+          h('div', { class: 'ta', style: { backgroundImage: `url("${cover(top)}")` } }),
           h('div', { style: { flex: 1, minWidth: 0 } }, h('div', { class: 'tt' }, top.title), h('div', { class: 'ts' }, `Song · ${top.artist}`)),
           canAdd() ? h('button', { class: 'btn sm', onclick: (e) => { e.stopPropagation(); addTrack(top); } }, icon('plus'), 'Add') : null);
         pressable(topCard, () => songMenu(top), () => songMenu(top));
@@ -1760,7 +1763,7 @@ function renderSearchTab(sc) {
     } catch (e) { if (my === seq) results.replaceChildren(h('div', { class: 'empty-note' }, e.message)); }
   }
   // wait until typing pauses (each search goes to YouTube); one letter isn't a search
-  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { const q = input.value.trim(); if (!q || q.length >= 2) go(); }, 1100); });
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { const q = input.value.trim(); if (!q || q.length >= 2) go(); }, 650); });
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { clearTimeout(timer); go(); input.blur(); } });
   empty();
   setTimeout(() => input.focus(), 450);

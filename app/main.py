@@ -327,7 +327,7 @@ async def api_thumb(request: Request):
         await session(request)
     except Denied as d:
         return Response(status_code=d.code)
-    return await music.thumb(request.path_params["vid"])
+    return await music.thumb(request.path_params["vid"], request.query_params.get("z") == "s")
 
 
 @guarded()

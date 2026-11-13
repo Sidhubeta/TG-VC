@@ -87,6 +87,7 @@ class Participant:
         self.role = "speaker"
         self.mic = False
         self.force_muted = False
+        self.muted_by_admin = False  # muted by an admin (not a moderator): only an admin may undo it
         self.hand = 0.0
         self.video = False
         self.screen = False
@@ -277,6 +278,7 @@ class Room:
         self._probing: set[int] = set()
         self._auto_skips: list[float] = []              # when songs were skipped because nobody could play them
         self._block_told = 0.0
+        self._restored = None  # (time restored, seconds the next song is already in) after a restart
 
     # ---------------- helpers -----------------
     def is_mod(self, p: Participant | None) -> bool:
@@ -293,6 +295,11 @@ class Room:
         if st.get("force_muted"):
             return False
         return st.get("role", "speaker" if self.settings["new_can_speak"] else "listener") == "speaker"
+
+    def votes_needed(self) -> int:
+        """More than half of the room must vote to skip (2 people: both; 3: 2; 4: 3). It used to be half rounded up,
+        so in a room of two one vote skipped the other person's song."""
+        return len(self.parts) // 2 + 1
 
     def can_speak(self, p: Participant) -> bool:
         if p.force_muted:
@@ -402,7 +409,7 @@ class Room:
         return bool(item) and item.get("byUid") in (p.uid, self.pid(p.uid))
 
     def music_state(self) -> dict:
-        need = max(1, (len(self.parts) + 1) // 2)
+        need = self.votes_needed()
         return {"queue": self.queue, "current": self.current, "status": self.status, "pos": self.pos,
                 "upd": self.upd, "loop": self.loop, "autoplay": self.autoplay, "votes": len(self.votes),
                 "need": need, "fx": self.fx, "rate": self.fx["rate"], "xfade": XFADE}
@@ -452,6 +459,7 @@ class Room:
                 p.role = "listener"
             if not admin and uid in self.sticky:
                 p.force_muted = self.sticky[uid].get("force_muted", False)
+                p.muted_by_admin = self.sticky[uid].get("by_admin", False)
                 p.role = self.sticky[uid].get("role", p.role)
             self.parts[uid] = p
             prev = self._left.pop(uid, None)
@@ -471,6 +479,7 @@ class Room:
             # as here (LINGER) — so the switch is made on the same participant (it used to be ignored).
             seen_as = {q.uid: self.vis_uid(p, q) for q in self.parts.values() if q.uid != uid}
             p.as_group = as_group and admin
+            p.joined = now()  # (a new tile time: the same one on both tiles gave away who it was)
             if p.as_group and p.session_id:  # (this visit was partly "as the group": not for their own badges)
                 await db.x("UPDATE sessions SET asg=1 WHERE id=?", (p.session_id,))
         p.conns.add(conn)
@@ -554,6 +563,7 @@ class Room:
             return
         seen_as = {q.uid: self.vis_uid(p, q) for q in self.parts.values() if q.uid != p.uid}
         p.as_group = on
+        p.joined = now()
         await self._retile(p, seen_as)
         if lk.enabled():
             await self.send_to(p.uid, {"t": "lk", "livekit": lk.join_info(self.chat_id, int(self.lk_id(p.uid)), self.can_speak(p)),
@@ -561,21 +571,33 @@ class Room:
 
     async def _skip_by_votes(self):
         async with self._lock:
-            if self.votes and self.current and len(self.votes) >= max(1, (len(self.parts) + 1) // 2):
+            if self.votes and self.current and len(self.votes) >= self.votes_needed():
                 await self._next()
+
+    def _since_restore(self) -> float:
+        """Seconds of music the phones played by themselves since a restart (they keep the room's clock going while
+        the server is away). Only right after a restart, while the first people come back."""
+        r, self._restored = self._restored, None
+        if not r or now() - r[0] > 180:
+            return 0.0
+        return r[1] + (now() - r[0])
 
     async def _resume_after_idle(self):
         self._idle_paused = False
+        ahead = self._since_restore()
         if self._next_on_resume:  # (restored after a restart, and the song had ended meanwhile)
             self._next_on_resume = False
             if self.queue:
                 await self._start(self.queue.pop(0))
+                self._skip_ahead(ahead)
             elif self.autoplay and self.recent:
                 spawn(self._autoplay_fill(self.recent[-1]))  # (autoplay was on: it carries on)
             return
         cur = self.current
         if not cur:
             return
+        if ahead:
+            self.pos += ahead * float(self.fx.get("rate") or 1)
         if music.is_ready(cur["id"]) and (music.is_cached(cur["id"]) or not voicemusic.enabled()):
             self.status, self.upd = "playing", now()
             self._arm_timer()
@@ -592,6 +614,22 @@ class Room:
                 spawn(self._fill_duration(cur))
             spawn(self.push_music())
 
+    def _skip_ahead(self, secs: float):
+        """The song just started is really this far in already (see _since_restore)."""
+        cur = self.current
+        if not cur or secs <= 0.5:
+            return
+        length = (cur.get("end") or cur.get("duration") or 0) - (cur.get("start") or 0)
+        if length and secs >= length - 5:
+            return  # (gone that long: just start this one)
+        self.pos = (cur.get("start") or 0.0) + secs * float(self.fx.get("rate") or 1)
+        if self.status == "loading":
+            self._load_seek = cur["qid"]  # (kept when it starts: see _when_ready)
+        else:
+            self.upd = now()
+            self._arm_timer()
+        spawn(self.push_music())
+
     async def _gone(self, p: Participant):
         if (t := self._lingering.pop(p.uid, None)) and not t.done() and t is not asyncio.current_task():
             t.cancel()
@@ -606,7 +644,7 @@ class Room:
             cut = now() - REJOIN_GRACE
             self._left = {k: v for k, v in self._left.items() if v[0] >= cut}
         self.votes.discard(p.uid)
-        if self.votes and self.current and len(self.votes) >= max(1, (len(self.parts) + 1) // 2):
+        if self.votes and self.current and len(self.votes) >= self.votes_needed():
             spawn(self._skip_by_votes())  # (fewer people now: the votes already given may be enough)
         self._mic_flush(p)
         t = now()
@@ -681,6 +719,10 @@ class Room:
                 continue
             if st.get("unsure"):
                 continue  # Telegram didn't really answer: check again next minute
+            if st.get("bot_gone"):
+                await self.kick(p.uid, "The bot was removed from the group, so its voice chat closed. An admin can add "
+                                       "the bot back and send /vc.")
+                continue
             if not st["member"]:
                 await self.kick(p.uid, "You're no longer in the group, so you were removed from its voice chat.")
                 continue
@@ -699,7 +741,7 @@ class Room:
         p.admin = admin
         if p.admin:
             # made an admin: whatever an admin did to them as a member (muted, listener) no longer holds
-            p.force_muted, p.role = False, "speaker"
+            p.force_muted, p.muted_by_admin, p.role = False, False, "speaker"
             self.sticky.pop(p.uid, None)
             await lk.set_publish(self.chat_id, self.lk_id(p.uid), True)
         elif p.as_group:
@@ -887,7 +929,10 @@ class Room:
             return await self.toast(p.uid, "Slow down 🙂")  # at most 8 messages in 10 seconds
         hits.append(t0)
         reply = None
-        rid = msg.get("reply")
+        try:
+            rid = int(msg.get("reply") or 0)
+        except (TypeError, ValueError):
+            rid = 0
         if rid:
             for m in self.chat:
                 if m["id"] == rid:
@@ -914,6 +959,13 @@ class Room:
         emoji = msg.get("emoji")
         if emoji not in REACTIONS:
             return
+        t0 = now()
+        hits = getattr(p, "react_hits", None)
+        if hits is None:
+            hits = p.react_hits = deque(maxlen=10)
+        if len(hits) == hits.maxlen and t0 - hits[0] < 5:
+            return
+        hits.append(t0)
         m = await self._message(msg.get("id"))
         if m:
             if True:
@@ -1177,7 +1229,7 @@ class Room:
                 if t - self._block_told > 600:
                     self._block_told = t
                     await self.broadcast({"t": "toast", "text": "YouTube is refusing songs right now — the music "
-                                          "will come back by itself"}, admins_only=True)
+                                          "will come back by itself"})
                 return
             self._auto_skips.append(t)
             async with self._lock:
@@ -1454,7 +1506,7 @@ class Room:
             if not self.can(p, "vote"):
                 return await self.deny(p, "vote")
             self.votes.add(p.uid)
-            if len(self.votes) >= max(1, (len(self.parts) + 1) // 2):
+            if len(self.votes) >= self.votes_needed():
                 await self._next()
             else:
                 await self.push_music()
@@ -1647,22 +1699,29 @@ class Room:
             if data.get("status") == "playing":
                 pos += (now() - float(data.get("at") or now())) * self.fx["rate"]
             dur = cur.get("duration") or 0
+            playing = data.get("status") == "playing"
             if dur and pos >= (cur.get("end") or dur) - 1:
                 # it would have ended while the server was down: the next one starts (properly, with _start)
-                # when someone comes
+                # when someone comes — as far in as the phones got on their own meanwhile (they play the queue
+                # on by themselves; starting it at 0 made every phone jump back)
                 self.current = None
                 self.history.append(cur)
                 if self.queue or self.autoplay:
                     self._idle_paused = self._next_on_resume = True
+                    rate = float(self.fx.get("rate") or 1)
+                    over = (pos - (cur.get("end") or dur)) / rate - 0.8 if playing else 0.0
+                    self._restored = (now(), max(0.0, over))
             if self.current:
                 # paused until someone is here; the first person in starts it again (see join)
                 self.pos, self.upd, self.status, self._idle_paused = pos, now(), "paused", True
+                if playing:
+                    self._restored = (now(), 0.0)
                 self._watching.add(self.current["qid"])
                 spawn(self._watch_song(self.current["qid"], self.current["id"]))
                 spawn(music.prefetch(self.current["id"]))
 
     def _remember(self, q: Participant):
-        self.sticky[q.uid] = {"force_muted": q.force_muted, "role": q.role}
+        self.sticky[q.uid] = {"force_muted": q.force_muted, "role": q.role, "by_admin": q.muted_by_admin}
 
     # ---------------- admin -----------------
     async def on_admin(self, p: Participant, t: str, msg: dict):
@@ -1682,15 +1741,19 @@ class Room:
             return await self.toast(p.uid, "Can't do that to another admin")
         if not p.admin and (not target or self.is_mod(target)):  # moderators: only people in the room, not each other
             return await self.toast(p.uid, "Moderators can't do that to another moderator" if target else "They're not here")
+        if not p.admin and target and target.force_muted and target.muted_by_admin and (
+                t == "admin.unmute" or (t == "admin.role" and msg.get("role") == "speaker")):
+            return await self.toast(p.uid, "An admin muted them — only an admin can let them speak")
         if t == "admin.mute":
             target.force_muted = True
+            target.muted_by_admin = target.muted_by_admin or p.admin
             if target.mic:
                 await self.set_mic(target, False)
             await lk.set_publish(self.chat_id, self.lk_id(target.uid), False)
             await self.bcast_part(target)
             await self.toast(target.uid, ("An admin" if p.admin else "A moderator") + " muted you")
         elif t == "admin.unmute":
-            target.force_muted = False
+            target.force_muted = target.muted_by_admin = False
             await lk.set_publish(self.chat_id, self.lk_id(target.uid), self.can_speak(target))
             await self.bcast_part(target)
             await self.toast(target.uid, ("An admin" if p.admin else "A moderator") + " allowed you to speak")
@@ -1700,7 +1763,7 @@ class Room:
                 return
             target.role, target.hand = role, 0
             if role == "speaker":
-                target.force_muted = False
+                target.force_muted = target.muted_by_admin = False
             if not self.can_speak(target) and target.mic:
                 await self.set_mic(target, False)
             await lk.set_publish(self.chat_id, self.lk_id(target.uid), self.can_speak(target))
@@ -1709,7 +1772,7 @@ class Room:
         elif t in ("admin.kick", "admin.ban"):
             uid = target.uid if target else int(msg.get("uid", 0))
             name = target.name if target else str(msg.get("name", ""))[:64]
-            if not uid or uid == p.uid:
+            if not uid or uid == p.uid or (uid < 0 and not target):  # (not a group or channel id)
                 return
             if not target and (await tg.member_status(self.chat_id, uid))["admin"]:
                 return await self.toast(p.uid, "Can't do that to another admin")
@@ -1777,7 +1840,7 @@ class Room:
         elif t == "admin.muteall":
             for q in list(self.parts.values()):
                 if not q.admin and not self.is_mod(q):  # (a moderator couldn't unmute themselves afterwards)
-                    q.force_muted = True
+                    q.force_muted = q.muted_by_admin = True
                     if q.mic:
                         await self.set_mic(q, False)
                     await lk.set_publish(self.chat_id, self.lk_id(q.uid), False)
@@ -1786,7 +1849,7 @@ class Room:
         elif t == "admin.unmuteall":
             for q in list(self.parts.values()):
                 if q.force_muted:
-                    q.force_muted = False
+                    q.force_muted = q.muted_by_admin = False
                     await lk.set_publish(self.chat_id, self.lk_id(q.uid), self.can_speak(q))
                     await self.bcast_part(q)
         elif t == "admin.settings":
@@ -1817,6 +1880,9 @@ class Room:
                 return await self.toast(p.uid, "Pick a time within the next 60 days")
             if at < now() + 30:
                 return await self.toast(p.uid, "Pick a time in the future")
+            pending = await db.q1("SELECT COUNT(*) AS n FROM schedules WHERE chat_id=? AND sent=0", (self.chat_id,))
+            if pending and pending["n"] >= 20:
+                return await self.toast(p.uid, "There are 20 reminders already — delete one first")
             await db.x("INSERT INTO schedules(chat_id,title,at,by_uid) VALUES(?,?,?,?)",
                        (self.chat_id, str(msg.get("title", ""))[:100], at, p.uid))
             await self.toast(p.uid, "Scheduled — the bot will post a reminder in the group")

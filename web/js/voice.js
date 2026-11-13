@@ -34,15 +34,16 @@ export async function startVoice(lk) {
   await connect();
 }
 
+let again = false; // asked to join while a join was running (e.g. switched to appearing as the group): do it after
 async function connect() {
-  if (connecting) return;
-  connecting = true;
+  if (connecting) { again = true; return; }
+  connecting = true; again = false;
   emit('voice', { state: 'connecting' });
   const old = room; room = null;
   if (old) { try { await old.disconnect(); } catch {} old.removeAllListeners?.(); }
   try {
     const out = store.get('dev:audiooutput', '');
-    room = new LK.Room({
+    const r = room = new LK.Room({
       adaptiveStream: true, dynacast: true,
       // LiveKit leaves the voice chat by itself when the page is hidden away ("pagehide") or frozen ("freeze").
       // Android freezes a minimized Telegram's page for a moment now and then: the voice chat was left, the mic
@@ -57,17 +58,18 @@ async function connect() {
       publishDefaults: { dtx: false, red: true, audioPreset: { maxBitrate: 48000 } },
       videoCaptureDefaults: { resolution: LK.VideoPresets?.h540?.resolution },
     });
-    wire(room);
-    await room.connect(info.url, info.token, { autoSubscribe: true });
-    try { window.removeEventListener('freeze', room.onPageLeave); } catch {} // (it listens to this one regardless)
+    wire(r);
+    await r.connect(info.url, info.token, { autoSubscribe: true });
+    if (room !== r) { try { await r.disconnect(); } catch {} return; } // (left, or replaced, while joining)
+    try { window.removeEventListener('freeze', r.onPageLeave); } catch {} // (it listens to this one regardless)
     V.ready = true;
     if (failN && !document.hidden) toast('Voice connected');
     failN = 0;
     emit('voice', { state: 'ready' });
     emit('voice:session', 'joined');
     restoreMic();
-    if (!room.canPlaybackAudio) emit('voice:blocked', true);
-    room.remoteParticipants.forEach(p => (isMusic(p) ? applyMusic(p) : applyVolume(p)));
+    if (!r.canPlaybackAudio) emit('voice:blocked', true);
+    r.remoteParticipants.forEach(p => (isMusic(p) ? applyMusic(p) : applyVolume(p)));
   } catch (e) {
     console.error(e);
     V.ready = false;
@@ -75,7 +77,10 @@ async function connect() {
     // said once, not every 4 seconds while the voice server is down; the wait grows too
     if (!failN++) toast('Voice connection failed — retrying…');
     scheduleRetry(Math.min(30000, 4000 * 2 ** Math.min(failN - 1, 3)));
-  } finally { connecting = false; }
+  } finally {
+    connecting = false;
+    if (again && !stopped) { again = false; connect(); }
+  }
 }
 
 let retryTimer = null, stopped = false, failN = 0;
@@ -374,6 +379,11 @@ export async function setMic(on) {
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
   try {
     if (on) await refreshPermissions();
+    if (on && room.localParticipant.permissions && room.localParticipant.permissions.canPublish === false) {
+      iosSession(false);
+      toast('You can’t speak right now — raise your hand');
+      return false;
+    }
     if (on) await room.localParticipant.setMicrophoneEnabled(true, micOpts());
     else await releaseMic();
     // (minimized, noise isolation crackles: it comes on when the app is open again — see the visibility handler)
@@ -396,7 +406,10 @@ export async function setMic(on) {
       emit('voice:session', 'play');
       return true;
     }
-    toast('Allow microphone access in Telegram settings to speak');
+    // (iPhone: the sound was switched to "call" mode for the mic; without a mic it goes back, or music stayed quiet)
+    iosSession(false);
+    emit('voice:session', 'play');
+    toast(e?.name === 'NotAllowedError' ? 'Allow microphone access in Telegram settings to speak' : 'Your mic couldn’t start — try again');
     return false;
   }
 }

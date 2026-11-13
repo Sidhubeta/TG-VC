@@ -59,9 +59,10 @@ def _filters(fx: dict) -> list[str]:
     if fx.get("treble"):
         f.append(f"treble=g={float(fx['treble']):.1f}:f=7000")
     rev = float(fx.get("reverb") or 0)
-    if rev > 0:
+    if rev >= 0.03:  # (below that it can't be heard, and ffmpeg refuses a decay that rounds to 0.00)
         d = min(0.9, rev)
-        f.append(f"aecho=0.85:{1 - rev * 0.35:.2f}:43|71|113|167:{d * 0.5:.2f}|{d * 0.38:.2f}|{d * 0.27:.2f}|{d * 0.18:.2f}")
+        decays = "|".join(f"{max(0.01, d * k):.2f}" for k in (0.5, 0.38, 0.27, 0.18))
+        f.append(f"aecho=0.85:{1 - rev * 0.35:.2f}:43|71|113|167:{decays}")
     if fx.get("mode") == "8d":
         f.append("apulsator=hz=0.11:amount=0.95")
     rate = float(fx.get("rate") or 1)

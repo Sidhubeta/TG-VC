@@ -551,7 +551,8 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
                     raise _Expired()
                 if r.status_code not in (200, 206):
                     raise RuntimeError(f"status {r.status_code}")
-                total = int(r.headers.get("content-range", "/0").split("/")[-1] or 0)
+                tail = r.headers.get("content-range", "/0").split("/")[-1].strip()
+                total = int(tail) if tail.isdigit() else 0  # ("*": length unknown)
                 if (total or 0) > limit or pos + len(r.content) > limit:
                     raise RuntimeError(f"too big to keep ({max(total, pos) // 2**20} MB)")
                 await asyncio.to_thread(fh.write, r.content)  # (8 MB at a time: not on the loop that sends the music)
@@ -604,8 +605,14 @@ def _trim_cache(squeeze: bool = False, startup: bool = False):
         files.sort(key=os.path.getmtime)
         total = sum(os.path.getsize(f) for f in files)
         cap = cap // (2 if squeeze else 1)
+        fresh = time.time() - 120  # (served or downloaded in the last 2 minutes: a phone may be reading it right now)
         while files and total > cap:
             f = files.pop(0)
+            try:
+                if os.path.getmtime(f) > fresh:
+                    continue
+            except OSError:
+                continue
             try:
                 total -= os.path.getsize(f)
                 os.remove(f)

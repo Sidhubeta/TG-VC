@@ -91,8 +91,14 @@ export function grad(id) {
   return `linear-gradient(135deg, ${g[0]}, ${g[1]})`;
 }
 export function initials(name = '?') {
-  const p = name.trim().split(/\s+/);
-  return ((p[0]?.[0] || '?') + (p[1]?.[0] || '')).toUpperCase();
+  // letters only, whole characters ("🔥 Rahul" used to show half an emoji: a broken "�R")
+  const out = [];
+  for (const w of String(name || '').trim().split(/\s+/)) {
+    const ch = Array.from(w).find(c => /[\p{L}\p{N}]/u.test(c));
+    if (ch) out.push(ch.toUpperCase());
+    if (out.length === 2) break;
+  }
+  return out.join('') || '?';
 }
 export function avatarEl(p, cls = 'img') {
   const el = h('div', { class: cls, style: { '--g': grad(p.uid) } });
@@ -179,6 +185,8 @@ document.addEventListener('visibilitychange', () => {
   if (!ws || ws.readyState > 1) { retry = 0; connectWS(); }
   else syncClock();
 });
+// connected to the server right now (a song that fails to load while it's away isn't the song's fault)
+export const serverUp = () => !!ws && ws.readyState === 1;
 export function reconnectWS(opts) { closedByUs = true; try { ws?.close(); } catch {} setTimeout(() => connectWS(opts), 200); }
 export function closeWS() { closedByUs = true; clearTimeout(retryTimer); try { ws?.close(); } catch {} }
 // Server clock, NTP style: the music timeline is in server time, so every phone must know it well. One slow
@@ -221,6 +229,18 @@ window.addEventListener('unhandledrejection', (e) => {
   if (e.reason?.api) { toast(e.reason.message, 3000, 'err'); return; }
   report('promise', e.reason?.message || String(e.reason));
 });
+
+// ---------- on-screen keyboard ----------
+// iPhone (and some Androids) put the keyboard over the page without making it smaller: a text box at the bottom of a
+// sheet, or the message box, ended up behind it. --kb is the keyboard's height; sheets and the room sit above it.
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const fit = () => {
+    const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+    document.documentElement.style.setProperty('--kb', (kb > 80 ? kb : 0) + 'px');
+  };
+  vv.addEventListener('resize', fit); vv.addEventListener('scroll', fit); fit();
+}
 
 // ---------- toasts ----------
 export function toast(text, ms = 2600, kind = '') {
@@ -298,9 +318,17 @@ export function actionRow(ic, label, onclick, cls = '', sub = null) {
   return h('button', { class: 'row ' + cls, onclick }, ic ? icon(ic) : null, h('span', { class: 'lab' }, label, sub ? h('small', null, sub) : null));
 }
 function copyFallback(text) {
-  const t = h('textarea', null, text); document.body.append(t); t.select();
-  try { document.execCommand('copy'); toast('Copied'); } catch { toast('Couldn’t copy'); }
-  t.remove();
+  const t = h('textarea', { readonly: true, style: { position: 'fixed', top: '0', left: '0', opacity: '0', fontSize: '16px' } }, text);
+  document.body.append(t);
+  // iPhone ignores select() on a textarea: it needs a range (and contentEditable) to copy
+  t.contentEditable = 'true';
+  const r = document.createRange(); r.selectNodeContents(t);
+  const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  t.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch {}
+  sel.removeAllRanges(); t.remove();
+  toast(ok ? 'Copied' : 'Couldn’t copy');
 }
 export function copyText(text) {
   // writeText returns a promise that rejects (it doesn't throw) when the clipboard is blocked

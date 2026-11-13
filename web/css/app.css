@@ -717,8 +717,10 @@ body { letter-spacing: -.005em; }
 .np .grab, .br-top { margin-top: var(--top-safe); }
 .br-scroll { padding-top: calc(30px + var(--top-safe)); }
 #gate { padding-top: calc(32px + var(--top-safe)); }
-.sheet { max-height: calc(100vh - var(--top-safe) - 12px); }
-.sheet.tall { height: calc(100vh - var(--top-safe) - 12px); }
+.sheet { max-height: calc(100vh - var(--top-safe) - 12px - var(--kb, 0px)); bottom: var(--kb, 0px); }
+.sheet.tall { height: calc(100vh - var(--top-safe) - 12px - var(--kb, 0px)); }
+/* the on-screen keyboard (see core.js): the room's message box and buttons stay above it */
+#room { bottom: var(--kb, 0px); }
 #toasts { top: calc(70px + var(--top-safe)); }
 .vtile .fs.pip { right: 44px; }
 
@@ -1266,6 +1268,8 @@ input[type=range] { color: var(--accent); }
 .trk, .prow, .msg, .sheet .row { content-visibility: auto; contain-intrinsic-size: auto 60px; }
 /* toasts come down from the very top, like iOS banners (they used to cover the music card's buttons) */
 #toasts { top: calc(var(--top-safe) + 8px); }
+/* (narrow enough to sit between the round buttons in the corners: a long toast covered them) */
+#toasts .toast { max-width: calc(100% - 136px); text-align: center; }
 
 /* =====================================================================
    Liquid glass, the whole app (iOS 26 look)

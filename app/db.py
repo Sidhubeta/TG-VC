@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS chat_stats(chat_id INTEGER, uid INTEGER, day INTEGER,
 CREATE TABLE IF NOT EXISTS sudo(uid INTEGER PRIMARY KEY, name TEXT, username TEXT, added_by INTEGER, ts REAL);
 CREATE TABLE IF NOT EXISTS room_state(chat_id INTEGER PRIMARY KEY, data TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS deletions(chat_id INTEGER, message_id INTEGER, at REAL, PRIMARY KEY(chat_id, message_id));
+CREATE TABLE IF NOT EXISTS migrations(old INTEGER PRIMARY KEY, new INTEGER, ts REAL);
 CREATE TABLE IF NOT EXISTS members(
   chat_id INTEGER, uid INTEGER, name TEXT, username TEXT, seen REAL, PRIMARY KEY(chat_id, uid));
 """
@@ -138,6 +139,41 @@ async def get_group(chat_id: int) -> dict:
 
 async def save_group_settings(chat_id: int, settings: dict):
     await x("UPDATE groups SET settings=?, updated=? WHERE chat_id=?", (json.dumps(settings), time.time(), chat_id))
+
+
+_MOVE = ("sessions", "messages", "plays", "bans", "reports", "schedules", "chat_stats", "room_state", "deletions", "members")
+
+
+def _migrate_sync(old: int, new: int) -> bool:
+    with _lock:
+        if _conn.execute("SELECT 1 FROM migrations WHERE old=?", (old,)).fetchone():
+            return False
+        _conn.execute("BEGIN")
+        try:
+            g = _conn.execute("SELECT title, link_version, settings FROM groups WHERE chat_id=?", (old,)).fetchone()
+            if g:
+                _conn.execute("INSERT OR IGNORE INTO groups(chat_id,title,updated) VALUES(?,?,?)", (new, g["title"], time.time()))
+                _conn.execute("UPDATE groups SET title=?, link_version=MAX(COALESCE(link_version,1),?), settings=?, "
+                              "pin_msg=NULL, pin_thread=NULL WHERE chat_id=?", (g["title"], g["link_version"], g["settings"], new))
+            for t in _MOVE:
+                _conn.execute(f"UPDATE OR IGNORE {t} SET chat_id=? WHERE chat_id=?", (new, old))
+            _conn.execute("INSERT OR REPLACE INTO migrations(old,new,ts) VALUES(?,?,?)", (old, new, time.time()))
+            _conn.execute("COMMIT")
+            return True
+        except Exception:
+            _conn.execute("ROLLBACK")
+            raise
+
+
+async def migrate_chat(old: int, new: int) -> bool:
+    """A group became a supergroup (new id): its voice chat's data moves along. True if it moved now."""
+    return await _run(_migrate_sync, old, new)
+
+
+async def moved_to(chat_id: int) -> int:
+    """The id a group has now (old links still name the id it had before it became a supergroup)."""
+    r = await q1("SELECT new FROM migrations WHERE old=?", (chat_id,))
+    return r["new"] if r else chat_id
 
 
 def close_stale_sessions():

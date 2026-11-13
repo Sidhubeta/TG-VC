@@ -93,7 +93,8 @@ async def for_group(chat_id: int, ttl: float = 300) -> dict[int, list[str]]:
         give(uid, "marathon")
     for r in await db.q("SELECT by_uid AS uid FROM plays WHERE chat_id=? AND by_uid!=0 AND COALESCE(asg,0)=0 GROUP BY by_uid HAVING COUNT(*)>=100", (chat_id,)):
         give(r["uid"], "lover")
-    for r in await db.q("SELECT uid FROM sessions WHERE chat_id=? AND uid!=0 GROUP BY uid HAVING MIN(joined)>?", (chat_id, now - 3 * DAY)):
+    for r in await db.q("SELECT uid FROM sessions WHERE chat_id=? AND uid!=0 AND COALESCE(asg,0)=0 GROUP BY uid HAVING MIN(joined)>?",
+                        (chat_id, now - 3 * DAY)):
         give(r["uid"], "new")
     for uid in out:
         out[uid] = sorted(set(out[uid]), key=ORDER.index)

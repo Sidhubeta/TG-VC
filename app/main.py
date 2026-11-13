@@ -144,6 +144,7 @@ async def api_auth(request: Request):
             chat_id, version = auth.parse_group_token(sp)
         except ValueError:
             return err("Invalid link", 403)
+        chat_id = await db.moved_to(chat_id)  # (the group became a supergroup since this link was made)
         g = await db.get_group(chat_id)
         if version < g["link_version"]:
             return err("This link was reset by an admin. Ask for the new link (/vc in the group)", 403)
@@ -154,6 +155,10 @@ async def api_auth(request: Request):
             await db.x("UPDATE groups SET link_version=? WHERE chat_id=?", (version, chat_id))
             log.info("group %s: link version restored to %s", chat_id, version)
     st = await tg.member_status(chat_id, uid, fresh=True)
+    if st.get("bot_gone"):
+        return err("The bot isn't in this group any more. Ask an admin to add it back and send /vc.", 403)
+    if st.get("unsure"):
+        return err("Telegram didn't answer just now — try again in a moment", 503)
     if not st["member"]:
         return err("Only members of this group can join", 403)
     if await is_banned(chat_id, uid):
@@ -224,7 +229,11 @@ async def api_search(request: Request, uid, chat_id, st):
             return err("This video is private, removed or not available" if music.unplayable(e)
                        else "Couldn't look up that link right now — try again in a moment")
         return JSONResponse({"tracks": [info["track"]] if info.get("track") else []})
-    return JSONResponse({"tracks": await music.search(q)})
+    try:
+        return JSONResponse({"tracks": await music.search(q)})
+    except Exception as e:
+        log.info("search %r failed: %s", q, e)
+        return err("Search isn't working right now (YouTube didn't answer) — try again in a moment", 503)
 
 
 async def api_stream(request: Request):
@@ -252,14 +261,16 @@ async def api_radio(request: Request):
         uid, chat_id, _ = await session(request)
     except Denied as d:
         return Response(d.msg, status_code=d.code)
-    room = ROOMS.get(chat_id)
-    if not room or radio.busy():
+    room = await get_room(chat_id)  # (after a restart the room is built again here: it used to answer 503)
+    if radio.busy():
         return Response("not available", status_code=503)
     p = room.parts.get(uid)
     request.state.who = f"{p.name if p else uid} ({uid})"
 
     async def still_allowed() -> bool:  # banned or gone from the group: the stream stops too
         st = await tg.member_status(chat_id, uid)
+        if st.get("bot_gone"):
+            return False
         return (st["member"] or st.get("unsure", False)) and not await is_banned(chat_id, uid)
     return StreamingResponse(radio.stream(room, request, still_allowed), media_type="audio/mpeg",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
@@ -302,11 +313,11 @@ async def emoji(request: Request):
     path = os.path.join(EMOJI_DIR, name)
     if not os.path.exists(path):
         # The page loads emoji before anyone is logged in, so this can't ask for a session. Instead the server
-        # fetches at most 600 new ones in 10 minutes (anyone could make it download the whole set).
+        # fetches at most 2000 new ones in 10 minutes (anyone could make it download the whole set).
         now_ = time.time()
         while _emoji_new and now_ - _emoji_new[0] > 600:
             _emoji_new.pop(0)
-        if len(_emoji_new) >= 600:
+        if len(_emoji_new) >= 2000:
             return Response(status_code=503, headers={"Retry-After": "60"})
         _emoji_new.append(now_)
         try:
@@ -426,19 +437,26 @@ def _clean_track(t) -> dict | None:
             "duration": _num(t.get("duration")), "thumb": f"/api/thumb/{vid}"}
 
 
-async def _add_items(pid: int, tracks) -> None:
+PLAYLISTS_MAX = 200
+PLAYLIST_SONGS_MAX = 2000
+
+
+async def _add_items(pid: int, tracks) -> int:
+    """Adds the songs that aren't in the playlist yet (up to its limit). Returns how many were added."""
     if not isinstance(tracks, list):
-        return
+        return 0
     now = time.time()
     # a song already in the playlist isn't added again (Liked Songs got the same song twice)
     have = {r["vid"] for r in await db.q("SELECT json_extract(track,'$.id') AS vid FROM playlist_items WHERE playlist_id=?", (pid,))}
     rows = []
-    for t in tracks[:300]:
+    room = max(0, PLAYLIST_SONGS_MAX - len(have))
+    for t in tracks[:PLAYLIST_SONGS_MAX]:
         c = _clean_track(t)
-        if c and c["id"] not in have:
+        if c and c["id"] not in have and len(rows) < room:
             have.add(c["id"])
             rows.append((pid, json.dumps(c), now))
     await db.xmany("INSERT INTO playlist_items(playlist_id,track,added) VALUES(?,?,?)", rows)
+    return len(rows)
 
 
 @guarded()
@@ -448,9 +466,12 @@ async def api_playlists(request: Request, uid, chat_id, st):
         name = str(body.get("name", "")).strip()[:60] or "My Playlist"
         if name == LIKED:
             name = "My Liked Songs"
+        n = await db.q1("SELECT COUNT(*) AS n FROM playlists WHERE uid=?", (uid,))
+        if n and n["n"] >= PLAYLISTS_MAX:
+            return err(f"You have {PLAYLISTS_MAX} playlists — delete one first")
         pid = await db.x("INSERT INTO playlists(uid,name,created) VALUES(?,?,?)", (uid, name, time.time()))
-        await _add_items(pid, body.get("tracks"))
-        return JSONResponse({"id": pid})
+        added = await _add_items(pid, body.get("tracks"))
+        return JSONResponse({"id": pid, "added": added})
     await _liked_id(uid)
     rows = await db.q("""SELECT p.id, p.name, COUNT(i.id) AS count,
         (SELECT track FROM playlist_items WHERE playlist_id=p.id ORDER BY id LIMIT 1) AS first
@@ -482,10 +503,12 @@ async def api_playlist(request: Request, uid, chat_id, st):
             if not new or pl["name"] == LIKED or new == LIKED:
                 return err("Can't use that name")
             await db.x("UPDATE playlists SET name=? WHERE id=?", (new, pid))
-        await _add_items(pid, body.get("add"))
+        added = await _add_items(pid, body.get("add"))
+        if body.get("add") and not added and isinstance(body.get("add"), list):
+            return JSONResponse({"ok": True, "added": 0})
         if body.get("remove"):
             await db.x("DELETE FROM playlist_items WHERE id=? AND playlist_id=?", (int(_num(body["remove"])), pid))
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, "added": added})
     items = await db.q("SELECT id, track FROM playlist_items WHERE playlist_id=? ORDER BY id", (pid,))
     return JSONResponse({"id": pid, "name": pl["name"],
                          "tracks": [{**json.loads(i["track"]), "item": i["id"]} for i in items]})
@@ -501,6 +524,10 @@ async def api_like(request: Request, uid, chat_id, st):
     if not t:
         return err("Bad track")
     hit = await db.q1("SELECT id FROM playlist_items WHERE playlist_id=? AND json_extract(track,'$.id')=?", (lid, t["id"]))
+    if not hit:
+        n = await db.q1("SELECT COUNT(*) AS n FROM playlist_items WHERE playlist_id=?", (lid,))
+        if n and n["n"] >= PLAYLIST_SONGS_MAX:
+            return err(f"Liked Songs is full ({PLAYLIST_SONGS_MAX} songs)")
     if hit:
         await db.x("DELETE FROM playlist_items WHERE playlist_id=? AND json_extract(track,'$.id')=?", (lid, t["id"]))
         return JSONResponse({"liked": False})
@@ -709,7 +736,7 @@ async def api_invite(request: Request, uid, chat_id, st):
     if only_admins and target not in admin_ids:
         return err("This group hides its members: you can invite admins only")
     t = time.time()
-    # Inviting several people one after another is normal: allow a burst of 10 a minute per person
+    # Inviting several people one after another is normal: allow a burst of 5 a minute per person
     # (an old 4-second gap made every invite after the first one fail when tapped quickly).
     recent = [x for x in _invite_by.get((chat_id, uid), []) if t - x < 60]
     if len(recent) >= 5:
@@ -849,8 +876,12 @@ async def api_health(request: Request, uid, chat_id, st):
                       + ("" if os.path.ismount(config.DATA_DIR) or config.DEV_MODE else " · no volume at /data: data is lost on redeploy")})
     except Exception as e:
         items.append({"name": "Storage", "ok": False, "detail": str(e)[:150]})
-    online = sum(len(r.parts) for r in ROOMS.values())
-    items.append({"name": "Server", "ok": True, "detail": f"Up {_ago(_started).replace(' ago', '')} · {len(ROOMS)} voice chat{'s' if len(ROOMS) != 1 else ''} · {online} people online"})
+    if sudo.is_sudo(uid):
+        online = sum(len(r.parts) for r in ROOMS.values())
+        items.append({"name": "Server", "ok": True, "detail": f"Up {_ago(_started).replace(' ago', '')} · {len(ROOMS)} voice chat{'s' if len(ROOMS) != 1 else ''} · {online} people online"})
+    else:  # (a group's creator, until OWNER_ID is set: their own group only, not everyone else's)
+        here = ROOMS.get(chat_id)
+        items.append({"name": "Server", "ok": True, "detail": f"Up {_ago(_started).replace(' ago', '')} · {len(here.parts) if here else 0} people in this voice chat"})
     day = time.time() - 86400
     probs = [d for d in DIAG if d["chat"] == chat_id and d["ts"] > day]
     kinds: dict[str, int] = {}
@@ -887,6 +918,13 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             raw = await ws.receive_text()
             t = time.time()
+            if len(raw) < 48 and raw.startswith('{"t":"ping"'):  # (clock sync: tiny and frequent, not flooding)
+                try:
+                    msg = json.loads(raw)
+                    await conn.send({"t": "pong", "id": msg.get("id"), "now": time.time()})
+                except Exception:
+                    pass
+                continue
             conn.hits.append(t)
             if len(conn.hits) == conn.hits.maxlen and t - conn.hits[0] < 5:
                 # flood protection: dropped (said once in a while, so a tap that does nothing isn't a mystery)
@@ -895,6 +933,7 @@ async def ws_endpoint(ws: WebSocket):
                     await conn.send({"t": "toast", "text": "Slow down a little 🙂"})
                 continue
             if len(raw) > 64_000:  # ("Add all": 200 songs are ~40 KB; 8000 cut it off at ~45 songs)
+                await conn.send({"t": "toast", "text": "That's too much at once — add fewer songs at a time"})
                 continue
             try:
                 msg = json.loads(raw)

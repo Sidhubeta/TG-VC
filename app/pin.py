@@ -6,6 +6,7 @@ bar looks like Telegram's own voice chat bar.
 """
 import asyncio
 import functools
+import glob
 import io
 import json
 import logging
@@ -39,6 +40,44 @@ def _font(size: int, bold: bool = True):
     return ImageFont.load_default(size)
 
 
+# Names in other scripts: Inter and DejaVu have no Gurmukhi or Devanagari, so a Punjabi or Hindi name's initials came
+# out as "no glyph" boxes in the pinned bar. Those letters use a font that has them (fonts-lohit-* / Noto).
+_SCRIPTS = [((0x0A00, 0x0A7F), ("*Gurmukhi*Bold*", "*Gurmukhi*")), ((0x0900, 0x097F), ("*Devanagari*Bold*", "*Devanagari*"))]
+
+
+@functools.lru_cache(maxsize=16)
+def _script_font(pattern: tuple, size: int):
+    for pat in pattern:
+        for path in sorted(glob.glob(f"/usr/share/fonts/**/{pat}.[ot]tf", recursive=True)):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return None
+
+
+def _initials(name: str) -> str:
+    """Up to two initials, letters only (an emoji or a symbol at the start of a name is skipped)."""
+    out = []
+    for word in (name or "").split():
+        ch = next((c for c in word if c.isalnum()), "")
+        if ch:
+            out.append(ch.upper())
+        if len(out) == 2:
+            break
+    return "".join(out)
+
+
+def _font_for(text: str, size: int):
+    """A font that can draw text, or None (then no letters: just the coloured circle)."""
+    for (lo, hi), pattern in _SCRIPTS:
+        if any(lo <= ord(c) <= hi for c in text):
+            return _script_font(pattern, size)
+    if all(ord(c) < 0x0250 for c in text):  # (Latin: Inter / DejaVu)
+        return _font(size)
+    return None
+
+
 def _initial_avatar(name: str, uid: int, size: int) -> Image.Image:
     grads = [((255, 94, 98), (255, 153, 102)), ((95, 114, 189), (155, 35, 234)), ((17, 153, 142), (56, 239, 125)),
              ((252, 92, 125), (106, 130, 251)), ((247, 151, 30), (255, 210, 0)), ((0, 198, 255), (0, 114, 255))]
@@ -48,10 +87,13 @@ def _initial_avatar(name: str, uid: int, size: int) -> Image.Image:
     for y in range(size):
         k = y / size
         d.line([(0, y), (size, y)], fill=tuple(int(a[i] * (1 - k) + b[i] * k) for i in range(3)))
-    parts = (name or "?").split()
-    ini = ((parts[0][:1] if parts else "?") + (parts[1][:1] if len(parts) > 1 else "")).upper()
-    f = _font(int(size * 0.4))
-    d.text((size / 2, size / 2), ini, font=f, fill="white", anchor="mm")
+    ini = _initials(name)
+    f = _font_for(ini, int(size * 0.4)) if ini else None
+    if not f:  # (a script we have no font for: a letter of one script with another's font is a box)
+        ini = ini[:1] if ini and _font_for(ini[:1], int(size * 0.4)) else ""
+        f = _font_for(ini, int(size * 0.4)) if ini else None
+    if f and ini:
+        d.text((size / 2, size / 2), ini, font=f, fill="white", anchor="mm")
     return im
 
 
@@ -172,7 +214,7 @@ def _render_sync(people: list[dict], paths: list, count: int, sub: str) -> bytes
 
 
 def caption_for(count: int, sub: str) -> str:
-    return f"<b>{LABEL}</b> · {sub}"
+    return f"<b>{tg._esc(LABEL)}</b> · {tg._esc(sub)}"
 
 
 async def _state(chat_id: int) -> tuple[list[dict], int, str]:
@@ -279,7 +321,7 @@ async def refresh(chat_id: int, force: bool = False):
             _last[chat_id] = key
             _edited_at[chat_id] = time.time()
         except Exception as e:
-            msg = str(e)
+            msg = str(e) or type(e).__name__  # (a timeout has no text: the log line was empty)
             if "not modified" in msg:
                 _last[chat_id] = key
             elif "not found" in msg or "MESSAGE_ID_INVALID" in msg:

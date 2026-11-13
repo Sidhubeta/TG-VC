@@ -181,7 +181,7 @@ class Station:
 
 
 async def stream(room, request, still_allowed):
-    """One phone's copy of the room's station. still_allowed(): checked every minute (banned, left the group)."""
+    """One phone's copy of the room's station. still_allowed(): checked every 15 s (banned, left the group)."""
     st = _stations.get(room.chat_id)
     if not st or st.task.done():
         st = _stations[room.chat_id] = Station(room)
@@ -204,7 +204,7 @@ async def stream(room, request, still_allowed):
                 yield chunk
             if await request.is_disconnected():
                 return
-            if time.monotonic() - checked > 60:
+            if time.monotonic() - checked > 15:
                 checked = time.monotonic()
                 if not await still_allowed():
                     why = "not allowed any more"

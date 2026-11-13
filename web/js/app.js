@@ -1,5 +1,5 @@
 import { $, CID, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
-import { getMusicVolume, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
+import { getMusicVolume, setSteady, steadyOn, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
@@ -351,7 +351,7 @@ function openParticipant(uid) {
         p.mod ? actionRow('shield', 'Remove as moderator', () => { send({ t: 'admin.unmod', uid }); toast(`${p.name} is no longer a moderator`); s.close(); })
           : actionRow('shield', 'Make moderator', () => { send({ t: 'admin.mod', uid }); toast(`${p.name} is now a moderator`); s.close(); }, '', 'Can mute, move and remove people')) : null,
       !me ? h('div', { class: 'list' }, actionRow('flag', 'Report to admins', async () => {
-        const reason = await prompt_('Report ' + p.name, 'What happened? (optional)');
+        const reason = await prompt_('Report ' + p.name, 'What happened? (optional)', '', 300);
         if (reason === null) return; // closed without sending: no report
         send({ t: 'report', uid, reason }); s.close();
       }, 'red')) : null,
@@ -514,7 +514,8 @@ function openAudio() {
         volRow('music', 'Music', getMusicVolume(), (v) => { unlockAudio(); setMusicVolume(v); })),
       h('div', { class: 'list' },
         switchRow('Noise isolation', noiseStatus(), V.noise, (v) => { setNoise(v).then(render); }),
-        switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
+        switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v)),
+        isApplePhone ? null : switchRow('Steady music when minimized', 'Songs switch without crossfade while this is on', steadyOn(), v => { unlockAudio(); setSteady(v); })));
   };
   const onDev = () => render();
   on('voice:devices', onDev);
@@ -658,7 +659,7 @@ function bindComposer() {
     send({ t: 'chat', text, reply: replyTo?.id || null });
     input.value = ''; setReply(null); haptic('light');
   };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); go(); } });
   $('#cmp-send').onclick = () => { go(); input.focus(); };
   $('#cmp-history').onclick = () => { closeComposer(); openHistory(); };
   picker.replaceChildren(...FLY.map(e => h('button', { 'aria-label': 'React ' + e, onclick: () => { haptic('light'); send({ t: 'fly', emoji: e }); } }, e)));
@@ -668,7 +669,9 @@ function bindComposer() {
     if (box.hidden || box.contains(e.target) || e.target.closest('#b-chat, .cpop')) return;
     if (input.value.trim()) return;
     closeComposer();
-    swallowClick = Date.now(); // this tap only closes the box; it shouldn't also open whatever is underneath
+    // a tap on a button (More, Music, the mic, a person…) does what it says too: it used to only close the box,
+    // and every button needed a second tap. A tap on empty space just closes it.
+    if (!e.target.closest('button, [role=button], a, input, .prow, .np-card, .cpop')) swallowClick = Date.now();
   }, true);
   // (only the click of that same tap: if it was a scroll, no click follows, and the next real tap must count)
   document.addEventListener('pointerdown', (e) => { if (swallowClick && Date.now() - swallowClick > 50) swallowClick = 0; }, false);
@@ -885,7 +888,7 @@ function adminMusic(c) {
   return () => off('room:changed', draw);
 }
 // ---- health: is everything working? ----
-const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-bg': 'Back from the background (how it went)', 'music-radio': 'Background stream failed', 'music-fx-asleep': 'Effect paused (Web Audio asleep)',
+const PROBLEM = { 'music-error': 'Song couldn’t load', 'music-stall': 'Song got stuck', 'music-blocked': 'Phone blocked the sound', 'music-dead': 'Song link failed (retried)', 'music-webaudio': 'Sound without a tap (Web Audio)', 'music-wa-fail': 'Web Audio piece failed', 'music-gaveup': 'Phone gave up on a song', 'music-bg': 'Back from the background (how it went)', 'music-radio': 'Background stream failed', 'music-fx-asleep': 'Effect paused (Web Audio asleep)', 'music-slow': 'Weak internet: moved to Data saver',
   js: 'App error', promise: 'App error' };
 function adminHealth(c) {
   let alive = true;

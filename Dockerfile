@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DENO_INSTALL=/usr/local
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unzip ca-certificates fonts-inter fonts-dejavu-core \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unzip ca-certificates fonts-inter fonts-dejavu-core fonts-lohit-guru fonts-lohit-deva \
     && curl -fsSL https://deno.land/install.sh | sh -s -- -y \
     && rm -rf /var/lib/apt/lists/*
 

@@ -26,11 +26,11 @@ def room_name(chat_id: int) -> str:
     return f"g{chat_id}"
 
 
-def join_token(chat_id: int, uid: int, name: str, can_publish: bool, ttl: int = 20 * 60) -> str:
+def join_token(chat_id: int, uid: int, name: str, can_publish: bool, ttl: int = 5 * 60) -> str:
     # (uid is the LiveKit identity: the Telegram id, or the stand-in id of someone appearing as the group)
     # Short-lived: a token only matters when joining. LiveKit hands connected apps fresh ones, and the app asks us
     # for a new one when it reconnects (/api/lk, which checks bans). A 6-hour token let a banned person with a
-    # modified app get back into the voice for hours.
+    # modified app get back into the voice for hours; 20 minutes still let a removed one back in for that long.
     now = int(time.time())
     claims = {
         "iss": config.LIVEKIT_API_KEY, "sub": str(uid), "nbf": now - 10, "exp": now + ttl, "name": "",  # (names come from the room, not LiveKit: someone appearing as the group stays hidden)

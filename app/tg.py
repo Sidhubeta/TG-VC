@@ -221,6 +221,10 @@ async def _member_lookup(chat_id: int, uid: int) -> dict:
             return hit[1] if hit else {"member": False, "admin": False, "name": "", "username": "", "bot": False, "unsure": True}
         log.info("getChatMember %s %s: %s", chat_id, uid, e)  # Telegram's answer: not a member / chat gone
         res = {"member": False, "admin": False, "name": "", "username": "", "bot": False}
+        txt = str(e).lower()
+        if "bot was kicked" in txt or "bot is not a member" in txt or "chat not found" in txt or "upgraded to a supergroup" in txt:
+            # the bot itself can't see the group any more: nobody can be checked (not "you left the group")
+            res["bot_gone"] = True
     except Exception as e:
         # Network trouble is not an answer: keep the last known status instead of kicking people out.
         log.warning("getChatMember failed %s %s: %s", chat_id, uid, e)
@@ -353,6 +357,14 @@ async def _handle(upd: dict):
             # the voice chat hears it at once (it used to wait for its check, up to a minute)
             await _room_news(gid, user.get("id", 0), st=st, user=user, banned=new.get("status") == "kicked")
         return
+    if msg and (new_id := msg.get("migrate_to_chat_id")):
+        # The group became a supergroup (Telegram does that by itself as groups grow): it has a new id. Everything
+        # kept under the old one moves with it, and old links and JOIN buttons keep working.
+        await migrate(msg["chat"]["id"], int(new_id))
+        return
+    if msg and msg.get("migrate_from_chat_id"):
+        await migrate(int(msg["migrate_from_chat_id"]), msg["chat"]["id"])
+        return
     if msg and msg.get("chat", {}).get("type") in ("group", "supergroup"):
         gid = msg["chat"]["id"]
         if not msg.get("sender_chat"):
@@ -376,6 +388,10 @@ async def _handle(upd: dict):
             await db.get_group(chat["id"])
             await db.x("UPDATE groups SET title=? WHERE chat_id=?", (chat.get("title", ""), chat["id"]))
             st = mcm["new_chat_member"]["status"]
+            if st in ("left", "kicked"):
+                log.info("bot removed from %s", chat["id"])
+                for k in [k for k in _member_cache if k[0] == chat["id"]]:
+                    _member_cache.pop(k, None)  # (the room's next check finds out and tells everyone why)
             if st == "member":
                 await call("sendMessage", chat_id=chat["id"],
                            text="👋 Thanks! Please make me an <b>admin</b> so I can verify members, then send /vc.",
@@ -428,6 +444,24 @@ async def _handle(upd: dict):
         from . import pin
         await pin.refresh(cid, force=True)
         await call("sendMessage", chat_id=cid, text="🔒 Old voice chat link disabled. The pinned Join button now uses the new link.")
+
+
+async def migrate(old: int, new: int):
+    if not old or not new or old == new:
+        return
+    if await db.migrate_chat(old, new):
+        log.info("group %s became supergroup %s: moved its voice chat", old, new)
+        from . import room as rooms
+        r = rooms.ROOMS.pop(old, None)
+        if r:
+            for p in list(r.parts.values()):
+                await r.kick(p.uid, "This group was upgraded by Telegram. Open the voice chat again from the group.")
+        _admins_cache.pop(old, None)
+        try:
+            from . import pin
+            await pin.post(new)  # a JOIN bar in the new group (the old pinned message is gone)
+        except Exception as e:
+            log.info("pin after migration: %s", e)
 
 
 _vc_last: dict[int, float] = {}

@@ -846,6 +846,11 @@ async def api_health(request: Request, uid, chat_id, st):
                      + (", provider set" if config.POT_PROVIDER_URL else ", POT_PROVIDER_URL not set"))
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
     items.append({"name": "PO token provider", **(await music.pot_check())})
+    lv = music._cur_level()
+    if lv:
+        items.append({"name": "YouTube settings", "ok": False, "detail": f"YouTube refused the full setup, so songs are fetched "
+                      f"{music.LEVELS[lv]} for now (tried again every 30 min)"
+                      + (" — the cookies look stale: make new ones in a private window" if lv == 1 else "")})
     if ms["dl_ok_at"] or ms["dl_err_at"]:
         dl_ok = ms["dl_ok_at"] >= ms["dl_err_at"]
         items.append({"name": "Song downloads", "ok": dl_ok,

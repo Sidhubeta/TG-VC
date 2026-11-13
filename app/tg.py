@@ -227,7 +227,7 @@ async def _member_lookup(chat_id: int, uid: int) -> dict:
             res["bot_gone"] = True
     except Exception as e:
         # Network trouble is not an answer: keep the last known status instead of kicking people out.
-        log.warning("getChatMember failed %s %s: %s", chat_id, uid, e)
+        log.warning("getChatMember failed %s %s: %s", chat_id, uid, str(e) or type(e).__name__)
         return hit[1] if hit else {"member": False, "admin": False, "name": "", "username": "", "bot": False, "unsure": True}
     if len(_member_cache) > 5000:
         cutoff = time.time() - 120

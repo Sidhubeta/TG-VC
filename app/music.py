@@ -173,15 +173,52 @@ class _QuietLog:
     def error(self, msg): log.info("yt-dlp: %s", str(msg)[:300])
 
 
-def _extractor_args() -> dict:
+# When YouTube refuses the server, the settings are stepped back by themselves instead of someone changing Railway
+# variables one by one: 0 = as set up, 1 = without the cookies (YouTube rejects a stale login: "The page needs to be
+# reloaded", 403s), 2 = also without YT_EXTRACTOR_ARGS and without forcing PO tokens (yt-dlp's own defaults). The
+# level that worked is kept for 30 minutes, then the full setup is tried again.
+LEVELS = ["as set up", "without the YouTube cookies", "yt-dlp defaults (no cookies, no extra settings)"]
+_level = {"n": 0, "until": 0.0}
+
+
+def _cur_level() -> int:
+    if _level["n"] and time.time() > _level["until"]:
+        _level["n"] = 0
+    return _level["n"]
+
+
+def _set_level(n: int):
+    if n != _level["n"]:
+        log.warning("YouTube: now %s", LEVELS[n])
+    _level["n"], _level["until"] = n, time.time() + 1800
+
+
+def _levels_from(start: int) -> list[int]:
+    """The levels worth trying from start (no point going without cookies when there are none, etc.)."""
+    out = [start]
+    for n in range(start + 1, len(LEVELS)):
+        if n == 1 and not os.path.exists(COOKIE_FILE):
+            continue
+        if n == 2 and not (config.YT_EXTRACTOR_ARGS or config.POT_PROVIDER_URL):
+            continue
+        out.append(n)
+    return out
+
+
+_REFUSED_RE = re.compile(r"page needs to be reloaded|sign in to confirm|not a bot|403|forbidden|cookies|po token|"
+                         r"requested format is not available|no video formats", re.I)
+
+
+def _extractor_args(level: int = 0) -> dict:
     """YouTube settings for yt-dlp. With a PO token provider, a token is fetched for every request (also the song
     files, where YouTube answers 403 after the first part without one). YT_EXTRACTOR_ARGS adds or overrides settings
     the way yt-dlp's --extractor-args does, e.g. "youtube:player_client=tv,web_safari" (several: separated by spaces)."""
     args: dict = {}
     if config.POT_PROVIDER_URL:
         args["youtubepot-bgutilhttp"] = {"base_url": [config.POT_PROVIDER_URL]}
-        args["youtube"] = {"fetch_pot": ["always"]}
-    for part in config.YT_EXTRACTOR_ARGS.split():
+        if level < 2:
+            args["youtube"] = {"fetch_pot": ["always"]}
+    for part in (config.YT_EXTRACTOR_ARGS.split() if level < 2 else []):
         ie, _, kv = part.partition(":")
         for item in kv.split(";"):
             k, _, v = item.partition("=")
@@ -190,12 +227,13 @@ def _extractor_args() -> dict:
     return args
 
 
-def _opts(**extra) -> dict:
+def _opts(level: int | None = None, **extra) -> dict:
+    level = _cur_level() if level is None else level
     o = {"logger": _QuietLog(), "quiet": True, "no_warnings": False, "skip_download": True, "noplaylist": True,
          "socket_timeout": 15, "retries": 3, "extractor_retries": 2}
-    if os.path.exists(COOKIE_FILE):
+    if os.path.exists(COOKIE_FILE) and level < 1:
         o["cookiefile"] = COOKIE_FILE
-    ea = _extractor_args()
+    ea = _extractor_args(level)
     if ea:
         o["extractor_args"] = ea
     o.update(extra)
@@ -409,8 +447,21 @@ async def match(song: dict) -> dict | None:
 def _extract(url: str, **extra) -> dict:
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed")
-    with yt_dlp.YoutubeDL(_opts(**extra)) as y:
-        return y.extract_info(url, download=False)
+    start = _cur_level()
+    err = None
+    for n in _levels_from(start):
+        try:
+            with yt_dlp.YoutubeDL(_opts(level=n, **extra)) as y:
+                info = y.extract_info(url, download=False)
+            if n != start:
+                _set_level(n)
+            return info
+        except Exception as e:
+            err = e
+            if unplayable(e) or not _REFUSED_RE.search(str(e)):
+                raise  # (the video itself, or the network: other settings won't help)
+            log.info("YouTube refused (%s): %s", LEVELS[n], str(e)[:160])
+    raise err
 
 
 _searches: "OrderedDict[tuple, tuple[float, list[dict]]]" = OrderedDict()
@@ -620,13 +671,28 @@ def _ytdlp_download(vid: str, fmt: dict, out: str, limit: int) -> None:
                  retries=4, fragment_retries=4, file_access_retries=1, writeinfojson=False, writethumbnail=False,
                  postprocessors=[], fixup="never", cachedir=False)
     hit = _raw.get(vid)
-    with yt_dlp.YoutubeDL(opts) as y:
-        if hit and time.time() - hit[0] < 1800:
-            y.process_ie_result(copy.deepcopy(hit[1]), download=True)  # (the lookup just made: no second one)
-        else:
-            y.download([f"https://www.youtube.com/watch?v={vid}"])
-    if not os.path.exists(out) or os.path.getsize(out) < 1024:
-        raise RuntimeError("yt-dlp wrote no file")
+    start = _cur_level()
+    err = None
+    for i, n in enumerate(_levels_from(start)):
+        opts["cookiefile"] = COOKIE_FILE if (n < 1 and os.path.exists(COOKIE_FILE)) else None
+        opts["extractor_args"] = _extractor_args(n)
+        try:
+            with yt_dlp.YoutubeDL(opts) as y:
+                if i == 0 and hit and time.time() - hit[0] < 1800:
+                    y.process_ie_result(copy.deepcopy(hit[1]), download=True)  # (the lookup just made: no second one)
+                else:
+                    y.download([f"https://www.youtube.com/watch?v={vid}"])  # (other settings: a fresh lookup)
+            if not os.path.exists(out) or os.path.getsize(out) < 1024:
+                raise RuntimeError("yt-dlp wrote no file")
+            if n != start:
+                _set_level(n)
+            return
+        except Exception as e:
+            err = e
+            if not _REFUSED_RE.search(str(e)):
+                raise
+            log.info("YouTube refused the download (%s): %s", LEVELS[n], str(e)[:160])
+    raise err
 
 
 async def _download(vid: str, fmt: dict, retry: bool = True):

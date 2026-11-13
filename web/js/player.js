@@ -818,10 +818,20 @@ function impulse(c, secs, decay) {
   return buf;
 }
 let tapped = false;
+// Android: the song always plays the way it does with an effect on (through Web Audio, set flat: it sounds the
+// same as without). People found the music steady that way when Telegram is minimized, and not without an effect
+// (it jumped to another line, or stopped outside Telegram). Songs then switch without blending (crossfade needs a
+// second plain player); it can be switched off in Audio.
+export const steadyOn = () => !isApple && store.get('steady', true) !== false;
+export function setSteady(v) {
+  store.set('steady', !!v); haptic('select');
+  if (needGraph()) buildGraph(); else releaseGraph();
+  reportCaps();
+}
 const needGraph = () => {
   if (viaVoice()) return false; // (the server makes the effects for everyone)
   const f = fx();
-  return tapped || f.mode !== 'none' || !!(f.bass || f.mid || f.treble || f.reverb) || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
+  return tapped || steadyOn() || f.mode !== 'none' || !!(f.bass || f.mid || f.treble || f.reverb) || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
 };
 // effects switched off: move the song back to a plain <audio> element (keeps playing where it was)
 function releaseGraph(force = false) {

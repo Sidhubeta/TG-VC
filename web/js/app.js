@@ -1,5 +1,5 @@
 import { $, CID, S, actionRow, api, avatarEl, closeWS, confirmBox, connectWS, copyText, denied, emit, fmtDate, fmtDur, fullView, h, haptic, icon, off, on, reconnectWS, send, sheet, store, switchRow, tg, toast } from './core.js';
-import { getMusicVolume, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
+import { getMusicVolume, setSteady, steadyOn, openNP, openPlayHistory, openSearch, pip, pipSupported, prompt_, refresh as refreshMusic, setMusicVolume, stopMusic, unlockAudio } from './player.js';
 import { BOARD, joinSound, leaveSound, micSound, playBoard } from './sounds.js';
 import {
   V, attachVideo, canPickOutput, currentDevice, flipCamera, getRoomVolume, getVolume, isMutedForMe, leaveVoice, listDevices,
@@ -514,7 +514,8 @@ function openAudio() {
         volRow('music', 'Music', getMusicVolume(), (v) => { unlockAudio(); setMusicVolume(v); })),
       h('div', { class: 'list' },
         switchRow('Noise isolation', noiseStatus(), V.noise, (v) => { setNoise(v).then(render); }),
-        switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v))));
+        switchRow('Join & leave sounds', null, store.get('joinSound', true), v => store.set('joinSound', v)),
+        isApplePhone ? null : switchRow('Steady music when minimized', 'Songs switch without crossfade while this is on', steadyOn(), v => { unlockAudio(); setSteady(v); })));
   };
   const onDev = () => render();
   on('voice:devices', onDev);

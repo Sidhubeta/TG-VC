@@ -820,13 +820,8 @@ async def api_health(request: Request, uid, chat_id, st):
     from .room import DIAG
     if not is_sudo(uid, st):
         return err("Only the bot's owner and sudo users can see this", 403)
-    if request.method == "POST":  # "Test YouTube now"
-        t = time.time()
-        try:
-            await music.resolve("jNQXAC9IVRw", force=True)  # a tiny public video
-            return JSONResponse({"ok": True, "detail": f"YouTube works ({time.time() - t:.1f} s)"})
-        except Exception as e:
-            return JSONResponse({"ok": False, "detail": f"YouTube failed: {str(e)[:200]}"})
+    if request.method == "POST":  # "Test YouTube now": a lookup and a real download (the lookup alone isn't enough)
+        return JSONResponse(await music.download_test())
     items = []
     if config.DEV_MODE:  # (anyone can log in as anyone: only for testing on a computer)
         items.append({"name": "DEV_MODE", "ok": False, "detail": "DEV_MODE=1 is on: anyone can open the app as anyone. Remove it on Railway now."})
@@ -851,6 +846,19 @@ async def api_health(request: Request, uid, chat_id, st):
                      + (", provider set" if config.POT_PROVIDER_URL else ", POT_PROVIDER_URL not set"))
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
     items.append({"name": "PO token provider", **(await music.pot_check())})
+    lv = music._cur_level()
+    if lv:
+        items.append({"name": "YouTube settings", "ok": False, "detail": f"YouTube refused the full setup, so songs are fetched "
+                      f"{music.LEVELS[lv]} for now (tried again every 30 min)"
+                      + (" — the cookies look stale: make new ones in a private window" if lv == 1 else "")})
+    if ms["dl_ok_at"] or ms["dl_err_at"]:
+        dl_ok = ms["dl_ok_at"] >= ms["dl_err_at"]
+        items.append({"name": "Song downloads", "ok": dl_ok,
+                      "detail": f"Last song saved {_ago(ms['dl_ok_at'])}" if dl_ok else
+                      f"YouTube refused the last download {_ago(ms['dl_err_at'])}: {ms['dl_err'][:120]}"})
+    recent = [w for ts, w in music.WARNINGS if time.time() - ts < 3600]
+    if recent:
+        items.append({"name": "yt-dlp says", "ok": None, "detail": " · ".join(recent[-3:])[:400]})
     items.append({"name": "Music in the voice chat", **voicemusic.status()})
     n403 = music.refused_last_hour()
     items.append({"name": "YouTube song links", "ok": n403 < 10,

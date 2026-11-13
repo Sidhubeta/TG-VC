@@ -38,6 +38,9 @@ LIVEKIT_HTTP_URL = (_env("LIVEKIT_HTTP_URL") or LIVEKIT_URL.replace("wss://", "h
 YT_COOKIES = _env("YT_COOKIES")            # contents of cookies.txt (Netscape format), optional
 YT_COOKIES_B64 = _env("YT_COOKIES_B64")    # same, base64 encoded (easier for Railway vars)
 POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. http://bgutil.railway.internal:4416
+# extra yt-dlp settings, like its --extractor-args: e.g. "youtube:player_client=tv,web_safari" (try other clients
+# when YouTube refuses the song files)
+YT_EXTRACTOR_ARGS = _env("YT_EXTRACTOR_ARGS")
 AUDIO_CACHE_MB = _int("AUDIO_CACHE_MB", 800)
 VIDEO_CACHE_MB = _int("VIDEO_CACHE_MB", 600)  # 0 = don't cache videos
 # The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)

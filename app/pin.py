@@ -321,7 +321,7 @@ async def refresh(chat_id: int, force: bool = False):
             _last[chat_id] = key
             _edited_at[chat_id] = time.time()
         except Exception as e:
-            msg = str(e)
+            msg = str(e) or type(e).__name__  # (a timeout has no text: the log line was empty)
             if "not modified" in msg:
                 _last[chat_id] = key
             elif "not found" in msg or "MESSAGE_ID_INVALID" in msg:

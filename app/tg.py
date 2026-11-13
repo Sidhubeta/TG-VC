@@ -558,7 +558,7 @@ async def run_polling():
                     log.info("owner commands: %s", e)
             break
         except Exception as e:
-            log.error("getMe failed: %s (retrying)", e)
+            log.error("getMe failed: %s (retrying)", str(e) or type(e).__name__)  # (a timeout has no text)
             await asyncio.sleep(10)
     try:
         # a webhook set earlier (another host, an old setup) makes every getUpdates fail with 409

@@ -346,7 +346,28 @@ function sync(force = false) {
       P.gSleep = 0; releaseGraph(true); setBlocked(false);
     }
   } else P.gSleep = 0;
+  bgFallback(want && !over);
   syncVideo();
+}
+// Minimized, the song that's playing simply keeps playing, and the next one is loaded on the same player when it
+// ends. Switching to the room's stream (/api/radio) the moment the app was minimized made the song jump to
+// another line (and back to another one when opened), and outside Telegram the phone refused to start the new
+// stream at all: the music stopped. So the stream is only the way out when the music really stopped while
+// minimized (the phone wouldn't start the next song, or it stalled) for a few seconds.
+function bgFallback(want) {
+  if (!document.hidden || !want || P.radio) { P.bgQuiet = 0; return; }
+  if (!audio.paused && audio.readyState >= 3) { P.bgQuiet = 0; return; }
+  P.bgQuiet ||= Date.now();
+  if (Date.now() - P.bgQuiet < 4000) return;
+  P.bgQuiet = 0;
+  if (viaVoice() || WA.on || G || isApple || P.localPaused || !playing() || (P.bgRadioTries = (P.bgRadioTries || 0) + 1) > 3) return;
+  console.info('music: minimized and the song stopped, playing the room\'s stream');
+  report('music-bg-radio', `ready=${audio.readyState} paused=${audio.paused}`);
+  endFade();
+  P.radio = { fails: 0 }; P.radioUsed = true;
+  audio.playbackRate = 1;
+  audio.src = media('/api/radio') + '&r=' + Date.now();
+  audio.play().catch(() => stopRadio());
 }
 let fine = 0; // -1 slower, 0 normal, +1 faster (small catch-up on the audio)
 let jumped = 0, jumpedAt = 0, jumpLead = 0.3;
@@ -457,7 +478,6 @@ function effectsToBackground() {
     P.fxBg = { el: old, g: G };
     G = null;
     console.info('music: minimized, playing without the effect until the app is open again');
-    startRadio(); // (with an effect on it couldn't start at the moment of minimizing: the graph was still in the way)
   }, () => { a.removeAttribute('src'); a.load(); a.muted = false; });
 }
 function effectsBack() {
@@ -493,14 +513,6 @@ function effectsBack() {
 // next one until the app is opened (the ticks above only help while the app still runs). So minimized, the player
 // plays the room's stream from the server (/api/radio): the server goes from song to song, follows skips, seeks
 // and pauses, and the phone only has to keep playing. Opened again, it's back on its own synced player.
-function startRadio() {
-  if (viaVoice() || P.radio || WA.on || G || isApple || P.localPaused || !playing() || audio.paused || isSilence(audio) || !audio.getAttribute('src')) return;
-  endFade();
-  P.radio = { fails: 0 }; P.radioUsed = true;
-  audio.playbackRate = 1;
-  audio.src = media('/api/radio') + '&r=' + Date.now();
-  audio.play().catch(() => stopRadio());
-}
 function radioRetry() {
   if (!P.radio) return;
   if (++P.radio.fails > 5) { report('music-radio', 'stream kept failing'); return stopRadio(); }
@@ -517,9 +529,9 @@ function stopRadio() {
 document.addEventListener('visibilitychange', () => {
   tellBg();
   if (document.hidden) {
-    P.hiddenAt = Date.now(); P.bgTicks = 0; P.radioUsed = false; P.radioPlayed = 0;
+    P.hiddenAt = Date.now(); P.bgTicks = 0; P.bgRadioTries = 0; P.bgQuiet = 0; P.radioUsed = false; P.radioPlayed = 0;
     P.bgGap = 0; P.bgLast = 0; P.bgFrozen = 0; P.bgVia = viaVoice() ? 'voice' : WA.on ? 'webaudio' : 'player';
-    effectsToBackground(); startRadio();
+    effectsToBackground(); // (the song playing keeps playing: no switch, so no jump to another line)
   } else {
     stopRadio(); effectsBack();
     // (for the logs: how a long time in the background went, so a phone that still stops can be told apart)

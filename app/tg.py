@@ -212,15 +212,7 @@ async def _member_lookup(chat_id: int, uid: int) -> dict:
     key = (chat_id, uid)
     hit = _member_cache.get(key)
     try:
-        m = await call("getChatMember", chat_id=chat_id, user_id=uid)
-        st = m.get("status")
-        u = m.get("user") or {}
-        res = {
-            "member": st in ("creator", "administrator", "member") or (st == "restricted" and bool(m.get("is_member"))),
-            "admin": st in ("creator", "administrator"),
-            "owner": st == "creator",
-            "name": _full_name(u)[:64], "username": u.get("username") or "", "bot": bool(u.get("is_bot")),
-        }
+        res = _status_of(await call("getChatMember", chat_id=chat_id, user_id=uid))
     except ApiError as e:
         if e.code not in (400, 403):
             # Too many requests (429) or Telegram's own trouble (5xx) is not an answer: keep what we knew. It used
@@ -303,6 +295,38 @@ async def send_recording(uid: int, data: bytes, filename: str, caption: str) -> 
 
 
 # ---- update handling ----------------------------------------------------------------------
+def _status_of(m: dict) -> dict:
+    """A ChatMember (from getChatMember or a chat_member update) as {'member', 'admin', ...}."""
+    st, u = m.get("status"), m.get("user") or {}
+    return {"member": st in ("creator", "administrator", "member") or (st == "restricted" and bool(m.get("is_member"))),
+            "admin": st in ("creator", "administrator"), "owner": st == "creator",
+            "name": _full_name(u)[:64] if u else "", "username": u.get("username") or "", "bot": bool(u.get("is_bot"))}
+
+
+def drop_admins(chat_id: int):
+    _admins_cache.pop(chat_id, None)
+
+
+async def _room_news(chat_id: int, uid: int, **kw):
+    from . import room as rooms  # (room imports this module)
+    r = rooms.ROOMS.get(chat_id)
+    if r and uid in r.parts:
+        try:
+            await r.tg_news(uid, **kw)
+        except Exception:
+            log.exception("room news")
+
+
+async def _group_news(chat_id: int, **kw):
+    from . import room as rooms
+    r = rooms.ROOMS.get(chat_id)
+    if r:
+        try:
+            await r.group_news(**kw)
+        except Exception:
+            log.exception("group news")
+
+
 async def _handle(upd: dict):
     # every way the bot sees someone in the group adds them to the invite list
     if mr := upd.get("message_reaction"):
@@ -314,22 +338,38 @@ async def _handle(upd: dict):
             await remember_member(em["chat"]["id"], em.get("from"))
         return
     msg = upd.get("message")
-    if cm := upd.get("chat_member"):  # someone joined / left the group (needs the bot to be admin)
+    if cm := upd.get("chat_member"):  # someone joined / left / was removed / promoted (needs the bot to be admin)
         if cm["chat"]["type"] in ("group", "supergroup"):
             new = cm.get("new_chat_member") or {}
-            if new.get("status") in ("left", "kicked"):
-                await forget_member(cm["chat"]["id"], new["user"]["id"])
+            gid, user = cm["chat"]["id"], new.get("user") or {}
+            st = _status_of(new)
+            if user.get("id"):
+                _member_cache[(gid, user["id"])] = (time.time(), st)  # Telegram's own word: no need to ask again
+                drop_admins(gid)
+            if not st["member"]:
+                await forget_member(gid, user.get("id", 0))
             else:
-                await remember_member(cm["chat"]["id"], new.get("user"))
+                await remember_member(gid, user)
+            # the voice chat hears it at once (it used to wait for its check, up to a minute)
+            await _room_news(gid, user.get("id", 0), st=st, user=user, banned=new.get("status") == "kicked")
         return
     if msg and msg.get("chat", {}).get("type") in ("group", "supergroup"):
         gid = msg["chat"]["id"]
         if not msg.get("sender_chat"):
             await remember_member(gid, msg.get("from"))
+            if msg.get("from"):  # a new name or username shows in the voice chat with their next message
+                await _room_news(gid, msg["from"]["id"], user=msg["from"])
         for u in msg.get("new_chat_members") or []:
             await remember_member(gid, u)
         if left := msg.get("left_chat_member"):
             await forget_member(gid, left["id"])
+            _member_cache.pop((gid, left["id"]), None)
+            await _room_news(gid, left["id"], st={"member": False, "admin": False})
+        if "new_chat_title" in msg:
+            await _group_news(gid, title=msg["new_chat_title"])
+        if msg.get("new_chat_photo") or msg.get("delete_chat_photo"):
+            forget_avatar(gid)
+            await _group_news(gid, photo=True)
     if mcm := upd.get("my_chat_member"):
         chat = mcm["chat"]
         if chat["type"] in ("group", "supergroup"):
@@ -551,6 +591,41 @@ async def fetch_bio(uid: int) -> str | None:
         return None  # unknown (not "no bio"): the caller keeps the one it has
 
 
+async def fetch_profile(uid: int) -> dict:
+    """Bio and current profile photo of a person: {'bio': str | None, 'photo': file_unique_id | '' | None}.
+    None means Telegram didn't answer (keep what we have)."""
+    out: dict = {"bio": None, "photo": None}
+    try:
+        out["bio"] = ((await call("getChat", chat_id=uid)).get("bio") or "")[:140]
+    except Exception:
+        pass
+    try:
+        r = await call("getUserProfilePhotos", user_id=uid, limit=1)
+        out["photo"] = r["photos"][0][-1].get("file_unique_id", "") if r.get("photos") else ""
+    except Exception:
+        pass
+    return out
+
+
+def avatar_id(entity_id: int) -> str | None:
+    """The Telegram id of the photo we keep for someone (None: not known)."""
+    try:
+        with open(os.path.join(AV_DIR, f"{entity_id}.jpg.id")) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def forget_avatar(entity_id: int):
+    """A new (or removed) profile photo: the next request downloads it again."""
+    base = os.path.join(AV_DIR, f"{entity_id}.jpg")
+    for f in (base, base + ".none", base + ".id"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
 async def _download_file(file_id: str) -> bytes | None:
     f = await call("getFile", file_id=file_id)
     r = await client().get(f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{f['file_path']}")
@@ -573,12 +648,13 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
     async with lock:
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
             return path
-        data, answered = None, False
+        data, answered, pid = None, False, ""
         try:
             if entity_id > 0:
                 r = await call("getUserProfilePhotos", user_id=entity_id, limit=1)
                 if r.get("photos"):
                     sizes = r["photos"][0]
+                    pid = sizes[-1].get("file_unique_id", "")
                     pick = next((x for x in sizes if x.get("width", 0) >= 300), sizes[-1])
                     data = await _download_file(pick["file_id"])
                 answered = True
@@ -603,6 +679,9 @@ async def avatar_path(entity_id: int, fallback_url: str = "") -> str | None:
             os.replace(tmp, path)  # atomic: a request never sees a half-written photo
             if os.path.exists(miss):
                 os.remove(miss)
+            if pid:  # (so a new photo can be noticed while they're in the voice chat)
+                with open(path + ".id", "w") as fh:
+                    fh.write(pid)
             return path
         if answered:
             open(miss, "w").close()  # really no photo: don't ask again for 6 hours

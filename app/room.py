@@ -100,6 +100,7 @@ class Participant:
         self.flags: list[str] = []
         self.last_sound = 0.0
         self.fly_times: deque[float] = deque(maxlen=6)
+        self.prof_at = self.joined - 150  # (first look soon after joining) when the bio and photo were last looked at (they're checked every few minutes)
 
 
 # Problems reported by phones (music errors, stalls, blocked sound, script errors): logged, and the latest ones
@@ -334,7 +335,7 @@ class Room:
              "hand": p.hand, "video": p.video, "screen": p.screen, "joined": p.joined, "asGroup": p.as_group,
              "mod": self.is_mod(p)}
         if p.as_group:
-            d.update(name=self.group_title, username="", photo=f"/api/avatar/{self.chat_id}", bio="",
+            d.update(name=self.group_title, username="", photo=self.group_photo(), bio="",
                      lk=self.pid(p.uid))  # (their LiveKit identity, for matching their voice to their tile)
             if for_admin:
                 d["realName"] = p.name
@@ -681,18 +682,93 @@ class Room:
             if st.get("unsure"):
                 continue  # Telegram didn't really answer: check again next minute
             if not st["member"]:
-                await self.kick(p.uid, "You left the group, so you were removed from its voice chat.")
-            elif st["admin"] != p.admin:
-                p.admin = st["admin"]
-                if p.admin:
-                    # made an admin: whatever an admin did to them as a member (muted, listener) no longer holds
-                    p.force_muted, p.role = False, "speaker"
-                    self.sticky.pop(p.uid, None)
-                    await lk.set_publish(self.chat_id, self.lk_id(p.uid), True)
-                elif p.as_group:
-                    await self.set_as_group(p, False)  # appearing as the group is for admins only
+                await self.kick(p.uid, "You're no longer in the group, so you were removed from its voice chat.")
+                continue
+            changed = self._new_name(p, st["name"], st.get("username")) if st.get("name") and p.uid > 0 else False
+            if st["admin"] != p.admin:
+                await self._set_admin(p, st["admin"])
+                changed = True
+            if changed:
                 await self.bcast_part(p)
-                await self.send_to(p.uid, {"t": "role", "admin": p.admin})
+        try:
+            await self._profiles([p for p in parts if self.parts.get(p.uid) is p])
+        except Exception:
+            log.exception("profiles")
+
+    async def _set_admin(self, p: Participant, admin: bool):
+        p.admin = admin
+        if p.admin:
+            # made an admin: whatever an admin did to them as a member (muted, listener) no longer holds
+            p.force_muted, p.role = False, "speaker"
+            self.sticky.pop(p.uid, None)
+            await lk.set_publish(self.chat_id, self.lk_id(p.uid), True)
+        elif p.as_group:
+            await self.set_as_group(p, False)  # appearing as the group is for admins only
+        await self.send_to(p.uid, {"t": "role", "admin": p.admin})
+
+    def _new_name(self, p: Participant, name: str, username: str | None) -> bool:
+        changed = False
+        if name and name != p.name:
+            p.name, changed = name[:64], True
+        if username is not None and username != p.username:
+            p.username, changed = username, True
+        if changed:
+            spawn(db.x("UPDATE users SET name=?, username=? WHERE uid=?", (p.name, p.username, p.uid)))
+        return changed
+
+    async def tg_news(self, uid: int, st: dict | None = None, user: dict | None = None, banned: bool = False):
+        """Telegram told us about someone in this voice chat: removed or banned from the group, made an admin or
+        not, a new name or username. Shown at once (the room's own check runs once a minute)."""
+        p = self.parts.get(uid)
+        if not p:
+            return
+        if st is not None and not st["member"]:
+            return await self.kick(uid, "An admin banned you from the group, so you were removed from its voice chat."
+                                   if banned else "You're no longer in the group, so you were removed from its voice chat.")
+        changed = False
+        if user and user.get("first_name"):
+            changed = self._new_name(p, tg._full_name(user), user.get("username") or "")
+        if st is not None and st["admin"] != p.admin:
+            await self._set_admin(p, st["admin"])
+            changed = True
+        if changed:
+            await self.bcast_part(p)
+
+    def group_photo(self) -> str:
+        v = getattr(self, "gphoto_v", 0)
+        return f"/api/avatar/{self.chat_id}" + (f"?v={v}" if v else "")
+
+    async def group_news(self, title: str | None = None, photo: bool = False):
+        """The group got a new name or photo: everyone sees it at once (and people appearing as the group too)."""
+        if title:
+            self.group_title = title[:128]
+        if photo:
+            self.gphoto_v = int(now())
+        await self.broadcast({"t": "group", "group": self.group_title, "photo": self.group_photo()})
+        for p in list(self.parts.values()):
+            if p.as_group:
+                await self.bcast_part(p)
+
+    async def _profiles(self, parts: list[Participant]):
+        """Bio and profile photo: Telegram sends no news when they change, so look every few minutes (a few
+        people per minute, so a big voice chat doesn't flood Telegram)."""
+        t = now()
+        every = max(180, len(parts) * 8)
+        due = sorted((p for p in parts if p.uid > 0 and t - p.prof_at > every), key=lambda p: p.prof_at)[:8]
+        for p in due:
+            p.prof_at = t
+            pr = await tg.fetch_profile(p.uid)
+            if self.parts.get(p.uid) is not p:
+                continue
+            changed = False
+            if pr["bio"] is not None and pr["bio"] != p.bio:
+                p.bio, changed = pr["bio"], True
+                await db.x("UPDATE users SET bio=?, updated=? WHERE uid=?", (p.bio, t, p.uid))
+            if pr["photo"] is not None and pr["photo"] != (tg.avatar_id(p.uid) or ""):
+                tg.forget_avatar(p.uid)  # the next request downloads the new one
+                p.photo, changed = f"/api/avatar/{p.uid}?v={int(t)}", True
+            if changed:
+                await self.bcast_part(p)
 
     async def kick(self, uid: int, reason: str = ""):
         p = self.parts.get(uid)

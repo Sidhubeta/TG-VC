@@ -1266,3 +1266,84 @@ input[type=range] { color: var(--accent); }
 .trk, .prow, .msg, .sheet .row { content-visibility: auto; contain-intrinsic-size: auto 60px; }
 /* toasts come down from the very top, like iOS banners (they used to cover the music card's buttons) */
 #toasts { top: calc(var(--top-safe) + 8px); }
+
+/* =====================================================================
+   Liquid glass, the whole app (iOS 26 look)
+   Glass only reads as glass when there's colour behind it: the room was black, so the glass looked grey.
+   Now the song's colours light the background (static gradients: nothing moves behind the glass, so it costs
+   no frames), and every surface is glass: a see-through fill, a bright rim on top, a soft shadow under it.
+   Real blur stays only on the small floating pieces (cheap); big surfaces don't need it over soft colour.
+   ===================================================================== */
+@property --c1 { syntax: '<color>'; inherits: true; initial-value: #10243d; }
+@property --c2 { syntax: '<color>'; inherits: true; initial-value: #1a3a5c; }
+@property --c3 { syntax: '<color>'; inherits: true; initial-value: #0b1420; }
+:root { transition: --c1 1.4s ease, --c2 1.4s ease, --c3 1.4s ease; --c1: #1f3f7a; --c2: #5a3a8c; --c3: #0e4a5c;
+  --lg-fill: linear-gradient(160deg, rgba(255, 255, 255, .15), rgba(255, 255, 255, .05) 55%, rgba(255, 255, 255, .08));
+  --lg-rim: rgba(255, 255, 255, .2);
+  --lg-shine: inset 0 1px 0 rgba(255, 255, 255, .28), inset 0 -.5px 0 rgba(255, 255, 255, .08);
+  --lg-drop: 0 10px 30px rgba(0, 0, 0, .28); }
+#aura { inset: 0 !important; opacity: 1 !important; filter: none !important; animation: none;
+  background:
+    radial-gradient(110% 60% at 10% -5%, var(--c1), transparent 62%),
+    radial-gradient(80% 55% at 105% 28%, var(--c2), transparent 64%),
+    radial-gradient(120% 70% at 20% 108%, var(--c3), transparent 66%),
+    #000; }
+#aura i { display: none; }
+#grain { opacity: 1 !important; background: linear-gradient(180deg, rgba(0, 0, 0, .18), rgba(0, 0, 0, .42) 70%, rgba(0, 0, 0, .55)) !important; }
+
+/* glass surfaces */
+.plist, .np-card, #room .list, .sheet .list, .stat, .pl-card {
+  background: var(--lg-fill) !important; border: .5px solid var(--lg-rim);
+  box-shadow: var(--lg-shine), var(--lg-drop); }
+.plist, .np-card { border-radius: 24px; }
+.sheet .list, #room .list { border-radius: 20px; }
+.prow + .prow::before, .row + .row::before { background: rgba(255, 255, 255, .09); }
+.np-card .art { border-radius: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, .35); }
+
+/* floating pieces: real blur, rounder, a little lift */
+.top .icon-btn, .dk .c, .close-x, .np .round, .vbtn, .fv-close, .br-close, .br-back {
+  background: var(--lg-fill) !important; border: .5px solid var(--lg-rim) !important; box-shadow: var(--lg-shine), var(--lg-drop) !important; }
+.dk.on .c { background: rgba(255, 255, 255, .92) !important; color: #000; }
+.dk.red .c { background: linear-gradient(160deg, rgba(255, 69, 58, .55), rgba(255, 69, 58, .28)) !important; border-color: rgba(255, 120, 110, .45) !important; }
+.mic .blob { box-shadow: inset 0 1.5px 0 rgba(255, 255, 255, .45), inset 0 -2px 6px rgba(0, 0, 0, .2), 0 12px 34px rgba(0, 0, 0, .35); }
+.mic.wait .blob { background: var(--lg-fill); border: .5px solid var(--lg-rim); }
+.toast, .cpop, #composer { background: rgba(40, 40, 46, .6) !important; border: .5px solid rgba(255, 255, 255, .2) !important;
+  box-shadow: var(--lg-shine), 0 12px 32px rgba(0, 0, 0, .4) !important; }
+.toast { border-radius: 26px; }
+.toast.err { background: rgba(255, 69, 58, .82) !important; }
+.searchbar, .field, .seg, .chip, #cmp-input { border: .5px solid rgba(255, 255, 255, .12); }
+.seg button.on { background: rgba(255, 255, 255, .22) !important; box-shadow: var(--lg-shine), 0 2px 8px rgba(0, 0, 0, .25); border-radius: 9px; }
+.switch.on { box-shadow: inset 0 1px 0 rgba(255, 255, 255, .25); }
+
+/* sheets float above the room like iOS 26: inset from the edges, very round, see-through with blur */
+.sheet { --card: rgba(255, 255, 255, .08); --card2: rgba(255, 255, 255, .14);
+  background: rgba(30, 30, 34, .74) !important;
+  -webkit-backdrop-filter: blur(34px) saturate(1.9) !important; backdrop-filter: blur(34px) saturate(1.9) !important;
+  border: .5px solid rgba(255, 255, 255, .18); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), 0 -10px 50px rgba(0, 0, 0, .5); }
+@media (max-width: 600px) {
+  .sheet { left: 8px; right: 8px; bottom: calc(8px + var(--safe-b) * .3); border-radius: 32px; }
+  .sheet .sh-body { padding-bottom: calc(16px + var(--safe-b) * .7); }
+}
+.backdrop { background: rgba(0, 0, 0, .35); }
+
+/* the Apple Music page gets the same light behind it */
+.br { background: transparent !important; }
+.br::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: linear-gradient(180deg, rgba(0, 0, 0, .3), rgba(0, 0, 0, .82) 50%, #000 85%),
+    radial-gradient(110% 55% at 0% -5%, var(--c1), transparent 60%), radial-gradient(90% 50% at 110% 40%, var(--c2), transparent 62%), #000; }
+.br .list, .top-res, .br .searchbar { background: var(--lg-fill) !important; border: .5px solid var(--lg-rim); box-shadow: var(--lg-shine); }
+.br-tabs, .br-mini { border-radius: 30px !important; border: .5px solid rgba(255, 255, 255, .22) !important;
+  background: rgba(40, 40, 46, .55) !important; box-shadow: var(--lg-shine), 0 12px 34px rgba(0, 0, 0, .45) !important; }
+
+/* iOS press feel: glass squishes a little and springs back */
+.top .icon-btn, .dk .c, .np-card, .close-x, .np .round, .chip, .seg button, .btn {
+  transition: transform .45s cubic-bezier(.2, 1.4, .4, 1), background .25s; }
+.top .icon-btn:active, .dk:active .c, .close-x:active, .np .round:active, .chip:active, .btn:active { transform: scale(.9); }
+.np-card:active { transform: scale(.98); }
+.prow:active, button.row:active { background: rgba(255, 255, 255, .1) !important; }
+
+/* phones that ask for less: no see-through, no blur */
+@media (prefers-reduced-transparency: reduce) {
+  .sheet, .toast, .cpop, #composer, .br-tabs, .br-mini { background: rgba(28, 28, 30, .97) !important;
+    -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+}

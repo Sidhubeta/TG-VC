@@ -66,7 +66,7 @@ function showJoin() {
   $('#gate').hidden = false;
   $('#gate').classList.add('join');
   $('#gate').querySelector('.box').replaceChildren(
-    avatarEl({ uid: S.chat, name: S.group || 'Group', photo: S.chat ? `/api/avatar/${S.chat}` : '' }, 'join-av'),
+    avatarEl({ uid: S.chat, name: S.group || 'Group', photo: S.chat ? (S.groupPhoto || `/api/avatar/${S.chat}`) : '' }, 'join-av'),
     h('h1', null, S.room?.settings?.title || S.group || 'Voice Chat'),
     h('p', null, S.parts?.size ? (n ? `${n} ${n === 1 ? 'person is' : 'people are'} here` : 'Nobody else is here yet') : 'Connecting…'),
     n ? h('div', { class: 'join-faces' }, ...parts.slice(0, 5).map(p => avatarEl(p, 'jf'))) : null,
@@ -178,6 +178,7 @@ function renderHeader() {
   $('#r-lock').hidden = !s.locked;
   const d = $('#r-desc'); d.hidden = !s.description; d.textContent = s.description || '';
 }
+on('ws:group', (m) => { S.group = m.group || S.group; S.groupPhoto = m.photo; renderHeader(); }); // (the group's new name / photo)
 on('ws:room', (m) => { S.room = m.room; renderHeader(); renderDock(); refreshMusic(); emit('room:changed'); });
 $('#b-search').onclick = () => openSearch('home');
 $('#b-admin').onclick = () => openMore();

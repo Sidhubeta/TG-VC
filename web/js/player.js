@@ -298,10 +298,22 @@ function sync(force = false) {
   let speed = r;
   if (audio.readyState >= 1 && !P.localPaused) {
     const drift = audio.currentTime - exp;
-    // Big gaps: jump. In the background timers run late, so only big jumps are corrected there.
+    // How far behind the last jump landed (on slow internet the player waits for data after a jump, and came
+    // back a second behind the room: at 2% catch-up that took most of the song, an echo between phones). The
+    // next jump aims that much ahead.
+    if (jumped && want && !audio.paused && audio.readyState >= 3 && Date.now() - jumped > 600) {
+      if (Math.abs(drift) > 0.1) jumpLead = Math.max(0, Math.min(3, jumpLead - drift * (drift < 0 ? 1 : 0.5)));
+      jumped = 0;
+    }
+    // Big gaps: jump. In the background timers run late, so only big jumps are corrected there. A medium gap
+    // jumps too when the sound there is already downloaded (the jump is instant then).
     const limit = document.hidden ? 4 : 1.2;
-    if ((force && Math.abs(drift) > 0.35 && !document.hidden) || Math.abs(drift) > limit || (!want && Math.abs(drift) > 0.5)) {
-      try { audio.currentTime = exp; } catch {}
+    const mid = want && !document.hidden && Math.abs(drift) > 0.35 && Date.now() - jumpedAt > 1500;
+    if ((force && Math.abs(drift) > 0.35 && !document.hidden) || Math.abs(drift) > limit || (!want && Math.abs(drift) > 0.5) ||
+        (mid && hasData(exp + 0.1))) {
+      const ahead = want && !hasData(exp + 0.1) ? jumpLead * r : 0;
+      try { audio.currentTime = exp + ahead; } catch {}
+      if (want) jumped = jumpedAt = Date.now();
       fine = 0;
     } else if (want && keepPitch && !document.hidden) {
       // Small gaps (everyone a bit apart): play 2% faster/slower until we're within 0.04 s. With the pitch kept,
@@ -337,6 +349,13 @@ function sync(force = false) {
   syncVideo();
 }
 let fine = 0; // -1 slower, 0 normal, +1 faster (small catch-up on the audio)
+let jumped = 0, jumpedAt = 0, jumpLead = 0.3;
+// the player already has the sound at this time (jumping there plays at once, no waiting for the network)
+function hasData(t) {
+  const b = audio.buffered;
+  for (let i = 0; i < b.length; i++) if (b.start(i) <= t && b.end(i) >= t + 0.5) return true;
+  return false;
+}
 setInterval(sync, 700);
 
 // The video (muted) is kept on the audio's clock 4x a second. Small gaps are closed by playing the video a little

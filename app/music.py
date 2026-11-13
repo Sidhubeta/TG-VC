@@ -52,7 +52,7 @@ except Exception as _e:  # a broken value: say so and go on without cookies (it 
 
 _info_cache: dict[str, tuple[float, dict]] = {}
 _raw: dict[str, tuple[float, dict]] = {}  # vid -> (when, yt-dlp's full answer): what a download by yt-dlp starts from
-STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": ""}  # for the admins' Health page
+STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": "", "dl_ok_at": 0.0, "dl_err_at": 0.0, "dl_err": ""}  # Health page
 REFUSED: "deque[float]" = deque(maxlen=500)  # when YouTube refused a song link (403/410)
 
 
@@ -66,6 +66,34 @@ def youtube_blocking() -> bool:
 def refused_last_hour() -> int:
     cut = time.time() - 3600
     return sum(1 for t in REFUSED if t > cut)
+
+
+async def download_test() -> dict:
+    """For the Health page's Test button: look a tiny public video up AND download its sound, the way songs are
+    cached. The lookup alone passed while YouTube refused every song file."""
+    vid, t = "jNQXAC9IVRw", time.time()
+    try:
+        info = await resolve(vid, force=True)
+    except Exception as e:
+        return {"ok": False, "detail": f"YouTube lookup failed: {str(e)[:200]}"}
+    f = pick_audio(info, "aac", "low") or pick_audio(info, "opus", "low")
+    if not f:
+        return {"ok": False, "detail": "YouTube gave no audio formats" + _warn_tail()}
+    out = os.path.join(CACHE_DIR, f"test_{int(t)}.dl")
+    try:
+        await asyncio.get_running_loop().run_in_executor(_DL_POOL, _ytdlp_download, vid, f, out, 20 * 1024 * 1024)
+        size = os.path.getsize(out)
+        return {"ok": True, "detail": f"YouTube works: lookup + download ({size // 1024} KB) in {time.time() - t:.1f} s"}
+    except Exception as e:
+        return {"ok": False, "detail": f"Lookup works, but YouTube refused the download: {str(e)[:150]}" + _warn_tail()}
+    finally:
+        if os.path.exists(out):
+            os.remove(out)
+
+
+def _warn_tail() -> str:
+    recent = [w for ts, w in WARNINGS if time.time() - ts < 3600]
+    return (" · yt-dlp says: " + recent[-1][:200]) if recent else ""
 
 
 async def pot_check() -> dict:
@@ -121,20 +149,55 @@ def _bg(fn, *args, **kw):
     return loop.run_in_executor(_POOL, lambda: fn(*args, **kw))
 
 
+# yt-dlp's warnings say why YouTube refuses songs ("PO token required", "SABR", "n challenge failed"…). They were
+# thrown away, so a server whose every song link got 403 showed nothing but the 403. Each different warning is logged
+# (once an hour) and the latest ones are on the Health page.
+WARNINGS: "deque[tuple[float, str]]" = deque(maxlen=12)
+_warned: dict[str, float] = {}
+
+
 class _QuietLog:
     def debug(self, msg): pass
     def info(self, msg): pass
-    def warning(self, msg): pass
+
+    def warning(self, msg):
+        text = re.sub(r"\b[\w-]{11}\b", "…", str(msg))[:300]  # (one line per kind, not per song)
+        now = time.time()
+        if now - _warned.get(text, 0) > 3600:
+            _warned[text] = now
+            if len(_warned) > 200:
+                _warned.clear()
+            log.warning("yt-dlp warning: %s", text)
+            WARNINGS.append((now, text))
+
     def error(self, msg): log.info("yt-dlp: %s", str(msg)[:300])
 
 
+def _extractor_args() -> dict:
+    """YouTube settings for yt-dlp. With a PO token provider, a token is fetched for every request (also the song
+    files, where YouTube answers 403 after the first part without one). YT_EXTRACTOR_ARGS adds or overrides settings
+    the way yt-dlp's --extractor-args does, e.g. "youtube:player_client=tv,web_safari" (several: separated by spaces)."""
+    args: dict = {}
+    if config.POT_PROVIDER_URL:
+        args["youtubepot-bgutilhttp"] = {"base_url": [config.POT_PROVIDER_URL]}
+        args["youtube"] = {"fetch_pot": ["always"]}
+    for part in config.YT_EXTRACTOR_ARGS.split():
+        ie, _, kv = part.partition(":")
+        for item in kv.split(";"):
+            k, _, v = item.partition("=")
+            if ie and k:
+                args.setdefault(ie.lower(), {})[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
+    return args
+
+
 def _opts(**extra) -> dict:
-    o = {"logger": _QuietLog(), "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+    o = {"logger": _QuietLog(), "quiet": True, "no_warnings": False, "skip_download": True, "noplaylist": True,
          "socket_timeout": 15, "retries": 3, "extractor_retries": 2}
     if os.path.exists(COOKIE_FILE):
         o["cookiefile"] = COOKIE_FILE
-    if config.POT_PROVIDER_URL:
-        o["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [config.POT_PROVIDER_URL]}}
+    ea = _extractor_args()
+    if ea:
+        o["extractor_args"] = ea
     o.update(extra)
     return o
 
@@ -568,11 +631,12 @@ def _ytdlp_download(vid: str, fmt: dict, out: str, limit: int) -> None:
 
 async def _download(vid: str, fmt: dict, retry: bool = True):
     path = _fmt_path(vid, fmt)
-    tmp = path + ".dl.part"
+    tmp = path + ".dl"  # (not ".part": yt-dlp takes that off the name it writes, and the file wasn't found)
     limit = MAX_VIDEO_FILE if fmt["vcodec"] != "none" else MAX_AUDIO_FILE
     try:
         await asyncio.get_running_loop().run_in_executor(_DL_POOL, _ytdlp_download, vid, fmt, tmp, limit)
         os.replace(tmp, path)
+        STATS["dl_ok_at"] = time.time()
         await asyncio.to_thread(_trim_cache)
         if fmt["vcodec"] == "none":
             spawn_analyze(vid, path)
@@ -583,6 +647,9 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
         msg = str(e)
         if "403" in msg or "Forbidden" in msg:
             REFUSED.append(time.time())
+            STATS["dl_err"], STATS["dl_err_at"] = msg[:200], time.time()
+            log.info("yt-dlp download refused %s/%s: %s", vid, fmt["id"], msg[:200])
+            return  # (the plain way gets the same 403: one more request that only marks the server)
         log.info("yt-dlp download failed %s/%s, trying the plain way: %s", vid, fmt["id"], msg[:200])
     await _download_plain(vid, fmt, retry)
 
@@ -642,7 +709,7 @@ def _trim_cache(squeeze: bool = False, startup: bool = False):
     """Keep the cache in its limits. squeeze: the disk is nearly full, keep only half."""
     # downloads that died (a crash, a restart) leave .part files: they count for nothing and are removed
     for f in os.listdir(CACHE_DIR):
-        if f.endswith(".part"):
+        if f.endswith((".part", ".dl")):
             fp = os.path.join(CACHE_DIR, f)
             try:
                 if startup or time.time() - os.path.getmtime(fp) > 1800:  # (at start nothing is downloading)

@@ -41,6 +41,11 @@ POT_PROVIDER_URL = _env("POT_PROVIDER_URL")  # bgutil PO token provider, e.g. ht
 # extra yt-dlp settings, like its --extractor-args: e.g. "youtube:player_client=tv,web_safari" (try other clients
 # when YouTube refuses the song files)
 YT_EXTRACTOR_ARGS = _env("YT_EXTRACTOR_ARGS")
+# YouTube blocks datacenter addresses ("Sign in to confirm you're not a bot", 429, 403). YT_WARP=1 sends every YouTube
+# request through Cloudflare WARP (free, built into the image); YT_PROXY uses your own proxy instead, e.g. a paid
+# residential one: http://user:pass@host:port or socks5://host:port
+YT_WARP = _env("YT_WARP").lower() in ("1", "true", "yes", "on")
+YT_PROXY = _env("YT_PROXY")
 AUDIO_CACHE_MB = _int("AUDIO_CACHE_MB", 800)
 VIDEO_CACHE_MB = _int("VIDEO_CACHE_MB", 600)  # 0 = don't cache videos
 # The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)

@@ -166,7 +166,7 @@ async def _source_args(room, ahead=0.0) -> list[str] | None:
         return None
     args = []
     if headers:
-        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())] + music.ffmpeg_proxy()
     args += ["-ss", f"{max(0.0, pos):.3f}", "-i", src]
     fl = _filters(room.fx)
     if fl:

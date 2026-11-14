@@ -4,6 +4,7 @@ import base64
 import logging
 import os
 import re
+import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from starlette.requests import Request
 from starlette.responses import FileResponse, Response, StreamingResponse
 
-from . import config
+from . import config, warp
 from .http import httpx
 
 log = logging.getLogger("music")
@@ -127,14 +128,30 @@ def http() -> httpx.AsyncClient:
 _sthttp: httpx.AsyncClient | None = None
 
 
+_sthttp_proxy: str | None = None
+
+
 def stream_http() -> httpx.AsyncClient:
     """Song streams and downloads. Each listener's stream holds a connection for the whole song; on the shared
-    client (100 connections) a big room used up the pool and thumbnails, lyrics and new streams timed out."""
-    global _sthttp
-    if _sthttp is None:
+    client (100 connections) a big room used up the pool and thumbnails, lyrics and new streams timed out.
+    Through the YouTube proxy when there is one (song links only work from the address that looked them up)."""
+    global _sthttp, _sthttp_proxy
+    proxy = warp.proxy_url()
+    if _sthttp is None or proxy != _sthttp_proxy:
+        old = _sthttp
+        _sthttp_proxy = proxy
         _sthttp = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10, pool=20), follow_redirects=True,
-                                    limits=httpx.Limits(max_connections=600, max_keepalive_connections=60))
+                                    limits=httpx.Limits(max_connections=600, max_keepalive_connections=60),
+                                    **({"proxy": proxy} if proxy else {}))
+        if old is not None:  # (requests still running on the old one finish; it's closed a minute later)
+            asyncio.get_running_loop().call_later(60, lambda: asyncio.ensure_future(old.aclose()))
     return _sthttp
+
+
+def ffmpeg_proxy() -> list[str]:
+    """ffmpeg arguments for reading a YouTube link through the proxy (ffmpeg takes HTTP proxies only)."""
+    p = warp.proxy_url()
+    return ["-http_proxy", p] if p and p.startswith("http") else []
 
 
 # yt-dlp and ffmpeg work (seconds each) runs on its own threads, so it can't hold up anything else
@@ -230,6 +247,8 @@ def _opts(level: int | None = None, **extra) -> dict:
          "socket_timeout": 15, "retries": 3, "extractor_retries": 2}
     if os.path.exists(COOKIE_FILE) and level < 1:
         o["cookiefile"] = COOKIE_FILE
+    if proxy := warp.proxy_url():
+        o["proxy"] = proxy
     ea = _extractor_args(level)
     if ea:
         o["extractor_args"] = ea
@@ -441,9 +460,17 @@ async def match(song: dict) -> dict | None:
     return res[0]
 
 
+_LOOKUPS = threading.BoundedSemaphore(2)
+
+
 def _extract(url: str, **extra) -> dict:
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed")
+    with _LOOKUPS:  # (at most two at once: bursts of lookups were answered with 429 Too Many Requests)
+        return _extract_now(url, **extra)
+
+
+def _extract_now(url: str, **extra) -> dict:
     start = _cur_level()
     err = None
     for n in _levels_from(start):
@@ -1066,7 +1093,7 @@ def _piece_source(info: dict, vid: str) -> tuple[str, dict]:
 async def _encode_piece(src: str, headers: dict, at: float, kbps: int) -> bytes:
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     if headers:
-        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())] + ffmpeg_proxy()
     args += ["-ss", f"{at:.3f}", "-i", src, "-t", f"{PIECE + PIECE_OVERLAP:.3f}", "-vn", "-ac", "2", "-ar", "48000",
              "-c:a", "libopus", "-b:a", f"{kbps}k", "-f", "ogg", "pipe:1"]
     async with _piece_sem:

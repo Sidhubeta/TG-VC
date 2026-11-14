@@ -73,7 +73,7 @@ async def _source(room):
     log.info("radio: %s from %.1f s%s", c["id"], pos, f" at x{rate}" if rate != 1 else "")
     args = []
     if headers:
-        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())] + music.ffmpeg_proxy()
     args += ["-ss", f"{max(0.0, pos):.2f}", "-i", src]
     # The room's effect is made here (bass, mids, treble, reverb, 8D, Slowed / Nightcore): minimized, the phone
     # can't run its own effects, and the song used to play plain until the app was opened again.

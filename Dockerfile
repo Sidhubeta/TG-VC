@@ -6,6 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unz
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# Cloudflare WARP as a local proxy for YouTube (used when YT_WARP=1, see app/warp.py). If a download fails the
+# build still goes on; the Health page then says the tools are missing.
+RUN (curl -fsSL -o /usr/local/bin/wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 \
+      && chmod +x /usr/local/bin/wgcf) || echo "wgcf download failed"; \
+    (curl -fsSL https://github.com/whyvl/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz | tar -xz -C /usr/local/bin wireproxy \
+      && chmod +x /usr/local/bin/wireproxy) || echo "wireproxy download failed"
+
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 

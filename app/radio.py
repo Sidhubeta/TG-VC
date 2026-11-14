@@ -16,7 +16,7 @@ from collections import deque
 from . import music, voicemusic
 
 log = logging.getLogger("radio")
-KBPS = 96
+KBPS = 128  # (96 sounded thin)
 BPS = KBPS * 1000 // 8
 # How far ahead of real time the music is made and sent. Minimized, Telegram can slow the app's network down: a
 # few seconds ahead stopped the music shortly after minimizing. Silence (pause, between songs) only just ahead, so

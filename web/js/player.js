@@ -682,7 +682,7 @@ function waEnter() {
 function waPos(s) { return s.pos + (s.gain.context.currentTime - s.at) * s.rate; }
 // effects on: through the effects graph (it sets the volume); else our own volume
 function waOut(c) {
-  if (G) return G.bass;
+  if (G) return G.master;
   if (!WA.vol) { WA.vol = c.createGain(); WA.vol.gain.value = P.vol; WA.vol.connect(c.destination); }
   return WA.vol;
 }
@@ -834,15 +834,6 @@ export async function pip(v) {
 }
 
 // ======================= effects (WebAudio) =======================
-function impulse(c, secs, decay) {
-  const len = Math.floor(c.sampleRate * secs);
-  const buf = c.createBuffer(2, len, c.sampleRate);
-  for (let ch = 0; ch < 2; ch++) {
-    const d = buf.getChannelData(ch);
-    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
-  }
-  return buf;
-}
 let tapped = false;
 // Android: the song always plays the way it does with an effect on (through Web Audio, set flat: it sounds the
 // same as without). People found the music steady that way when Telegram is minimized, and not without an effect
@@ -855,16 +846,15 @@ export function setSteady(v) {
   reportCaps();
 }
 const needGraph = () => {
-  if (viaVoice()) return false; // (the server makes the effects for everyone)
-  const f = fx();
-  return tapped || steadyOn() || f.mode !== 'none' || !!(f.bass || f.mid || f.treble || f.reverb) || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
+  if (viaVoice()) return false; // (the music comes through the voice chat)
+  return tapped || steadyOn() || (isApple && P.vol < 0.99); // iPhone ignores <audio>.volume
 };
 // effects switched off: move the song back to a plain <audio> element (keeps playing where it was)
 function releaseGraph(force = false) {
   if (!G || (needGraph() && !force)) return;
   // Moving the song to a fresh <audio> needs one a tap has unlocked (else it's silent on iPhone / Telegram Android).
   // Without one, the song stays on the effects graph (now set flat) until the next tap brings a spare.
-  if (!spare?.__ok) { applyFx(FX_NONE); return; }
+  if (!spare?.__ok) return; // (stays on the graph, a plain volume, until a tap gives a spare player)
   const old = audio, src = old.getAttribute('src'), was = !old.paused;
   // a fresh element would need a new tap on iPhone: use the spare one that a tap already unlocked
   audio = spare; spare = null;
@@ -876,54 +866,22 @@ function releaseGraph(force = false) {
   try { G.master.disconnect(); } catch {}
   G = null;
 }
+// The song through Web Audio (Android's steady mode, a recording, an iPhone turned down): just a volume, nothing
+// else. It used to run through the effects' filters, reverb and a compressor even with no effect on, and the
+// compressor squeezed every song: the music sounded flat and muffled.
 function buildGraph() {
   if (G) return;
   const c = getCtx(); if (!c) return;
   try {
     const src = c.createMediaElementSource(audio);
-    const bass = c.createBiquadFilter(); bass.type = 'lowshelf'; bass.frequency.value = 110;
-    const mid = c.createBiquadFilter(); mid.type = 'peaking'; mid.frequency.value = 1300; mid.Q.value = 0.9;
-    const treble = c.createBiquadFilter(); treble.type = 'highshelf'; treble.frequency.value = 7000;
-    const pan = c.createStereoPanner ? c.createStereoPanner() : c.createGain();
-    const lfo = c.createOscillator(); lfo.frequency.value = 0.11;
-    const lfoAmt = c.createGain(); lfoAmt.gain.value = 0;
-    lfo.connect(lfoAmt); if (pan.pan) lfoAmt.connect(pan.pan); lfo.start();
-    const dry = c.createGain();
-    const conv = c.createConvolver(); conv.buffer = impulse(c, 2.6, 2.4);
-    const wet = c.createGain(); wet.gain.value = 0;
-    const comp = c.createDynamicsCompressor(); comp.threshold.value = -12; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.2;
     const master = c.createGain(); master.gain.value = P.vol;
-    src.connect(bass).connect(mid).connect(treble).connect(pan);
-    pan.connect(dry).connect(comp);
-    pan.connect(conv).connect(wet).connect(comp);
-    comp.connect(master).connect(c.destination);
-    G = { c, bass, mid, treble, pan, lfoAmt, dry, wet, master };
-    applyFx();
+    src.connect(master).connect(c.destination);
+    G = { c, master };
     const sink = store.get('dev:audiooutput', '');
     if (sink) setMusicSink(sink);
-  } catch (e) { console.warn('fx graph failed', e); }
+  } catch (e) { console.warn('music graph failed', e); }
 }
-// Effects that change only small details or needed headphones to notice (Spatial 3D, Treble) were dropped.
-const PRESETS = {
-  normal: { label: 'Normal', e: '🎵', v: { bass: 0, mid: 0, treble: 0, reverb: 0, rate: 1, mode: 'none' } },
-  bass: { label: 'Bass Boost', e: '🔊', v: { bass: 9, mid: 0, treble: 1, reverb: 0, rate: 1, mode: 'none' } },
-  '8d': { label: '8D Audio', e: '🎧', v: { bass: 2, mid: 0, treble: 1, reverb: 0.22, rate: 1, mode: '8d' } },
-  hall: { label: 'Concert Hall', e: '🏛️', v: { bass: 2, mid: 0, treble: 1, reverb: 0.5, rate: 1, mode: 'none' } },
-  vocal: { label: 'Vocal', e: '🎤', v: { bass: -4, mid: 6, treble: 3, reverb: 0.05, rate: 1, mode: 'none' } },
-  slowed: { label: 'Slowed + Reverb', e: '🌙', v: { bass: 3, mid: 0, treble: -1, reverb: 0.42, rate: 0.85, mode: 'none' } },
-  nightcore: { label: 'Nightcore', e: '⚡', v: { bass: 1, mid: 0, treble: 2, reverb: 0, rate: 1.25, mode: 'none' } },
-};
-function applyFx(f = fx()) {
-  if (!G) return;
-  const t = G.c.currentTime;
-  G.bass.gain.setTargetAtTime(f.bass, t, 0.02);
-  G.mid.gain.setTargetAtTime(f.mid, t, 0.02);
-  G.treble.gain.setTargetAtTime(f.treble, t, 0.02);
-  G.wet.gain.setTargetAtTime(f.reverb * 1.4, t, 0.04);
-  G.dry.gain.setTargetAtTime(1 - f.reverb * 0.35, t, 0.04);
-  G.lfoAmt.gain.setTargetAtTime(f.mode === '8d' ? 0.95 : 0, t, 0.04);
-  if (f.mode !== '8d' && G.pan.pan) G.pan.pan.setTargetAtTime(0, t, 0.04);
-}
+function applyFx() {} // (sound effects were removed)
 function setVol(v) {
   P.vol = v; store.set('vol', v);
   if (viaVoice()) return setMusicVoice({ vol: v });
@@ -1141,7 +1099,6 @@ function buildNP() {
         h('button', { id: 'tab-lyr', 'aria-label': 'Lyrics', onclick: () => setView(NP.view === 'lyrics' ? 'art' : 'lyrics') }, icon('lyrics')),
         h('button', { id: 'tab-vid', 'aria-label': 'Audio or video', onclick: toggleMode }, icon('video')),
         h('button', { id: 'tab-hq', 'aria-label': 'Quality', onclick: openQuality }, icon('hq')),
-        h('button', { id: 'tab-fx', 'aria-label': 'Sound effects', onclick: openFx }, icon('sparkle')),
         h('button', { id: 'tab-q', 'aria-label': 'Queue', onclick: () => setView(NP.view === 'queue' ? 'art' : 'queue') }, icon('queue')))));
   document.body.append(el);
   dragToClose(el, [el.querySelector('.grab'), el.querySelector('.info')], closeNP);
@@ -1250,7 +1207,6 @@ export function refresh() {
   const lk = el.querySelector('#np-like'), liked = S.liked.has(t.id) ? '1' : '0';
   if (lk.dataset.on !== liked) { lk.dataset.on = liked; lk.replaceChildren(icon('heart', liked === '1' ? 'fill' : '')); }
   el.querySelector('#tab-vid').classList.toggle('on', isVideo());
-  el.querySelector('#tab-fx').classList.toggle('on', fx().preset !== 'normal');
   if (NP.view === 'queue' && queueSig() !== NP.qsig) renderStage();
 }
 const queueSig = () => { const m = S.music; return [m.loop, m.autoplay, can('queue'), can('modes'), can('add'), ...m.queue.map(q => q.qid + q.title + q.by)].join('|'); };
@@ -1471,57 +1427,6 @@ async function openQuality() {
   const setVq = (q) => { P.vq = Number(q); store.set('vq', P.vq); delete video.dataset.src; if (isVideo()) loadVideo(); render(); };
   render();
   if (t) { try { P.heights = (await api(`/api/formats/${t.id}`)).heights; render(); } catch {} }
-}
-
-// ======================= effects sheet =======================
-// Everyone hears the same effect. Only admins, or whoever added the playing song, can change it.
-const canFx = () => can('fx') || (!!cur() && mine(cur()) && can('fx_own'));
-function openFx() {
-  unlockAudio();
-  const body = h('div');
-  let draft = { ...fx() }, tmr = null;
-  // you hear your change at once (EQ / reverb / 8D); the server then applies it for everyone, speed included
-  // (with the music in the voice chat the server makes the effect: nothing to preview on this phone)
-  const preview = () => { if (!viaVoice()) { buildGraph(); applyFx(draft); } };
-  const push = () => { preview(); clearTimeout(tmr); tmr = setTimeout(() => send({ t: 'music.fx', fx: draft }), 80); };
-  const slider = (key, label, min, max, step, fmt, allowed) => {
-    const out = h('output', null, fmt(draft[key]));
-    const r = h('input', { type: 'range', min, max, step, value: draft[key], 'aria-label': label });
-    const paint = () => r.style.setProperty('--v', ((r.value - min) / (max - min) * 100) + '%');
-    r.oninput = () => {
-      draft[key] = Number(r.value); draft.preset = 'custom'; out.textContent = fmt(draft[key]); paint(); push();
-      body.querySelectorAll('.fx').forEach(b => b.classList.remove('on'));
-    };
-    paint();
-    // not allowed: the slider can't move, and tapping it says why (in red)
-    return h('div', { class: 'slider-row' + (allowed ? '' : ' ro'), onclick: () => { if (!allowed) deny('fx'); } }, h('label', null, label), r, out);
-  };
-  const render = () => {
-    draft = { ...fx() };
-    const allowed = canFx();
-    body.replaceChildren(
-      allowed ? null : h('p', { class: 'muted', style: { fontSize: '13px', margin: '0 0 6px' } }, 'You can’t change the sound of this song.'),
-      h('div', { class: 'fx-grid' }, ...Object.entries(PRESETS).map(([k, p]) =>
-        h('button', { class: 'fx' + (draft.preset === k ? ' on' : '') + (allowed ? '' : ' locked'), onclick: (e) => { if (!allowed) return deny('fx'); draft = { ...p.v, preset: k }; if (!viaVoice()) { if (k !== 'normal') buildGraph(); applyFx(draft); } send({ t: 'music.fx', fx: draft }); haptic('select');
-          body.querySelectorAll('.fx').forEach(b => b.classList.toggle('on', b === e.currentTarget)); } }, h('span', null, p.e), p.label))),
-      slider('bass', 'Bass', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
-      slider('mid', 'Mids', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
-      slider('treble', 'Treble', -12, 12, 1, v => (v > 0 ? '+' : '') + v + ' dB', allowed),
-      slider('reverb', 'Reverb', 0, 0.8, 0.01, v => Math.round(v * 100) + '%', allowed),
-      slider('rate', 'Speed', 0.7, 1.4, 0.05, v => Number(v).toFixed(2) + '×', allowed),
-      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '12px' } }, 'Everyone hears this effect.'));
-  };
-  // redraw when someone else changes it (not on the echo of our own slider, which would break the drag)
-  const onFx = () => {
-    const f = fx(), same = ['bass', 'mid', 'treble', 'reverb', 'rate', 'mode'].every(k => String(f[k]) === String(draft[k]));
-    if (!same || f.preset !== draft.preset) render();
-  };
-  on('music:fx', onFx);
-  on('music:changed', onFxOwner);
-  let owner = canFx();
-  function onFxOwner() { if (canFx() !== owner) { owner = canFx(); render(); } }
-  sheet({ title: 'Sound effects', body, onClose: () => { off('music:fx', onFx); off('music:changed', onFxOwner); } });
-  render();
 }
 
 // ======================= search + library =======================

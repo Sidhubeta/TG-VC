@@ -51,7 +51,6 @@ except Exception as _e:  # a broken value: say so and go on without cookies (it 
     log.error("YT_COOKIES_B64 / YT_COOKIES couldn't be read, going on without cookies: %s", _e)
 
 _info_cache: dict[str, tuple[float, dict]] = {}
-_raw: dict[str, tuple[float, dict]] = {}  # vid -> (when, yt-dlp's full answer): what a download by yt-dlp starts from
 STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": "", "dl_ok_at": 0.0, "dl_err_at": 0.0, "dl_err": ""}  # Health page
 REFUSED: "deque[float]" = deque(maxlen=500)  # when YouTube refused a song link (403/410)
 
@@ -76,30 +75,17 @@ async def download_test() -> dict:
         info = await resolve(vid, force=True)
     except Exception as e:
         return {"ok": False, "detail": f"YouTube lookup failed: {str(e)[:200]}"}
-    f = pick_audio(info, "aac", "low") or pick_audio(info, "opus", "low")
+    f = pick_audio(info, "aac", "medium") or pick_audio(info, "opus", "medium")
     if not f:
         return {"ok": False, "detail": "YouTube gave no audio formats" + _warn_tail()}
-    out = os.path.join(CACHE_DIR, f"test_{int(t)}.dl")
-    try:
-        await asyncio.get_running_loop().run_in_executor(_DL_POOL, _ytdlp_download, vid, f, out, 20 * 1024 * 1024)
-        size = os.path.getsize(out)
-        return {"ok": True, "detail": f"YouTube works: lookup + download ({size // 1024} KB) in {time.time() - t:.1f} s"}
-    except Exception as e:
-        ytdlp_err = str(e)
-    finally:
-        if os.path.exists(out):
-            os.remove(out)
-    # songs are also fetched the plain way: try a piece of the file like that
-    try:
-        r = await stream_http().get(f["url"], headers={**f["headers"], "Range": "bytes=0-262143"})
-        if r.status_code in (200, 206) and r.content:
-            return {"ok": True, "detail": f"YouTube works (songs download the plain way; yt-dlp's own download was "
-                                          f"refused: {ytdlp_err[:90]})"}
-        plain = f"status {r.status_code}"
-    except Exception as e:
-        plain = str(e) or type(e).__name__
-    return {"ok": False, "detail": f"Lookup works, but YouTube refused the download (yt-dlp: {ytdlp_err[:100]}; plain: "
-                                   f"{plain[:40]})" + _warn_tail()}
+    before = STATS["dl_ok_at"]
+    path = _fmt_path(vid, f)
+    if os.path.exists(path):
+        os.remove(path)
+    await _download(vid, f)
+    if os.path.exists(path) and STATS["dl_ok_at"] > before:
+        return {"ok": True, "detail": f"YouTube works: lookup + download ({STATS['dl_via']}), {time.time() - t:.1f} s in all"}
+    return {"ok": False, "detail": f"Lookup works, but the download failed: {STATS['dl_err'][:150]}" + _warn_tail()}
 
 
 def _warn_tail() -> str:
@@ -558,9 +544,6 @@ async def resolve(vid: str, force: bool = False) -> dict:
         except Exception as e:
             STATS["yt_err"], STATS["yt_err_at"] = str(e)[:300], time.time()
             raise
-        _raw[vid] = (time.time(), info)
-        while len(_raw) > 30:
-            _raw.pop(next(iter(_raw)))
         STATS["yt_ok_at"] = time.time()
         fmts = []
         for f in info.get("formats") or []:
@@ -591,7 +574,9 @@ def pick_audio(info: dict, codec: str = "aac", quality: str = "medium") -> dict 
         return auds[0]
     if quality == "high":
         return auds[-1]
-    mid = [f for f in auds if (f["abr"] or f["tbr"]) <= 135]
+    # Standard: the full-quality sound YouTube has for most songs (Opus ~130-160 kbps, AAC 128 kbps). It used to stop
+    # at 135 kbps, which on Android (Opus) meant the 70 kbps file: the music sounded dull and muddy.
+    mid = [f for f in auds if (f["abr"] or f["tbr"]) <= 180]
     return mid[-1] if mid else auds[0]
 
 
@@ -665,94 +650,83 @@ def cacheable(info: dict, fmt: dict) -> bool:
     return True
 
 
-# Songs are downloaded into the cache by yt-dlp itself. Our own downloader (plain HTTP requests) sent no cookies and
-# none of what yt-dlp does for YouTube, and YouTube answered it with 403 — often after the first minute of a song,
-# while phones were playing it through the server: the song stopped at 0:22 or 1:05 and came back after a retry.
-# yt-dlp downloads the way YouTube expects (PO token, cookies, its chunking and retries). The plain downloader is
-# still there if yt-dlp can't.
-_DL_POOL = ThreadPoolExecutor(4, thread_name_prefix="dl")
+# Songs are downloaded into the cache in pieces, several at once. One request for the whole file came down slowly
+# (YouTube's servers send each connection at an even pace), and a phone waiting on it played through the server. With
+# four pieces of 1 MB in flight a song is on disk in a few seconds. (yt-dlp's own downloader was tried too: YouTube
+# refused it with 403 on Railway while this one worked, and it cost an extra request per song. One way now: this one.)
+PIECE_BYTES = 1024 * 1024
+PIECES_AT_ONCE = 4
+FIRST_BYTES = 256 * 1024
 
 
-def _ytdlp_download(vid: str, fmt: dict, out: str, limit: int) -> None:
-    if yt_dlp is None:
-        raise RuntimeError("yt-dlp is not installed")
-    import copy
-    opts = _opts(format=str(fmt["id"]), outtmpl={"default": out}, skip_download=False, noprogress=True,
-                 overwrites=True, nopart=True, continuedl=False, max_filesize=limit, http_chunk_size=10 * 1024 * 1024,
-                 retries=4, fragment_retries=4, file_access_retries=1, writeinfojson=False, writethumbnail=False,
-                 postprocessors=[], fixup="never", cachedir=False)
-    # Only from the lookup just made: a download never asks YouTube for the page again. Downloads that looked songs
-    # up again (once per format, and once more per setting tried) were several page requests per song, and YouTube
-    # answered with 429 "Too Many Requests" and "Sign in to confirm you're not a bot". Without a fresh lookup the
-    # plain downloader takes over (see _download).
-    hit = _raw.get(vid)
-    if not hit or time.time() - hit[0] > 1800:
-        raise _NoLookup("no fresh lookup to download from")
-    with yt_dlp.YoutubeDL(opts) as y:
-        y.process_ie_result(copy.deepcopy(hit[1]), download=True)
-    if not os.path.exists(out) or os.path.getsize(out) < 1024:
-        raise RuntimeError("yt-dlp wrote no file")
-
-
-class _NoLookup(Exception):
-    pass
+def _write_at(path: str, offset: int, data: bytes):
+    with open(path, "r+b") as fh:
+        fh.seek(offset)
+        fh.write(data)
 
 
 async def _download(vid: str, fmt: dict, retry: bool = True):
     path = _fmt_path(vid, fmt)
-    tmp = path + ".dl"  # (not ".part": yt-dlp takes that off the name it writes, and the file wasn't found)
-    limit = MAX_VIDEO_FILE if fmt["vcodec"] != "none" else MAX_AUDIO_FILE
-    try:
-        await asyncio.get_running_loop().run_in_executor(_DL_POOL, _ytdlp_download, vid, fmt, tmp, limit)
-        os.replace(tmp, path)
-        STATS["dl_ok_at"], STATS["dl_via"] = time.time(), "yt-dlp"
-        await asyncio.to_thread(_trim_cache)
-        if fmt["vcodec"] == "none":
-            spawn_analyze(vid, path)
-        return
-    except Exception as e:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        msg = str(e)
-        if "403" in msg or "Forbidden" in msg:
-            REFUSED.append(time.time())
-        if not isinstance(e, _NoLookup):
-            log.info("yt-dlp download failed %s/%s, trying the plain way: %s", vid, fmt["id"], msg[:200])
-    # The plain downloader: when yt-dlp can't (it's the one that works on some days: YouTube refuses one or the other)
-    await _download_plain(vid, fmt, retry)
-
-
-async def _download_plain(vid: str, fmt: dict, retry: bool = True):
-    path = _fmt_path(vid, fmt)
     tmp = path + ".part"
     limit = MAX_VIDEO_FILE if fmt["vcodec"] != "none" else MAX_AUDIO_FILE
+    client, headers = stream_http(), fmt["headers"]
+
+    async def get(a: int, b: int):
+        for attempt in range(3):
+            r = await client.get(fmt["url"], headers={**headers, "Range": f"bytes={a}-{b}"})
+            if r.status_code in (403, 410):
+                REFUSED.append(time.time())
+                raise _Expired()
+            if r.status_code in (200, 206) and r.content:
+                return r
+            if attempt == 2:
+                raise RuntimeError(f"status {r.status_code}")
+            await asyncio.sleep(0.5 * (attempt + 1))
+
+    t0 = time.time()
     try:
-        pos = 0
+        first = await get(0, FIRST_BYTES - 1)  # (small: it's mostly to learn the file's size, then the rest at once)
+        tail = first.headers.get("content-range", "/0").split("/")[-1].strip()
+        total = int(tail) if tail.isdigit() else 0  # ("*": length unknown)
+        if first.status_code == 200:
+            total = len(first.content)  # (the server sent the whole file)
+        if total > limit:
+            raise RuntimeError(f"too big to keep ({total // 2**20} MB)")
         with open(tmp, "wb") as fh:
+            fh.write(first.content)
+        if total and len(first.content) < total:
+            sem = asyncio.Semaphore(PIECES_AT_ONCE)
+
+            async def one(a: int, b: int):
+                async with sem:
+                    r = await get(a, b)
+                    if len(r.content) != b - a + 1:
+                        raise RuntimeError(f"short piece at {a}")
+                    await asyncio.to_thread(_write_at, tmp, a, r.content)
+            await asyncio.gather(*(one(a, min(a + PIECE_BYTES, total) - 1)
+                                   for a in range(len(first.content), total, PIECE_BYTES)))
+        elif not total and first.status_code == 206:
+            # length unknown: one piece after another until the server has no more
+            pos = len(first.content)
             while True:
-                r = await stream_http().get(fmt["url"], headers={**fmt["headers"], "Range": f"bytes={pos}-{pos + CHUNK - 1}"})
-                if r.status_code in (403, 410):
-                    REFUSED.append(time.time())
-                if r.status_code in (403, 410) and retry:
-                    raise _Expired()
-                if r.status_code not in (200, 206):
-                    raise RuntimeError(f"status {r.status_code}")
-                tail = r.headers.get("content-range", "/0").split("/")[-1].strip()
-                total = int(tail) if tail.isdigit() else 0  # ("*": length unknown)
-                if (total or 0) > limit or pos + len(r.content) > limit:
-                    raise RuntimeError(f"too big to keep ({max(total, pos) // 2**20} MB)")
-                await asyncio.to_thread(fh.write, r.content)  # (8 MB at a time: not on the loop that sends the music)
+                r = await get(pos, pos + PIECE_BYTES - 1)
+                await asyncio.to_thread(_write_at, tmp, pos, r.content)
                 pos += len(r.content)
-                if r.status_code == 200 or not r.content or (total and pos >= total):
+                if pos > limit:
+                    raise RuntimeError("too big to keep")
+                if len(r.content) < PIECE_BYTES:
                     break
         os.replace(tmp, path)
-        STATS["dl_ok_at"], STATS["dl_via"] = time.time(), "plain"
+        STATS["dl_ok_at"], STATS["dl_via"] = time.time(), f"{os.path.getsize(path) // 1024} KB in {time.time() - t0:.1f} s"
         await asyncio.to_thread(_trim_cache)  # (lists and sizes every file: a moment's stall for everyone on the loop)
         if fmt["vcodec"] == "none":
             spawn_analyze(vid, path)
     except _Expired:  # the link went stale (or came without a PO token): get a fresh one and try once more
         if os.path.exists(tmp):
             os.remove(tmp)
+        if not retry:
+            STATS["dl_err"], STATS["dl_err_at"] = "YouTube refused the song file (403)", time.time()
+            return
         try:
             info = await resolve(vid, force=True)
             same = [f for f in info["formats"] if f["id"] == fmt["id"]]
@@ -761,12 +735,12 @@ async def _download_plain(vid: str, fmt: dict, retry: bool = True):
                 same = sorted([f for f in info["formats"] if (f["vcodec"] != "none") == kind_v and f["acodec"] == fmt["acodec"]],
                               key=lambda f: abs((f["abr"] or f["tbr"] or 0) - (fmt["abr"] or fmt["tbr"] or 0)))
             if same:
-                return await _download_plain(vid, same[0], retry=False)
+                return await _download(vid, same[0], retry=False)
         except Exception as e:
             log.info("cache download retry failed %s: %s", vid, e)
     except Exception as e:
-        log.info("cache download failed %s: %s", vid, e)
-        STATS["dl_err"], STATS["dl_err_at"] = str(e)[:200], time.time()
+        log.info("cache download failed %s: %s", vid, str(e) or type(e).__name__)
+        STATS["dl_err"], STATS["dl_err_at"] = (str(e) or type(e).__name__)[:200], time.time()
         if os.path.exists(tmp):
             os.remove(tmp)
 

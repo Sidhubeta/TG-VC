@@ -868,7 +868,7 @@ function scheduleBox() {
 const MUSIC_PERMS = [
   ['add', 'Add songs'], ['next', 'Play a song next (jump the queue)'], ['vote', 'Vote to skip'], ['skip_own', 'Skip songs they added'],
   ['playback', 'Play, pause, seek, previous and skip any song'], ['queue', 'Change the queue', 'Remove, move, play now, shuffle, clear'],
-  ['modes', 'Repeat and autoplay'], ['fx_own', 'Sound effects on their own songs'], ['fx', 'Sound effects on any song'],
+  ['modes', 'Repeat and autoplay'],
   ['video', 'Turn on video for everyone'], ['stop', 'Stop the music'],
 ];
 function adminMusic(c) {

@@ -67,6 +67,7 @@ async function connect() {
     failN = 0;
     emit('voice', { state: 'ready' });
     emit('voice:session', 'joined');
+    warmNoise();
     restoreMic();
     if (!r.canPlaybackAudio) emit('voice:blocked', true);
     r.remoteParticipants.forEach(p => (isMusic(p) ? applyMusic(p) : applyVolume(p)));
@@ -301,6 +302,17 @@ function rnnoiseProcessor() {
   };
   return proc;
 }
+// The noise isolation's files (~1 MB) are fetched in the background once the voice is in, so the first tap on the
+// mic doesn't wait for them.
+let warmed = false;
+function warmNoise() {
+  if (warmed || !V.noise) return;
+  warmed = true;
+  setTimeout(() => {
+    for (const f of ['vendor/nsuppress/index.js', 'vendor/nsuppress/rnnoise_simd.wasm', 'vendor/nsuppress/rnnoise.wasm',
+      'vendor/nsuppress/rnnoiseWorklet.js', 'js/gate-worklet.js']) fetch('/static/' + f).catch(() => {});
+  }, 3000);
+}
 function setNsState(st) { if (nsState !== st) { nsState = st; emit('voice:noise', st); } }
 async function applyNoise() {
   const track = room?.localParticipant.getTrackPublication(LK.Track.Source.Microphone)?.audioTrack;
@@ -363,9 +375,11 @@ function iosSession(recording) {
 }
 iosSession(false);
 
-// A mic that's off is let go at once. While a phone has a mic open it keeps all its sound in "call" mode (thin,
-// quiet music from the call speaker): a muted-but-open mic kept the music sounding like a phone call. It used to be
-// let go 20 s later; now the music is back to normal sound the moment the mic goes off.
+// Mic off: muted at once (nobody hears you from that moment), and let go a few seconds later. Letting it go at once
+// made every "on" start the mic from nothing (ask the phone for it, publish it, set up noise isolation): half a
+// second to a second and a half before you were heard. Within those seconds "on" is instant. After them the mic is
+// let go, so the phone's sound leaves "call" mode (thin, quiet music) — it used to stay that way 20 s.
+const MIC_KEEP = 6000;
 let micReleaseTimer = null;
 async function releaseMic() {
   const pub = room?.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone);
@@ -377,6 +391,17 @@ export async function setMic(on) {
   clearTimeout(micReleaseTimer);
   if (on) iosSession(true);
   if (on && V.noise && nsState !== 'failed') { try { nsCtx(); } catch {} }
+  const pub = room.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone);
+  // quick way: the mic is still there (switched off a moment ago): unmute / mute, no new mic
+  if (pub?.track && pub.track.mediaStreamTrack?.readyState === 'live' && room.localParticipant.permissions?.canPublish !== false) {
+    try {
+      if (on) await pub.unmute(); else await pub.mute();
+      V.mic = on;
+      send({ t: 'mic', on });
+      if (!on) micReleaseTimer = setTimeout(() => { if (!V.mic) releaseMic().then(() => { iosSession(false); emit('voice:session', 'play'); }, () => {}); }, MIC_KEEP);
+      return true;
+    } catch (e) { console.warn('quick mic switch failed, starting it again', e); }
+  }
   try {
     if (on) await refreshPermissions();
     if (on && room.localParticipant.permissions && room.localParticipant.permissions.canPublish === false) {
@@ -386,6 +411,7 @@ export async function setMic(on) {
     }
     if (on) await room.localParticipant.setMicrophoneEnabled(true, micOpts());
     else await releaseMic();
+    if (on) { const p2 = room.localParticipant.getTrackPublication?.(LK.Track.Source.Microphone); if (p2?.isMuted) await p2.unmute(); }
     // (minimized, noise isolation crackles: it comes on when the app is open again — see the visibility handler)
     if (on) { if (document.hidden) bgOff = true; else await applyNoise(); }
     V.mic = on;

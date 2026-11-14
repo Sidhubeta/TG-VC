@@ -29,13 +29,11 @@ MUSIC_PERMS = {
     "playback": "Play, pause, seek, previous and skip any song",
     "queue": "Change the queue (remove, move, play now, shuffle, clear)",
     "modes": "Repeat and autoplay",
-    "fx_own": "Sound effects on their own songs",
-    "fx": "Sound effects on any song",
     "video": "Turn on video for everyone",
     "stop": "Stop the music",
 }
 MUSIC_DEFAULT = {"add": True, "next": False, "vote": True, "skip_own": True, "playback": False, "queue": False,
-                 "modes": False, "fx_own": True, "fx": False, "video": True, "stop": False}
+                 "modes": False, "video": True, "stop": False}
 DENY = {"add": "add songs", "next": "play songs next", "vote": "vote to skip", "skip_own": "skip songs",
         "playback": "control playback", "queue": "change the queue", "modes": "change repeat and autoplay",
         "fx_own": "change the sound", "fx": "change the sound", "video": "turn on video for everyone",
@@ -1499,7 +1497,7 @@ class Room:
             spawn(self._import_job(p, source, fetch))
             return
         if cmd == "fx":
-            return await self.set_fx(p, msg.get("fx") or {})
+            return  # (sound effects were removed: the music always plays as it is)
         if cmd == "voteskip":
             if not self.current:
                 return
@@ -1630,30 +1628,6 @@ class Room:
                     and self.status == "playing" and self.cur_pos() > 20):
                 await self._next(auto=True)
 
-    async def set_fx(self, p: Participant, new: dict):
-        own = self.mine(self.current, p)
-        if not (self.can(p, "fx") or (own and self.can(p, "fx_own"))):
-            return await self.deny(p, "fx")
-        if not isinstance(new, dict):
-            return
-
-        def num(k, lo, hi):
-            try:
-                v = float(new.get(k, self.fx[k]))
-            except (TypeError, ValueError):
-                return self.fx[k]
-            return min(hi, max(lo, v)) if v == v else self.fx[k]
-        fx = {"preset": new.get("preset") if new.get("preset") in FX_PRESETS else "custom",
-              "bass": num("bass", -12, 12), "mid": num("mid", -12, 12), "treble": num("treble", -12, 12),
-              "reverb": num("reverb", 0, 0.8), "rate": round(num("rate", 0.7, 1.4), 2),
-              "mode": "8d" if new.get("mode") == "8d" else "none"}
-        if fx["rate"] != self.fx["rate"]:
-            self.pos, self.upd = self.cur_pos(), now()  # keep the song where it is, then run at the new speed
-        self.fx = fx
-        self.fx_by_admin = p.admin
-        self._arm_timer()
-        await self.push_music()
-
     # ---------------- surviving a restart -----------------
     # The queue and the song playing lived only in memory: every deploy or restart emptied them. They're saved
     # (a moment after each change) and read back when the room is built again.
@@ -1690,8 +1664,7 @@ class Room:
         self.queue = [q for q in data.get("queue") or [] if isinstance(q, dict) and q.get("id")][:QUEUE_MAX]
         self.loop = data.get("loop") if data.get("loop") in ("off", "one", "all") else "off"
         self.autoplay = bool(data.get("autoplay"))
-        if isinstance(data.get("fx"), dict):
-            self.fx = {**FX_DEFAULT, **data["fx"]}
+        self.fx = dict(FX_DEFAULT)  # (sound effects were removed: an effect saved before stays off)
         cur = data.get("current")
         if isinstance(cur, dict) and cur.get("id") and data.get("status") in ("playing", "paused", "loading"):
             self.current = cur

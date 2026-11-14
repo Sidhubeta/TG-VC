@@ -979,6 +979,17 @@ async def api_bye(request: Request):
 
 
 # ---------------- static ----------------
+class AppFiles(StaticFiles):
+    """The app's own files are checked with the server on every open (a cheap "not modified" when nothing changed).
+    They had no caching rule, so Telegram's browser kept old copies for a long time after a deploy: the Effects
+    button was still there after it had been removed. Third-party files (vendor/) are kept a day."""
+    def file_response(self, full_path, *args, **kwargs):
+        resp = super().file_response(full_path, *args, **kwargs)
+        resp.headers["Cache-Control"] = "public, max-age=86400" if "/vendor/" in str(full_path) else "no-cache"
+        return resp
+
+
+
 async def index(request: Request):
     return FileResponse(os.path.join(WEB, "index.html"), headers={
         "Cache-Control": "no-cache", "X-Robots-Tag": "noindex, nofollow", "Referrer-Policy": "no-referrer"})
@@ -1054,7 +1065,7 @@ routes = [
     Route("/api/badges", api_badges),
     Route("/api/bye", api_bye, methods=["POST", "GET"]),
     WebSocketRoute("/ws", ws_endpoint),
-    Mount("/static", StaticFiles(directory=WEB), name="static"),
+    Mount("/static", AppFiles(directory=WEB), name="static"),
 ]
 app = Starlette(routes=routes, lifespan=lifespan)
 

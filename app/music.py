@@ -650,71 +650,42 @@ def cacheable(info: dict, fmt: dict) -> bool:
     return True
 
 
-# Songs are downloaded into the cache in pieces, several at once. One request for the whole file came down slowly
-# (YouTube's servers send each connection at an even pace), and a phone waiting on it played through the server. With
-# four pieces of 1 MB in flight a song is on disk in a few seconds. (yt-dlp's own downloader was tried too: YouTube
-# refused it with 403 on Railway while this one worked, and it cost an extra request per song. One way now: this one.)
-PIECE_BYTES = 1024 * 1024
-PIECES_AT_ONCE = 4
-FIRST_BYTES = 256 * 1024
-
-
-def _write_at(path: str, offset: int, data: bytes):
-    with open(path, "r+b") as fh:
-        fh.seek(offset)
-        fh.write(data)
-
-
+# Songs are downloaded into the cache from the start of the file, in one request (8 MB: a whole song), written to
+# disk as it comes. YouTube lets this server have a song's file from its first byte, but refuses (403) requests that
+# start further in: fetching it in parallel pieces (tried) got 403 for every piece after the first, and so did a
+# phone asking the server for the middle of a song it didn't have yet (the song stopped at 0:22 or 1:05).
 async def _download(vid: str, fmt: dict, retry: bool = True):
     path = _fmt_path(vid, fmt)
     tmp = path + ".part"
     limit = MAX_VIDEO_FILE if fmt["vcodec"] != "none" else MAX_AUDIO_FILE
     client, headers = stream_http(), fmt["headers"]
-
-    async def get(a: int, b: int):
-        for attempt in range(3):
-            r = await client.get(fmt["url"], headers={**headers, "Range": f"bytes={a}-{b}"})
-            if r.status_code in (403, 410):
-                REFUSED.append(time.time())
-                raise _Expired()
-            if r.status_code in (200, 206) and r.content:
-                return r
-            if attempt == 2:
-                raise RuntimeError(f"status {r.status_code}")
-            await asyncio.sleep(0.5 * (attempt + 1))
-
     t0 = time.time()
     try:
-        first = await get(0, FIRST_BYTES - 1)  # (small: it's mostly to learn the file's size, then the rest at once)
-        tail = first.headers.get("content-range", "/0").split("/")[-1].strip()
-        total = int(tail) if tail.isdigit() else 0  # ("*": length unknown)
-        if first.status_code == 200:
-            total = len(first.content)  # (the server sent the whole file)
-        if total > limit:
-            raise RuntimeError(f"too big to keep ({total // 2**20} MB)")
+        pos = 0
         with open(tmp, "wb") as fh:
-            fh.write(first.content)
-        if total and len(first.content) < total:
-            sem = asyncio.Semaphore(PIECES_AT_ONCE)
-
-            async def one(a: int, b: int):
-                async with sem:
-                    r = await get(a, b)
-                    if len(r.content) != b - a + 1:
-                        raise RuntimeError(f"short piece at {a}")
-                    await asyncio.to_thread(_write_at, tmp, a, r.content)
-            await asyncio.gather(*(one(a, min(a + PIECE_BYTES, total) - 1)
-                                   for a in range(len(first.content), total, PIECE_BYTES)))
-        elif not total and first.status_code == 206:
-            # length unknown: one piece after another until the server has no more
-            pos = len(first.content)
             while True:
-                r = await get(pos, pos + PIECE_BYTES - 1)
-                await asyncio.to_thread(_write_at, tmp, pos, r.content)
-                pos += len(r.content)
-                if pos > limit:
-                    raise RuntimeError("too big to keep")
-                if len(r.content) < PIECE_BYTES:
+                req = client.build_request("GET", fmt["url"], headers={**headers, "Range": f"bytes={pos}-{pos + CHUNK - 1}"})
+                r = await client.send(req, stream=True)
+                try:
+                    if r.status_code in (403, 410):
+                        REFUSED.append(time.time())
+                        raise _Expired()
+                    if r.status_code not in (200, 206):
+                        raise RuntimeError(f"status {r.status_code}")
+                    tail = r.headers.get("content-range", "/0").split("/")[-1].strip()
+                    total = int(tail) if tail.isdigit() else 0  # ("*": length unknown)
+                    if total > limit:
+                        raise RuntimeError(f"too big to keep ({total // 2**20} MB)")
+                    got = 0
+                    async for chunk in r.aiter_bytes(256 * 1024):
+                        fh.write(chunk)
+                        got += len(chunk)
+                        if pos + got > limit:
+                            raise RuntimeError("too big to keep")
+                finally:
+                    await r.aclose()
+                pos += got
+                if r.status_code == 200 or not got or (total and pos >= total) or (not total and got < CHUNK):
                     break
         os.replace(tmp, path)
         STATS["dl_ok_at"], STATS["dl_via"] = time.time(), f"{os.path.getsize(path) // 1024} KB in {time.time() - t0:.1f} s"
@@ -970,6 +941,19 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
                     pass
         while len(_served_as) > 3000:
             _served_as.pop(next(iter(_served_as)))
+    if kind == "audio" and not os.path.exists(path):
+        # A request for the middle of the song (the phone has its start already, so it can wait a little): YouTube
+        # refuses those from this server (403), so wait for our download, which goes from the start and has it soon.
+        m = re.match(r"bytes=(\d+)-", request.headers.get("range", ""))
+        if m and int(m.group(1)) > 0:
+            job = _downloads.get(f"{vid}_{fmt['id']}")
+            if job is None and cacheable(info, fmt):
+                job = _start_download(vid, fmt)
+            if job is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(job), 12)
+                except Exception:
+                    pass
     if os.path.exists(path):
         try:
             os.utime(path)  # LRU: mark as recently used (atime is often not updated on volumes)

@@ -85,10 +85,21 @@ async def download_test() -> dict:
         size = os.path.getsize(out)
         return {"ok": True, "detail": f"YouTube works: lookup + download ({size // 1024} KB) in {time.time() - t:.1f} s"}
     except Exception as e:
-        return {"ok": False, "detail": f"Lookup works, but YouTube refused the download: {str(e)[:150]}" + _warn_tail()}
+        ytdlp_err = str(e)
     finally:
         if os.path.exists(out):
             os.remove(out)
+    # songs are also fetched the plain way: try a piece of the file like that
+    try:
+        r = await stream_http().get(f["url"], headers={**f["headers"], "Range": "bytes=0-262143"})
+        if r.status_code in (200, 206) and r.content:
+            return {"ok": True, "detail": f"YouTube works (songs download the plain way; yt-dlp's own download was "
+                                          f"refused: {ytdlp_err[:90]})"}
+        plain = f"status {r.status_code}"
+    except Exception as e:
+        plain = str(e) or type(e).__name__
+    return {"ok": False, "detail": f"Lookup works, but YouTube refused the download (yt-dlp: {ytdlp_err[:100]}; plain: "
+                                   f"{plain[:40]})" + _warn_tail()}
 
 
 def _warn_tail() -> str:
@@ -670,29 +681,21 @@ def _ytdlp_download(vid: str, fmt: dict, out: str, limit: int) -> None:
                  overwrites=True, nopart=True, continuedl=False, max_filesize=limit, http_chunk_size=10 * 1024 * 1024,
                  retries=4, fragment_retries=4, file_access_retries=1, writeinfojson=False, writethumbnail=False,
                  postprocessors=[], fixup="never", cachedir=False)
+    # Only from the lookup just made: a download never asks YouTube for the page again. Downloads that looked songs
+    # up again (once per format, and once more per setting tried) were several page requests per song, and YouTube
+    # answered with 429 "Too Many Requests" and "Sign in to confirm you're not a bot". Without a fresh lookup the
+    # plain downloader takes over (see _download).
     hit = _raw.get(vid)
-    start = _cur_level()
-    err = None
-    for i, n in enumerate(_levels_from(start)):
-        opts["cookiefile"] = COOKIE_FILE if (n < 1 and os.path.exists(COOKIE_FILE)) else None
-        opts["extractor_args"] = _extractor_args(n)
-        try:
-            with yt_dlp.YoutubeDL(opts) as y:
-                if i == 0 and hit and time.time() - hit[0] < 1800:
-                    y.process_ie_result(copy.deepcopy(hit[1]), download=True)  # (the lookup just made: no second one)
-                else:
-                    y.download([f"https://www.youtube.com/watch?v={vid}"])  # (other settings: a fresh lookup)
-            if not os.path.exists(out) or os.path.getsize(out) < 1024:
-                raise RuntimeError("yt-dlp wrote no file")
-            if n != start:
-                _set_level(n)
-            return
-        except Exception as e:
-            err = e
-            if not _REFUSED_RE.search(str(e)):
-                raise
-            log.info("YouTube refused the download (%s): %s", LEVELS[n], str(e)[:160])
-    raise err
+    if not hit or time.time() - hit[0] > 1800:
+        raise _NoLookup("no fresh lookup to download from")
+    with yt_dlp.YoutubeDL(opts) as y:
+        y.process_ie_result(copy.deepcopy(hit[1]), download=True)
+    if not os.path.exists(out) or os.path.getsize(out) < 1024:
+        raise RuntimeError("yt-dlp wrote no file")
+
+
+class _NoLookup(Exception):
+    pass
 
 
 async def _download(vid: str, fmt: dict, retry: bool = True):
@@ -702,7 +705,7 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
     try:
         await asyncio.get_running_loop().run_in_executor(_DL_POOL, _ytdlp_download, vid, fmt, tmp, limit)
         os.replace(tmp, path)
-        STATS["dl_ok_at"] = time.time()
+        STATS["dl_ok_at"], STATS["dl_via"] = time.time(), "yt-dlp"
         await asyncio.to_thread(_trim_cache)
         if fmt["vcodec"] == "none":
             spawn_analyze(vid, path)
@@ -713,10 +716,9 @@ async def _download(vid: str, fmt: dict, retry: bool = True):
         msg = str(e)
         if "403" in msg or "Forbidden" in msg:
             REFUSED.append(time.time())
-            STATS["dl_err"], STATS["dl_err_at"] = msg[:200], time.time()
-            log.info("yt-dlp download refused %s/%s: %s", vid, fmt["id"], msg[:200])
-            return  # (the plain way gets the same 403: one more request that only marks the server)
-        log.info("yt-dlp download failed %s/%s, trying the plain way: %s", vid, fmt["id"], msg[:200])
+        if not isinstance(e, _NoLookup):
+            log.info("yt-dlp download failed %s/%s, trying the plain way: %s", vid, fmt["id"], msg[:200])
+    # The plain downloader: when yt-dlp can't (it's the one that works on some days: YouTube refuses one or the other)
     await _download_plain(vid, fmt, retry)
 
 
@@ -744,6 +746,7 @@ async def _download_plain(vid: str, fmt: dict, retry: bool = True):
                 if r.status_code == 200 or not r.content or (total and pos >= total):
                     break
         os.replace(tmp, path)
+        STATS["dl_ok_at"], STATS["dl_via"] = time.time(), "plain"
         await asyncio.to_thread(_trim_cache)  # (lists and sizes every file: a moment's stall for everyone on the loop)
         if fmt["vcodec"] == "none":
             spawn_analyze(vid, path)
@@ -763,6 +766,7 @@ async def _download_plain(vid: str, fmt: dict, retry: bool = True):
             log.info("cache download retry failed %s: %s", vid, e)
     except Exception as e:
         log.info("cache download failed %s: %s", vid, e)
+        STATS["dl_err"], STATS["dl_err_at"] = str(e)[:200], time.time()
         if os.path.exists(tmp):
             os.remove(tmp)
 

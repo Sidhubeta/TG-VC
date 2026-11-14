@@ -1270,6 +1270,8 @@ input[type=range] { color: var(--accent); }
 #toasts { top: calc(var(--top-safe) + 8px); }
 /* (narrow enough to sit between the round buttons in the corners: a long toast covered them) */
 #toasts .toast { max-width: calc(100% - 136px); text-align: center; }
+/* a long message (a server error) is cut at 5 lines instead of covering the whole screen */
+#toasts .toast { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; line-clamp: 5; overflow: hidden; }
 
 /* =====================================================================
    Liquid glass, the whole app (iOS 26 look)

@@ -854,7 +854,7 @@ async def api_health(request: Request, uid, chat_id, st):
     if ms["dl_ok_at"] or ms["dl_err_at"]:
         dl_ok = ms["dl_ok_at"] >= ms["dl_err_at"]
         items.append({"name": "Song downloads", "ok": dl_ok,
-                      "detail": f"Last song saved {_ago(ms['dl_ok_at'])}" if dl_ok else
+                      "detail": f"Last song saved {_ago(ms['dl_ok_at'])}" + (f" ({ms.get('dl_via')})" if ms.get("dl_via") else "") if dl_ok else
                       f"YouTube refused the last download {_ago(ms['dl_err_at'])}: {ms['dl_err'][:120]}"})
     recent = [w for ts, w in music.WARNINGS if time.time() - ts < 3600]
     if recent:

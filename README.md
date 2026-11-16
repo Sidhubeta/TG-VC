@@ -40,6 +40,11 @@ secret into the app variables. Voice works over TCP, just with a little more del
 - If you still get errors: export `cookies.txt` from a **throwaway** YouTube account, base64 it
   (`base64 -w0 cookies.txt`) and put it in `YT_COOKIES_B64`.
 - yt-dlp updates itself on every restart.
+- **"Sign in to confirm you're not a bot" / 429 / 403 on every song**: YouTube is blocking Railway's address. Set
+  `YT_WARP=1` to send all YouTube requests through Cloudflare WARP (free, built into the image; Health shows
+  "YouTube proxy (WARP): On"). Or set `YT_PROXY` to your own proxy (a paid residential one works best).
+- Cookies: make them in a **private window** (log in, open `youtube.com/robots.txt`, export, close the window and
+  never open that session again), or YouTube rotates them and they go stale.
 
 ### 4a. Spotify links (optional)
 Pasting a Spotify playlist / album / song link works out of the box (read from Spotify's public page, up to about

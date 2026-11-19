@@ -71,7 +71,7 @@ on('voice:session', kickAudio);
 const video = h('video', { class: 'vid', playsinline: true, muted: true, preload: 'auto' });
 video.muted = true;
 const isApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document || /iPhone|iPad|iPod/.test(navigator.userAgent);
-const CODEC = !isApple && audio.canPlayType('audio/webm; codecs="opus"') ? 'opus' : 'aac';
+const CODEC = 'aac'; // (every phone plays the same AAC file: one download per song, and iPhone plays what Android plays)
 const HEIGHTS = [144, 240, 360, 480, 720, 1080];
 
 const P = {
@@ -1525,6 +1525,7 @@ function addAll(tracks) {
   }
 }
 function songMenu(t) {
+  if (t?.id && canAdd()) api('/api/warm/' + t.id, { method: 'POST' }).catch(() => {}); // (the server gets it ready)
   const big = (cls, ic, label, sub, perm, fn) => h('button', { class: 'pick ' + cls + (can(perm) && can('add') ? '' : ' locked'), onclick: () => {
     if (!can('add')) return deny('add');
     if (!can(perm)) return deny(perm);

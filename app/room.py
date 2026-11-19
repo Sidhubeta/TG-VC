@@ -263,7 +263,7 @@ class Room:
         self._alerted: dict[tuple[int, str], float] = {}  # (uid, flag) -> when admins were last told
         self._watching: set[int] = set()                # qids with a _watch_song task
         self._idle_paused = False                       # the music was paused because the room emptied
-        self._prefetched = ""                           # the next song we last asked the cache for
+        self._prefetched: deque[str] = deque(maxlen=12)  # the queued songs we last asked the cache for
         self._filling = False                           # autoplay is looking for songs
         self._bad: deque[str] = deque(maxlen=200)       # songs that couldn't be played (skipped)
         self._load_seek: int | None = None              # qid that was seeked while still loading
@@ -425,10 +425,11 @@ class Room:
         await self.broadcast({"t": "music", "m": st, "now": now()})
         # whatever is next now (after a move, play now, shuffle, remove…) starts downloading, so it can start
         # straight away and crossfade
-        nxt = self.queue[0]["id"] if self.queue else ""
-        if nxt and nxt != self._prefetched:
-            self._prefetched = nxt
-            spawn(music.prefetch(nxt))
+        # (the next three: a skip or two still starts at once)
+        for it in self.queue[:3]:
+            if it["id"] not in self._prefetched:
+                self._prefetched.append(it["id"])
+                spawn(music.prefetch(it["id"]))
         spawn(self._save_soon())
 
     async def toast(self, uid: int, text: str):
@@ -1187,17 +1188,17 @@ class Room:
                     await self._skip_unplayable(qid, str(e))
                 return
         try:
-            # Wait a few seconds for the song's files (the usual two kinds: iPhone and Android) while it's
-            # "loading". Started before they were on disk, every phone pulled it from YouTube by itself, and an
-            # iPhone often heard nothing for the first 5–15 seconds.
-            await music.wait_cached(vid, 12 if voicemusic.enabled() else 6)
+            # Wait a moment for the song's file (one file now, for every phone: usually on disk in a second or two)
+            # while it's "loading". Started before it was there, every phone pulled it from YouTube by itself, and an
+            # iPhone often heard nothing for the first 5–15 seconds. (It was 6 s for two or three files.)
+            await music.wait_cached(vid, 12 if voicemusic.enabled() else 4)
         except Exception:
             pass
         try:
             await music.prefetch(vid)  # make sure the download (and with it the silence check) has started
         except Exception:
             pass
-        for _ in range(8):  # up to 2 s more to learn about a silent intro, only while it's being worked out
+        for _ in range(4):  # up to 1 s more to learn about a silent intro (a later one is skipped while playing)
             if music.trim(vid) or not music.trim_pending(vid) or not self.current or self.current["qid"] != qid:
                 break
             await asyncio.sleep(0.25)

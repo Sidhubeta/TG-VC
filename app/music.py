@@ -204,7 +204,7 @@ def _cur_level() -> int:
 def _set_level(n: int):
     if n != _level["n"]:
         log.warning("YouTube: now %s", LEVELS[n])
-    _level["n"], _level["until"] = n, time.time() + 1800
+    _level["n"], _level["until"] = n, time.time() + 6 * 3600
 
 
 def _levels_from(start: int) -> list[int]:
@@ -787,8 +787,8 @@ async def prefetch(vid: str):
     except Exception as e:
         log.info("prefetch resolve failed %s: %s", vid, e)
         return
-    # medium for both kinds of phones, plus any other quality listeners picked lately (High / Data saver)
-    wanted = {("aac", "medium"), ("opus", "medium")} | {k for k, t in _asked.items() if time.time() - t < 3600}
+    # the one file every phone plays (Standard), plus any other quality listeners picked lately (High / Data saver)
+    wanted = {("aac", "medium")} | {k for k, t in _asked.items() if time.time() - t < 3600 and k[0] == "aac"}
     for codec, q in sorted(wanted):
         f = pick_audio(info, codec, q)
         if not f or not cacheable(info, f):
@@ -811,7 +811,7 @@ async def wait_cached(vid: str, timeout: float) -> bool:
         info = await resolve(vid)
     except Exception:
         return False
-    fmts = [f for f in (pick_audio(info, "aac", "medium"), pick_audio(info, "opus", "medium")) if f and cacheable(info, f)]
+    fmts = [f for f in (pick_audio(info, "aac", "medium"),) if f and cacheable(info, f)]
     jobs = [_start_download(vid, f) for f in fmts if not os.path.exists(_cache_path(vid, f["id"]))]
     if jobs:
         try:
@@ -921,6 +921,11 @@ def _mime(fmt: dict) -> str:
 
 
 async def stream(request: Request, vid: str, kind: str, codec: str, quality: str) -> Response:
+    # Every phone gets the same AAC (m4a) file: iPhone can only play AAC, and Android plays it just as well. With an
+    # Opus file for Android and an AAC one for iPhone, each song was downloaded two or three times, and the iPhone's
+    # file could fail while Android's played (or be refused while Android's was already on disk). Older apps that
+    # still ask for Opus get the AAC file too.
+    codec = "aac"
     try:
         info = await resolve(vid)
     except Exception as e:
@@ -1043,7 +1048,7 @@ async def probe(vid: str) -> bool:
         info = await resolve(vid)
     except Exception:
         return False
-    fmts = [f for f in (pick_audio(info, "opus", "medium"), pick_audio(info, "aac", "medium")) if f]
+    fmts = [f for f in (pick_audio(info, "aac", "medium"), pick_audio(info, "opus", "medium")) if f]
     if any(os.path.exists(_cache_path(vid, f["id"])) for f in fmts):
         return True
     for f in fmts[:1]:
@@ -1080,7 +1085,7 @@ _piece_sem = asyncio.Semaphore(3)
 
 def _piece_source(info: dict, vid: str) -> tuple[str, dict]:
     """The cached file if there is one (no YouTube request), else the stream link."""
-    fmts = [pick_audio(info, c, q) for c in ("opus", "aac") for q in ("medium", "high", "low")]
+    fmts = [pick_audio(info, c, q) for c in ("aac", "opus") for q in ("medium", "high", "low")]  # (the cached AAC first)
     for f in fmts:
         if f and os.path.exists(_cache_path(vid, f["id"])):
             return _cache_path(vid, f["id"]), {}

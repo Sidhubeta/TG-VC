@@ -46,6 +46,9 @@ YT_EXTRACTOR_ARGS = _env("YT_EXTRACTOR_ARGS")
 # residential one: http://user:pass@host:port or socks5://host:port
 YT_WARP = _env("YT_WARP").lower() in ("1", "true", "yes", "on")
 YT_PROXY = _env("YT_PROXY")
+# Cookies from a link instead of a variable: a batbin / pastebin paste (or any raw text URL) of a cookies.txt.
+# Read at start and every 6 hours, so a new paste is picked up without a redeploy. Wins over YT_COOKIES_B64.
+COOKIES_URL = _env("COOKIES_URL")
 AUDIO_CACHE_MB = _int("AUDIO_CACHE_MB", 800)
 VIDEO_CACHE_MB = _int("VIDEO_CACHE_MB", 600)  # 0 = don't cache videos
 # The bot's owner (your Telegram id): sees the Health page and adds sudo users (/addsudo, or on the Health page)

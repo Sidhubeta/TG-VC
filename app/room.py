@@ -426,10 +426,12 @@ class Room:
         # whatever is next now (after a move, play now, shuffle, remove…) starts downloading, so it can start
         # straight away and crossfade
         # (the next three: a skip or two still starts at once)
-        for it in self.queue[:3]:
+        for i, it in enumerate(self.queue[:3]):
+            if i > 0 and music.youtube_busy():
+                break  # (not marked as asked for: they're fetched once YouTube allows, or when they're next)
             if it["id"] not in self._prefetched:
                 self._prefetched.append(it["id"])
-                spawn(music.prefetch(it["id"]))
+                spawn(music.prefetch(it["id"]))  # (the next one always; the two after it only while YouTube allows)
         spawn(self._save_soon())
 
     async def toast(self, uid: int, text: str):

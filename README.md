@@ -43,6 +43,7 @@ secret into the app variables. Voice works over TCP, just with a little more del
 - **"Sign in to confirm you're not a bot" / 429 / 403 on every song**: YouTube is blocking Railway's address. Set
   `YT_WARP=1` to send all YouTube requests through Cloudflare WARP (free, built into the image; Health shows
   "YouTube proxy (WARP): On"). Or set `YT_PROXY` to your own proxy (a paid residential one works best).
+- Cookies can also come from a link: `COOKIES_URL=https://batbin.me/xxxx` (read every 6 hours, tabs fixed).
 - Cookies: make them in a **private window** (log in, open `youtube.com/robots.txt`, export, close the window and
   never open that session again), or YouTube rotates them and they go stale.
 

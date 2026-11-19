@@ -341,6 +341,24 @@ async def api_thumb(request: Request):
     return await music.thumb(request.path_params["vid"], request.query_params.get("z") == "s")
 
 
+_warm_by: dict[int, list[float]] = {}
+
+
+@guarded()
+async def api_warm(request: Request, uid, chat_id, st):
+    """A song was tapped (its menu is open): look it up and start its download now, so it plays at once when it's
+    added a second later (the lookup alone takes a few seconds). At most 10 a minute per person."""
+    vid = _vid(request)
+    t = time.time()
+    recent = [x for x in _warm_by.get(uid, []) if t - x < 60]
+    if len(recent) < 10 and not music.is_cached(vid):
+        _warm_by[uid] = recent + [t]
+        asyncio.get_running_loop().create_task(music.prefetch(vid))
+        if len(_warm_by) > 5000:
+            _warm_by.clear()
+    return JSONResponse({"ok": True})
+
+
 @guarded()
 async def api_formats(request: Request, uid, chat_id, st):
     info = await music.resolve(_vid(request))
@@ -850,7 +868,7 @@ async def api_health(request: Request, uid, chat_id, st):
     lv = music._cur_level()
     if lv:
         items.append({"name": "YouTube settings", "ok": False, "detail": f"YouTube refused the full setup, so songs are fetched "
-                      f"{music.LEVELS[lv]} for now (tried again every 30 min)"
+                      f"{music.LEVELS[lv]} for now (tried again every 6 h)"
                       + (" — the cookies look stale: make new ones in a private window" if lv == 1 else "")})
     if ms["dl_ok_at"] or ms["dl_err_at"]:
         dl_ok = ms["dl_ok_at"] >= ms["dl_err_at"]
@@ -1049,6 +1067,7 @@ routes = [
     Route("/api/avatar/{eid}", api_avatar),
     Route("/emoji/{name}", emoji),
     Route("/api/formats/{vid}", api_formats),
+    Route("/api/warm/{vid}", api_warm, methods=["POST"]),
     Route("/api/lyrics/{vid}", api_lyrics),
     Route("/api/history", api_history),
     Route("/api/browse", api_browse),

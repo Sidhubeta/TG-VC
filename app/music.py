@@ -1073,10 +1073,27 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
             pass
         return FileResponse(path, media_type=_mime(fmt), headers={"Cache-Control": "private, max-age=3600"})
     try:
-        return await _proxy(request, vid, fmt, retry=True)
+        resp = await _proxy(request, vid, fmt, retry=True)
     except Exception as e:
         log.warning("stream proxy failed %s: %s", vid, e)
-        return Response("upstream error", status_code=502)
+        resp = Response("upstream error", status_code=502)
+    if resp.status_code >= 400 and kind == "audio":
+        # YouTube refused to pass the song on (403 / 429 / blocked) while our own download of it is under way (it
+        # goes from the start of the file, which YouTube allows): wait for it and send our copy. Sending the error
+        # made the phone report "Format error" and go silent for a few seconds until its retry — on everyone's phone
+        # that opened the song before its file was on the server.
+        job = _downloads.get(f"{vid}_{fmt['id']}")
+        if job is None and cacheable(info, fmt):
+            job = _start_download(vid, fmt)
+        if job is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(job), 10)
+            except Exception:
+                pass
+        if os.path.exists(path):
+            log.info("stream %s: YouTube refused, sent our own copy instead", vid)
+            return FileResponse(path, media_type=_mime(fmt), headers={"Cache-Control": "private, max-age=3600"})
+    return resp
 
 
 async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response:

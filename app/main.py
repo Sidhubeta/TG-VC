@@ -351,9 +351,9 @@ async def api_warm(request: Request, uid, chat_id, st):
     vid = _vid(request)
     t = time.time()
     recent = [x for x in _warm_by.get(uid, []) if t - x < 60]
-    if len(recent) < 10 and not music.is_cached(vid):
+    if len(recent) < 10 and not music.is_cached(vid) and not music.youtube_busy():
         _warm_by[uid] = recent + [t]
-        asyncio.get_running_loop().create_task(music.prefetch(vid))
+        asyncio.get_running_loop().create_task(music.prefetch(vid, extra=True))
         if len(_warm_by) > 5000:
             _warm_by.clear()
     return JSONResponse({"ok": True})
@@ -865,6 +865,14 @@ async def api_health(request: Request, uid, chat_id, st):
                   + ("" if config.POT_PROVIDER_URL or os.path.exists(music.COOKIE_FILE) else " · tip: set POT_PROVIDER_URL against YouTube blocks")})
     items.append({"name": "PO token provider", **(await music.pot_check())})
     items.append({"name": "YouTube proxy (WARP)", **warp.status()})
+    ck = music.COOKIES
+    items.append({"name": "YouTube cookies", "ok": (False if ck["error"] else True if ck["count"] else None),
+                  "detail": ck["error"] or (f"{ck['count']} YouTube cookies from {ck['source']}, loaded {_ago(ck['at'])}"
+                                            if ck["count"] else "None set (COOKIES_URL or YT_COOKIES_B64)")})
+    if music.youtube_busy():
+        items.append({"name": "YouTube rate limit", "ok": False,
+                      "detail": f"YouTube said \"Too Many Requests\" {_ago(ms['yt_429_at'])}: only the playing and the next "
+                                "song are looked up for 10 minutes (fewer requests, so it lifts sooner)"})
     lv = music._cur_level()
     if lv:
         items.append({"name": "YouTube settings", "ok": False, "detail": f"YouTube refused the full setup, so songs are fetched "
@@ -1034,7 +1042,7 @@ async def lifespan(app):
     tasks = [asyncio.create_task(tg.run_polling()), asyncio.create_task(tg.schedule_loop()),
              asyncio.create_task(heartbeat_loop()), asyncio.create_task(pin.startup_reset()),
              asyncio.create_task(pin.countdown_loop()), asyncio.create_task(bg_tick_loop()),
-             asyncio.create_task(warp.start())]
+             asyncio.create_task(warp.start()), asyncio.create_task(music.cookies_loop())]
     log.info("LiveKit %s", "enabled" if lk.enabled() else "NOT configured (voice disabled)")
     if config.DEV_MODE and config.BOT_TOKEN:
         log.error("DEV_MODE=1 is on with a real bot: anyone can open the app as anyone. Remove DEV_MODE.")

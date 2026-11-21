@@ -10,7 +10,7 @@ from collections import deque
 
 from starlette.websockets import WebSocket
 
-from . import auth, badges, db, lk, music, pin, tg, voicemusic
+from . import auth, badges, db, lk, music, pin, sudo, tg, voicemusic
 
 log = logging.getLogger("room")
 ROOMS: dict[int, "Room"] = {}
@@ -304,6 +304,14 @@ class Room:
             return False
         return p.admin or p.role == "speaker"
 
+    def rank(self, uid: int, admin: bool) -> int:
+        """Who may act on whom: the bot's owner 3, sudo users 2, the group's admins 1, everyone else 0."""
+        if sudo.is_owner(uid):
+            return 3
+        if sudo.is_sudo(uid):
+            return 2
+        return 1 if admin else 0
+
     def staff(self, q: Participant) -> bool:
         return q.admin or self.is_mod(q)
 
@@ -346,6 +354,8 @@ class Room:
                 d["realName"] = p.name
         if for_admin or mod_view:
             d["flags"] = p.flags  # moderators handle warnings too
+        if for_admin:
+            d["rank"] = self.rank(p.uid, p.admin)  # (admins' apps: whom they may act on)
         return d
 
     def chat_view(self, m: dict, viewer: Participant) -> dict:
@@ -426,10 +436,12 @@ class Room:
         # whatever is next now (after a move, play now, shuffle, remove…) starts downloading, so it can start
         # straight away and crossfade
         # (the next three: a skip or two still starts at once)
-        for it in self.queue[:3]:
+        for i, it in enumerate(self.queue[:3]):
+            if i > 0 and music.youtube_busy():
+                break  # (not marked as asked for: they're fetched once YouTube allows, or when they're next)
             if it["id"] not in self._prefetched:
                 self._prefetched.append(it["id"])
-                spawn(music.prefetch(it["id"]))
+                spawn(music.prefetch(it["id"]))  # (the next one always; the two after it only while YouTube allows)
         spawn(self._save_soon())
 
     async def toast(self, uid: int, text: str):
@@ -492,6 +504,7 @@ class Room:
         await conn.send({"t": "init", "me": uid, "now": now(), "parts": everyone, "room": self.room_state(),
                          "music": self.music_state(), "chat": [self.chat_view(m, p) for m in self.chat if m["ts"] >= since],
                          "admin": admin,
+                         "rank": self.rank(uid, admin),  # (owner 3, sudo 2, admin 1: whom this app may act on)
                          "musicVoice": voicemusic.enabled(),  # (the music comes through the voice chat)
                          "sudo": bool(getattr(conn, "sudo", False)),  # (bot owner / sudo user: sees the Health tab)
                          "owner": bool(getattr(conn, "owner", False)),  # (the bot's owner: manages sudo users)
@@ -1711,7 +1724,8 @@ class Room:
         if t in ("admin.mute", "admin.unmute", "admin.role", "admin.kick", "admin.ban", "admin.clearflags") and not target:
             if t != "admin.ban":
                 return
-        if target and target.admin and t in ("admin.mute", "admin.kick", "admin.ban", "admin.role") and target.uid != p.uid:
+        if (target and target.admin and t in ("admin.mute", "admin.kick", "admin.ban", "admin.role") and target.uid != p.uid
+                and self.rank(p.uid, p.admin) <= self.rank(target.uid, True)):  # (the owner / sudo users outrank admins)
             return await self.toast(p.uid, "Can't do that to another admin")
         if not p.admin and (not target or self.is_mod(target)):  # moderators: only people in the room, not each other
             return await self.toast(p.uid, "Moderators can't do that to another moderator" if target else "They're not here")
@@ -1748,7 +1762,8 @@ class Room:
             name = target.name if target else str(msg.get("name", ""))[:64]
             if not uid or uid == p.uid or (uid < 0 and not target):  # (not a group or channel id)
                 return
-            if not target and (await tg.member_status(self.chat_id, uid))["admin"]:
+            if (not target and (await tg.member_status(self.chat_id, uid))["admin"]
+                    and self.rank(p.uid, p.admin) <= self.rank(uid, True)):
                 return await self.toast(p.uid, "Can't do that to another admin")
             if t == "admin.ban":
                 await db.x("INSERT OR REPLACE INTO bans(chat_id,uid,name,by_uid,ts) VALUES(?,?,?,?,?)",

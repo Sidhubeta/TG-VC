@@ -41,15 +41,77 @@ if yt_dlp is not None:
 CACHE_DIR = os.path.join(config.DATA_DIR, "audio")
 os.makedirs(CACHE_DIR, exist_ok=True)
 COOKIE_FILE = os.path.join(config.DATA_DIR, "cookies.txt")
+COOKIES: dict = {"source": "", "count": 0, "at": 0.0, "error": ""}  # for the Health page
+
+
+def normalize_cookies(text: str) -> tuple[str, int]:
+    """A cookies.txt as yt-dlp needs it, and how many YouTube cookies it has. Pastes (batbin, chats) often turn the
+    tabs between the fields into spaces, and yt-dlp then reads no cookies at all: each line is put back together
+    from its 7 fields."""
+    out, n = ["# Netscape HTTP Cookie File"], 0
+    for line in text.replace("\ufeff", "").replace("\r", "").split("\n"):
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            fields = line.split(None, 6)
+        if len(fields) != 7 or not fields[4].lstrip("-").isdigit():
+            continue
+        out.append("\t".join(fields))
+        if "youtube.com" in fields[0] or "google.com" in fields[0]:
+            n += 1
+    return "\n".join(out) + "\n", n
+
+
+def _save_cookies(text: str, source: str) -> bool:
+    clean, n = normalize_cookies(text)
+    if not n:
+        COOKIES.update(error=f"{source}: no YouTube cookies found in it (is it a cookies.txt?)")
+        log.error(COOKIES["error"])
+        return False
+    tmp = COOKIE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(clean)
+    os.replace(tmp, COOKIE_FILE)
+    COOKIES.update(source=source, count=n, at=time.time(), error="")
+    return True
+
+
 try:
-    if config.YT_COOKIES_B64:
-        with open(COOKIE_FILE, "wb") as _fh:
-            _fh.write(base64.b64decode(config.YT_COOKIES_B64.strip().strip('"\'')))
-    elif config.YT_COOKIES:
-        with open(COOKIE_FILE, "w") as _fh:
-            _fh.write(config.YT_COOKIES.replace("\\n", "\n"))
+    if config.YT_COOKIES_B64 and not config.COOKIES_URL:
+        _save_cookies(base64.b64decode(config.YT_COOKIES_B64.strip().strip('"\'')).decode("utf-8", "replace"), "YT_COOKIES_B64")
+    elif config.YT_COOKIES and not config.COOKIES_URL:
+        _save_cookies(config.YT_COOKIES.replace("\\n", "\n"), "YT_COOKIES")
 except Exception as _e:  # a broken value: say so and go on without cookies (it used to stop the server starting)
-    log.error("YT_COOKIES_B64 / YT_COOKIES couldn't be read, going on without cookies: %s", _e)
+    COOKIES["error"] = f"YT_COOKIES_B64 / YT_COOKIES couldn't be read: {_e}"
+    log.error("%s — going on without cookies", COOKIES["error"])
+
+
+def _raw_url(url: str) -> str:
+    """The plain-text address of a paste: batbin.me/abc -> batbin.me/raw/abc, pastebin.com/abc -> pastebin.com/raw/abc."""
+    m = re.match(r"(https?://(?:www\.)?(batbin\.me|pastebin\.com|katb\.in|nekobin\.com))/(?:raw/)?([\w-]+)/?$", url.strip())
+    if m:
+        return f"{m.group(1)}/raw/{m.group(3)}"
+    return url.strip()
+
+
+async def cookies_loop():
+    """COOKIES_URL: fetch the cookies at start and every 6 hours (a new paste needs no redeploy)."""
+    if not config.COOKIES_URL:
+        return
+    while True:
+        try:
+            r = await http().get(_raw_url(config.COOKIES_URL), timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                raise RuntimeError(f"the link answered {r.status_code}")
+            if _save_cookies(r.text, "COOKIES_URL"):
+                _level["n"], _level["until"] = 0, 0.0  # (fresh cookies: use them again at once)
+                log.info("cookies loaded from COOKIES_URL: %d YouTube cookies", COOKIES["count"])
+        except Exception as e:
+            COOKIES["error"] = f"COOKIES_URL: {str(e) or type(e).__name__}"[:200]
+            log.warning(COOKIES["error"])
+        await asyncio.sleep(6 * 3600)
 
 _info_cache: dict[str, tuple[float, dict]] = {}
 STATS: dict = {"yt_ok_at": 0.0, "yt_err_at": 0.0, "yt_err": "", "dl_ok_at": 0.0, "dl_err_at": 0.0, "dl_err": ""}  # Health page
@@ -175,6 +237,8 @@ class _QuietLog:
     def info(self, msg): pass
 
     def warning(self, msg):
+        if "429" in str(msg) or "Too Many Requests" in str(msg):
+            mark_429()
         text = re.sub(r"\b[\w-]{11}\b", "…", str(msg))[:300]  # (one line per kind, not per song)
         now = time.time()
         if now - _warned.get(text, 0) > 3600:
@@ -184,7 +248,20 @@ class _QuietLog:
             log.warning("yt-dlp warning: %s", text)
             WARNINGS.append((now, text))
 
-    def error(self, msg): log.info("yt-dlp: %s", str(msg)[:300])
+    def error(self, msg):
+        if "429" in str(msg) or "Too Many Requests" in str(msg):
+            mark_429()
+        log.info("yt-dlp: %s", str(msg)[:300])
+
+
+def mark_429():
+    STATS["yt_429_at"] = time.time()
+
+
+def youtube_busy() -> bool:
+    """YouTube said "Too Many Requests" in the last 10 minutes: only what's needed now (the song playing, the next
+    one) is looked up; songs tapped in search and the ones further down the queue wait."""
+    return time.time() - STATS.get("yt_429_at", 0) < 600
 
 
 # When YouTube refuses the server, the settings are stepped back by themselves instead of someone changing Railway
@@ -780,8 +857,11 @@ def _trim_cache(squeeze: bool = False, startup: bool = False):
                 pass
 
 
-async def prefetch(vid: str):
-    """Resolve + cache the default audio formats for a track (both codecs) in the background."""
+async def prefetch(vid: str, extra: bool = False):
+    """Resolve + cache the song's file in the background. extra: only nice to have (a tapped song, the queue further
+    down): skipped while YouTube says "Too Many Requests"."""
+    if extra and youtube_busy() and not is_ready(vid):
+        return
     try:
         info = await resolve(vid)
     except Exception as e:
@@ -993,10 +1073,27 @@ async def stream(request: Request, vid: str, kind: str, codec: str, quality: str
             pass
         return FileResponse(path, media_type=_mime(fmt), headers={"Cache-Control": "private, max-age=3600"})
     try:
-        return await _proxy(request, vid, fmt, retry=True)
+        resp = await _proxy(request, vid, fmt, retry=True)
     except Exception as e:
         log.warning("stream proxy failed %s: %s", vid, e)
-        return Response("upstream error", status_code=502)
+        resp = Response("upstream error", status_code=502)
+    if resp.status_code >= 400 and kind == "audio":
+        # YouTube refused to pass the song on (403 / 429 / blocked) while our own download of it is under way (it
+        # goes from the start of the file, which YouTube allows): wait for it and send our copy. Sending the error
+        # made the phone report "Format error" and go silent for a few seconds until its retry — on everyone's phone
+        # that opened the song before its file was on the server.
+        job = _downloads.get(f"{vid}_{fmt['id']}")
+        if job is None and cacheable(info, fmt):
+            job = _start_download(vid, fmt)
+        if job is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(job), 10)
+            except Exception:
+                pass
+        if os.path.exists(path):
+            log.info("stream %s: YouTube refused, sent our own copy instead", vid)
+            return FileResponse(path, media_type=_mime(fmt), headers={"Cache-Control": "private, max-age=3600"})
+    return resp
 
 
 async def _proxy(request: Request, vid: str, fmt: dict, retry: bool) -> Response:

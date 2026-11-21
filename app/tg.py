@@ -4,7 +4,7 @@ import logging
 import os
 import time
 
-from . import auth, config, db
+from . import auth, config, db, sudo
 from .http import httpx
 
 log = logging.getLogger("tg")
@@ -190,8 +190,20 @@ async def alert_admins(chat_id: int, kind: str, text: str, every: int = 120):
 _member_calls: dict[tuple[int, int], asyncio.Task] = {}
 
 
+def _boost(uid: int, st: dict) -> dict:
+    """The bot's owner and sudo users count as admins in every group's voice chat (as long as they're members),
+    whether or not Telegram made them admins there."""
+    if st.get("member") and not st.get("admin") and sudo.is_sudo(uid):
+        return {**st, "admin": True, "boss": True}
+    return st
+
+
 async def member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
-    """Returns {'member': bool, 'admin': bool}. Cached for 60s."""
+    """Returns {'member': bool, 'admin': bool}. Cached for 60s. Owner / sudo users: admin everywhere (see _boost)."""
+    return _boost(uid, await _member_status(chat_id, uid, fresh))
+
+
+async def _member_status(chat_id: int, uid: int, fresh: bool = False) -> dict:
     if config.DEV_MODE and uid < 0:  # fake dev users
         return {"member": True, "admin": uid == -1, "name": f"Dev {abs(uid)}", "username": f"dev{abs(uid)}", "bot": False}
     key = (chat_id, uid)
@@ -315,6 +327,8 @@ async def _room_news(chat_id: int, uid: int, **kw):
     from . import room as rooms  # (room imports this module)
     r = rooms.ROOMS.get(chat_id)
     if r and uid in r.parts:
+        if kw.get("st") is not None:
+            kw["st"] = _boost(uid, kw["st"])  # (Telegram's news about the owner / a sudo user: still an admin here)
         try:
             await r.tg_news(uid, **kw)
         except Exception:

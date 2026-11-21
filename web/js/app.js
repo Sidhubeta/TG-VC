@@ -117,7 +117,7 @@ function goFullscreen() {
 
 let started = false;
 on('ws:init', (m) => {
-  S.admin = m.admin; S.sudo = !!m.sudo; S.owner = !!m.owner; S.room = m.room; S.group = m.group;
+  S.admin = m.admin; S.sudo = !!m.sudo; S.owner = !!m.owner; S.rank = m.rank || (m.admin ? 1 : 0); S.room = m.room; S.group = m.group;
   // appearing as the group: members know us by a stand-in id, and the voice uses it too
   S.pid = m.pid || null;
   // the voice identity changed (switched to appearing as the group, or back): join the voice again under it
@@ -337,7 +337,8 @@ function openParticipant(uid) {
         h('div', { class: 'row' }, icon('vol-low'), vol, icon('vol')),
         actionRow(isMutedForMe(uid) ? 'vol' : 'vol-x', isMutedForMe(uid) ? 'Unmute for me' : 'Mute for me', () => { const m = toggleMuteForMe(uid); toast(m ? `${p.name} is muted for you` : `${p.name} unmuted for you`); renderGrid(); render(); }, '', 'Only you stop hearing them')) : null,
       // admins, and moderators for people who aren't admins or moderators themselves
-      (S.admin || (isMod() && !p.mod)) && !me && !p.admin ? h('div', { class: 'list' },
+      // (the bot's owner and sudo users also over the group's admins)
+      (S.admin || (isMod() && !p.mod)) && !me && (!p.admin || (S.admin && (S.rank || 1) > (p.rank ?? 1))) ? h('div', { class: 'list' },
         p.forceMuted
           ? actionRow('mic', 'Allow to speak', () => { send({ t: 'admin.unmute', uid }); s.close(); })
           : actionRow('mic-off', 'Mute for everyone', () => { send({ t: 'admin.mute', uid }); s.close(); }, '', 'They can’t unmute until you allow it'),

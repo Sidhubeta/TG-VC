@@ -876,7 +876,7 @@ async def api_health(request: Request, uid, chat_id, st):
     lv = music._cur_level()
     if lv:
         items.append({"name": "YouTube settings", "ok": False, "detail": f"YouTube refused the full setup, so songs are fetched "
-                      f"{music.LEVELS[lv]} for now (tried again every 6 h)"
+                      f"{music.LEVELS[lv]} for now (tried again every 30 min)"
                       + (" — the cookies look stale: make new ones in a private window" if lv == 1 else "")})
     if ms["dl_ok_at"] or ms["dl_err_at"]:
         dl_ok = ms["dl_ok_at"] >= ms["dl_err_at"]

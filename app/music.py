@@ -264,11 +264,13 @@ def youtube_busy() -> bool:
     return time.time() - STATS.get("yt_429_at", 0) < 600
 
 
-# When YouTube refuses the server, the settings are stepped back by themselves instead of someone changing Railway
-# variables one by one: 0 = as set up, 1 = without the cookies (YouTube rejects a stale login: "The page needs to be
-# reloaded", 403s), 2 = also without YT_EXTRACTOR_ARGS and without forcing PO tokens (yt-dlp's own defaults). The
-# level that worked is kept for 30 minutes, then the full setup is tried again.
-LEVELS = ["as set up", "without the YouTube cookies", "yt-dlp defaults (no cookies, no extra settings)"]
+# When YouTube refuses the server, the settings are changed by themselves instead of someone changing Railway
+# variables one by one. 0 = as set up; 1 = without the cookies, only when YouTube says they're stale ("The page needs
+# to be reloaded"); 2 = with the cookies, but yt-dlp's own defaults (no YT_EXTRACTOR_ARGS, no forced PO tokens), for
+# other refusals (403, no formats). "Sign in to confirm you're not a bot" never drops the cookies — it asks for them:
+# dropping them for it left the server without cookies for hours with good ones loaded, and every song refused.
+# The level that worked is kept for 30 minutes, then the full setup is tried again.
+LEVELS = ["as set up", "without the YouTube cookies", "with yt-dlp's default settings (cookies kept)"]
 _level = {"n": 0, "until": 0.0}
 
 
@@ -281,19 +283,28 @@ def _cur_level() -> int:
 def _set_level(n: int):
     if n != _level["n"]:
         log.warning("YouTube: now %s", LEVELS[n])
-    _level["n"], _level["until"] = n, time.time() + 6 * 3600
+    _level["n"], _level["until"] = n, time.time() + 1800
 
 
-def _levels_from(start: int) -> list[int]:
-    """The levels worth trying from start (no point going without cookies when there are none, etc.)."""
-    out = [start]
-    for n in range(start + 1, len(LEVELS)):
-        if n == 1 and not os.path.exists(COOKIE_FILE):
+_STALE_RE = re.compile(r"page needs to be reloaded|cookies are no longer valid|cookies[^.]{0,40}(expired|invalid)", re.I)
+_BOT_RE = re.compile(r"sign in to confirm|not a bot", re.I)
+
+
+def _next_level(n: int, msg: str, tried: set) -> int | None:
+    """What to try after level n was refused with msg (None: nothing else is worth a try)."""
+    has_cookies = os.path.exists(COOKIE_FILE)
+    extras = bool(config.YT_EXTRACTOR_ARGS or config.POT_PROVIDER_URL)  # (else level 2 is the same as 0)
+    if _STALE_RE.search(msg) and has_cookies:
+        order = [1]
+    elif _BOT_RE.search(msg):
+        order = [0, 2] if has_cookies else []  # (needs the cookies: back to them, never away from them)
+    else:
+        order = [2, 0]
+    for o in order:
+        if o in tried or (o == 2 and not extras):
             continue
-        if n == 2 and not (config.YT_EXTRACTOR_ARGS or config.POT_PROVIDER_URL):
-            continue
-        out.append(n)
-    return out
+        return o
+    return None
 
 
 _REFUSED_RE = re.compile(r"page needs to be reloaded|sign in to confirm|not a bot|403|forbidden|cookies|po token|"
@@ -322,7 +333,7 @@ def _opts(level: int | None = None, **extra) -> dict:
     level = _cur_level() if level is None else level
     o = {"logger": _QuietLog(), "quiet": True, "no_warnings": False, "skip_download": True, "noplaylist": True,
          "socket_timeout": 15, "retries": 3, "extractor_retries": 2}
-    if os.path.exists(COOKIE_FILE) and level < 1:
+    if os.path.exists(COOKIE_FILE) and level != 1:
         o["cookiefile"] = COOKIE_FILE
     if proxy := warp.proxy_url():
         o["proxy"] = proxy
@@ -548,9 +559,10 @@ def _extract(url: str, **extra) -> dict:
 
 
 def _extract_now(url: str, **extra) -> dict:
-    start = _cur_level()
-    err = None
-    for n in _levels_from(start):
+    start = n = _cur_level()
+    tried: set = set()
+    while True:
+        tried.add(n)
         try:
             with yt_dlp.YoutubeDL(_opts(level=n, **extra)) as y:
                 info = y.extract_info(url, download=False)
@@ -558,11 +570,15 @@ def _extract_now(url: str, **extra) -> dict:
                 _set_level(n)
             return info
         except Exception as e:
-            err = e
             if unplayable(e) or not _REFUSED_RE.search(str(e)):
                 raise  # (the video itself, or the network: other settings won't help)
-            log.info("YouTube refused (%s): %s", LEVELS[n], str(e)[:160])
-    raise err
+            nxt = _next_level(n, str(e), tried)
+            log.info("YouTube refused (%s)%s: %s", LEVELS[n], f", trying {LEVELS[nxt]}" if nxt is not None else "", str(e)[:160])
+            if nxt is None:
+                if n != start:
+                    _set_level(0)  # (nothing helped: back to the full setup, not stuck on a worse one)
+                raise
+            n = nxt
 
 
 _searches: "OrderedDict[tuple, tuple[float, list[dict]]]" = OrderedDict()
